@@ -11,7 +11,9 @@
 //! reqwest stack, the on-disk enrollment state, and the sign/verify halves of the
 //! handshake. It is compiled only under the `fgtw` cargo feature.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fgtw::client::{FgtwResponse, FgtwTransport};
@@ -195,6 +197,38 @@ pub fn is_enrolled() -> bool {
     state_path().exists()
 }
 
+// ── pending handshake auth ──
+//
+// The handshake is verified in the TCP-accept path (server.rs), where the client's box key
+// and our identity key are both in hand, but the login decision happens later in the
+// Connection state machine (connection.rs). We bridge the two by connection id rather than
+// threading a new field through ConnectionMeta / Connection::start — one insert at handshake,
+// one take at first login. Entries are created only on a VALID fleet handshake.
+
+fn pending() -> &'static Mutex<HashMap<i32, [u8; 32]>> {
+    static P: OnceLock<Mutex<HashMap<i32, [u8; 32]>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record that connection `id` completed a valid fleet handshake as `device_pk`.
+pub fn remember_authed(id: i32, device_pk: [u8; 32]) {
+    if let Ok(mut m) = pending().lock() {
+        m.insert(id, device_pk);
+    }
+}
+
+/// Take (and clear) the fleet-authenticated device pubkey for connection `id`, if any.
+pub fn take_authed(id: i32) -> Option<[u8; 32]> {
+    pending().lock().ok().and_then(|mut m| m.remove(&id))
+}
+
+/// Drop any pending entry for `id` (connection closed before login).
+pub fn forget_authed(id: i32) {
+    if let Ok(mut m) = pending().lock() {
+        m.remove(&id);
+    }
+}
+
 // ── membership freshness ──
 
 fn cache_max_age() -> u64 {
@@ -306,34 +340,26 @@ fn parse_hs_payload(payload: &[u8]) -> Option<([u8; 32], Vec<u8>)> {
 
 /// Host side: verify an incoming `PublicKey.fgtw` payload. Checks the signature binds the
 /// client's box key to our identity key, then that the signing device is a current member of
-/// our own fleet (fresh fetch, cache fallback within bound).
+/// our own fleet (fresh fetch, cache fallback within bound). Returns the verified device
+/// pubkey on success, or the reason it was rejected.
 pub fn verify_hs_payload(
     payload: &[u8],
     client_box_pk: &[u8; 32],
     our_sign_pk: &[u8; 32],
-) -> FgtwVerdict {
-    let Some(state) = EnrollState::load() else {
-        return FgtwVerdict::NotEnrolled;
-    };
-    let Some((device_pk, sig)) = parse_hs_payload(payload) else {
-        return FgtwVerdict::BadPayload;
-    };
+) -> Result<[u8; 32], FgtwVerdict> {
+    let state = EnrollState::load().ok_or(FgtwVerdict::NotEnrolled)?;
+    let (device_pk, sig) = parse_hs_payload(payload).ok_or(FgtwVerdict::BadPayload)?;
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-    let Ok(vk) = VerifyingKey::from_bytes(&device_pk) else {
-        return FgtwVerdict::BadPayload;
-    };
-    let Ok(sig_arr) = <[u8; 64]>::try_from(sig.as_slice()) else {
-        return FgtwVerdict::BadPayload;
-    };
-    if vk.verify(&hs_digest(client_box_pk, our_sign_pk), &Signature::from_bytes(&sig_arr)).is_err() {
-        return FgtwVerdict::BadSignature;
-    }
+    let vk = VerifyingKey::from_bytes(&device_pk).map_err(|_| FgtwVerdict::BadPayload)?;
+    let sig_arr = <[u8; 64]>::try_from(sig.as_slice()).map_err(|_| FgtwVerdict::BadPayload)?;
+    vk.verify(&hs_digest(client_box_pk, our_sign_pk), &Signature::from_bytes(&sig_arr))
+        .map_err(|_| FgtwVerdict::BadSignature)?;
     match current_fleet(&state) {
-        Ok(members) if members.contains(&device_pk) => FgtwVerdict::Ok,
-        Ok(_) => FgtwVerdict::NotMember,
+        Ok(members) if members.contains(&device_pk) => Ok(device_pk),
+        Ok(_) => Err(FgtwVerdict::NotMember),
         Err(e) => {
             log::warn!("fgtw membership check failed: {e}");
-            FgtwVerdict::StaleCache
+            Err(FgtwVerdict::StaleCache)
         }
     }
 }

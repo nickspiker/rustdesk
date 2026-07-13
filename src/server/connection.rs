@@ -260,6 +260,8 @@ enum ConnAuditPrimaryAuth {
     TemporaryPassword = 2,
     PermanentPassword = 3,
     SwitchSides = 4,
+    #[cfg(feature = "fgtw")]
+    Fgtw = 5,
 }
 
 impl ConnAuditPrimaryAuth {
@@ -467,9 +469,16 @@ impl Connection {
         let _raii_control_permissions_id =
             raii::ControlPermissionsID::new(id, &control_permissions);
         let salt = Config::get_effective_permanent_password_salt();
+        // A longer challenge under fgtw: the handshake signature covers it, and a 6-char
+        // challenge (~30 bits) is thin replay margin. Safe for vanilla clients — challenge is
+        // a string they feed into SHA256 at any length.
+        #[cfg(feature = "fgtw")]
+        let challenge = Config::get_auto_password(24);
+        #[cfg(not(feature = "fgtw"))]
+        let challenge = Config::get_auto_password(6);
         let hash = Hash {
             salt,
-            challenge: Config::get_auto_password(6),
+            challenge,
             ..Default::default()
         };
         let (tx_from_cm_holder, mut rx_from_cm) = mpsc::unbounded_channel::<ipc::Data>();
@@ -2649,6 +2658,25 @@ impl Connection {
                 return true;
             }
 
+            // FGTW fleet auth: if this channel was proven to belong to a current fleet device
+            // during the handshake, authorize now — no password, no click. Placed before the
+            // approve-mode chain so it works on Click-only hosts too (membership is a stronger
+            // credential than click). 2FA still applies inside send_logon_response_and_keep_alive.
+            #[cfg(feature = "fgtw")]
+            if let Some(device_pk) = crate::fgtw_auth::take_authed(self.inner.id()) {
+                if Config::get_option("enable-fgtw-auth") != "N" {
+                    log::info!("fgtw: authorizing fleet device {:02x?}", &device_pk[..4]);
+                    self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Fgtw);
+                    #[cfg(target_os = "linux")]
+                    self.linux_headless_handle.wait_desktop_cm_ready().await;
+                    if !self.send_logon_response_and_keep_alive().await {
+                        return false;
+                    }
+                    self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
+                    return true;
+                }
+            }
+
             // https://github.com/rustdesk/rustdesk-server-pro/discussions/646
             // `is_logon` is used to check login with `OPTION_ALLOW_LOGON_SCREEN_PASSWORD` == "Y".
             // `is_logon_ui()` is a fallback for logon UI detection on Windows.
@@ -4785,6 +4813,9 @@ impl Connection {
             return;
         }
         self.closed = true;
+        // Drop any fleet-handshake entry not consumed by a login (disconnect before LoginRequest).
+        #[cfg(feature = "fgtw")]
+        crate::fgtw_auth::forget_authed(self.inner.id());
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //

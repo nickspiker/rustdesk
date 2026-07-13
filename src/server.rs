@@ -224,6 +224,10 @@ pub async fn create_tcp_connection(
             ..Default::default()
         });
         timeout(CONNECT_TIMEOUT, stream.send(&msg_out)).await??;
+        // Our identity (sign) public key — captured before `pk` is shadowed by the peer's
+        // PublicKey message below. It's what the fgtw client bound its handshake signature to.
+        #[cfg(feature = "fgtw")]
+        let our_sign_pk_vec = pk.clone();
         match timeout(CONNECT_TIMEOUT, stream.next()).await? {
             Some(res) => {
                 let bytes = res?;
@@ -235,6 +239,36 @@ pub async fn create_tcp_connection(
                                 &pk.asymmetric_value,
                                 &our_sk_b,
                             )?);
+                            // FGTW fleet handshake: if the peer proved a fleet device key bound
+                            // to this channel, record it so the login path can authorize without
+                            // a password. A present-but-invalid payload fails the connection
+                            // closed — it never falls through to the password layer.
+                            #[cfg(feature = "fgtw")]
+                            if !pk.fgtw.is_empty() {
+                                let mut client_box_pk = [0u8; 32];
+                                client_box_pk.copy_from_slice(&pk.asymmetric_value);
+                                let our_sign_pk: [u8; 32] =
+                                    match our_sign_pk_vec.as_slice().try_into() {
+                                        Ok(k) => k,
+                                        Err(_) => bail!("fgtw: bad host sign key length"),
+                                    };
+                                match crate::fgtw_auth::verify_hs_payload(
+                                    &pk.fgtw,
+                                    &client_box_pk,
+                                    &our_sign_pk,
+                                ) {
+                                    Ok(device_pk) => {
+                                        log::info!(
+                                            "fgtw fleet handshake ok: device {:02x?}",
+                                            &device_pk[..4]
+                                        );
+                                        crate::fgtw_auth::remember_authed(id, device_pk);
+                                    }
+                                    Err(reason) => {
+                                        bail!("fgtw fleet handshake rejected: {:?}", reason);
+                                    }
+                                }
+                            }
                         } else if pk.asymmetric_value.is_empty() {
                             Config::set_key_confirmed(false);
                             log::info!("Force to update pk");
