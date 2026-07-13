@@ -31,6 +31,7 @@ hwcodec = ["scrap/hwcodec"]
 vram = ["scrap/vram"]
 mediacodec = ["scrap/mediacodec"]
 plugin_framework = []
+fgtw = ["dep:fgtw", "dep:tohu", "dep:ihi", "dep:vsf", "dep:ed25519-dalek", "dep:blake3"]
 linux-pkg-config = ["magnum-opus/linux-pkg-config", "scrap/linux-pkg-config"]
 unix-file-copy-paste = [
     "dep:x11-clipboard",
@@ -47,6 +48,14 @@ screencapturekit = ["cpal/screencapturekit"]
 async-trait = "0.1"
 scrap = { path = "libs/scrap", features = ["wayland"] }
 hbb_common = { path = "libs/hbb_common" }
+# FGTW fleet auth (feature `fgtw`, default off). Path deps to the sibling TOKEN-stack
+# checkout; vanilla builds compile none of these and keep MSRV 1.75.
+fgtw = { path = "../fgtw", optional = true }
+tohu = { path = "../tohu", optional = true }
+ihi = { path = "../ihi", optional = true }
+vsf = { path = "../vsf", default-features = false, features = ["crypto", "inspect"], optional = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"], optional = true }
+blake3 = { version = "1", default-features = false, optional = true }
 serde_derive = "1.0"
 serde = "1.0"
 serde_json = "1.0"

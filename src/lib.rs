@@ -37,6 +37,8 @@ pub mod flutter;
 pub mod flutter_ffi;
 use common::*;
 mod auth_2fa;
+#[cfg(feature = "fgtw")]
+pub mod fgtw_auth;
 #[cfg(not(target_os = "ios"))]
 mod clipboard;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
