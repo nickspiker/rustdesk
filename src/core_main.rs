@@ -450,6 +450,23 @@ pub fn core_main() -> Option<Vec<String>> {
                 }
             }
             return None;
+        } else if args[0] == "--fgtw-enroll" {
+            if is_cli_setting_change_disabled() {
+                println!("Settings are disabled!");
+                return None;
+            }
+            #[cfg(feature = "fgtw")]
+            if args.len() == 2 {
+                match crate::fgtw_auth::enroll(&args[1]) {
+                    Ok(msg) => println!("{msg}"),
+                    Err(e) => println!("Enrollment failed: {e}"),
+                }
+            } else {
+                println!("Usage: --fgtw-enroll <handle>");
+            }
+            #[cfg(not(feature = "fgtw"))]
+            println!("This build has no FGTW support (rebuild with --features fgtw).");
+            return None;
         } else if args[0] == "--set-unlock-pin" {
             if config::Config::is_disable_unlock_pin() {
                 println!("Unlock PIN is disabled!");
@@ -920,6 +937,7 @@ fn is_user_main_ipc_scope_cli_command(args: &[String]) -> bool {
             | Some("--option")
             | Some("--assign")
             | Some("--deploy")
+            | Some("--fgtw-enroll")
     )
 }
 

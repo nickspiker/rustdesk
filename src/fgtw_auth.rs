@@ -381,6 +381,88 @@ pub fn verify_host_signed_id(signed_id: &[u8]) -> Option<(String, [u8; 32])> {
     None
 }
 
+// ── enrollment (CLI) ──
+
+/// Enroll this machine into the fleet for `handle_input`. Creates the fleet genesis if none
+/// exists; otherwise, if this device isn't a member yet, runs the pair-words flow and waits
+/// for an already-enrolled device (e.g. Photon) to approve. Persists the verified member set
+/// on success. Blocking + prints progress — it's a CLI command.
+pub fn enroll(handle_input: &str) -> Result<String, String> {
+    let handle = fgtw::keys::canonical_handle(handle_input);
+    println!("Deriving identity for \"{handle}\" (memory-hard, ~1s)...");
+    let identity_seed = *ihi::handle_to_hash(&handle).as_bytes();
+    let handle_proof = *ihi::handle_to_proof(&handle).as_bytes();
+    let device_key = device_keypair().map_err(|e| e.to_string())?;
+    let me = device_key.public.to_bytes();
+    let t = RdTransport::enroll();
+
+    match fgtw::client::ensure_member(&t, &device_key, &handle_proof, &identity_seed) {
+        Ok(()) => {}
+        // Not a member and a fleet already exists → must be added from an existing device.
+        Err(e) if e.contains("enroll it from an existing device") => {
+            return pair_flow(&t, &device_key, &handle_proof);
+        }
+        Err(e) => return Err(e),
+    }
+    let (members, tip) = fgtw::client::current_members_with_ts(&t, &handle_proof)?;
+    EnrollState { handle_proof, members: members.clone(), tip_osc: tip, fetched_at: now_secs() }
+        .save()?;
+    seed_rustdesk_identity(&device_key);
+    Ok(format!(
+        "Enrolled. This device ({:02x?}…) is one of {} fleet member(s).",
+        &me[..4],
+        members.len()
+    ))
+}
+
+/// Make RustDesk's identity keypair BE the fleet device key, so the host signs its `SignedId`
+/// with the fleet key and fleet peers verify it against the membership fold. sodiumoxide's
+/// Ed25519 secret key is the 64-byte `seed || public`; ed25519-dalek's `to_bytes()` is the
+/// 32-byte seed — same algorithm, so a signature made by one verifies with the other.
+fn seed_rustdesk_identity(device_key: &Keypair) {
+    let seed = device_key.secret.to_bytes();
+    let pk = device_key.public.to_bytes();
+    let mut sk = Vec::with_capacity(64);
+    sk.extend_from_slice(&seed);
+    sk.extend_from_slice(&pk);
+    Config::set_key_pair((sk, pk.to_vec()));
+}
+
+fn pair_flow(t: &RdTransport, device_key: &Keypair, handle_proof: &[u8; 32]) -> Result<String, String> {
+    let me = device_key.public.to_bytes();
+    let pairing = fgtw::pair::new_pairing_id();
+    fgtw::client::post_pairing_request(t, &pairing, &me, handle_proof)?;
+    println!("\nThis device isn't in the fleet yet. On an already-enrolled device (e.g. Photon),");
+    println!("approve pairing for these words:\n");
+    println!("    {}\n", fgtw::pair::pair_words(&pairing.public.to_bytes()));
+    println!("Waiting up to 5 minutes for approval...");
+    // The approving device runs bind_device, which folds our pubkey into the chain; we detect
+    // completion by our pubkey appearing in the current member set.
+    for _ in 0..150 {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let (members, tip) = match fgtw::client::current_members_with_ts(t, handle_proof) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if members.contains(&me) {
+            EnrollState {
+                handle_proof: *handle_proof,
+                members: members.clone(),
+                tip_osc: tip,
+                fetched_at: now_secs(),
+            }
+            .save()?;
+            seed_rustdesk_identity(device_key);
+            return Ok(format!(
+                "Paired. This device ({:02x?}…) is now one of {} fleet member(s).",
+                &me[..4],
+                members.len()
+            ));
+        }
+    }
+    Err("timed out waiting for approval".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +500,36 @@ mod tests {
         assert!(vk
             .verify(&hs_digest(&[4u8; 32], &host_pk), &Signature::from_bytes(&sig_arr))
             .is_err());
+    }
+
+    #[test]
+    fn sodiumoxide_and_dalek_sign_interop() {
+        // Load-bearing: the host signs its SignedId with sodiumoxide using the seed||pk secret
+        // key we seed from the fgtw device key; fleet peers verify with ed25519-dalek against
+        // the fold. If these two libs disagreed on Ed25519, fleet auth would silently never work.
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        use hbb_common::sodiumoxide::crypto::sign;
+
+        let dev = kp(42);
+        let seed = dev.secret.to_bytes();
+        let pk = dev.public.to_bytes();
+        let mut sk64 = [0u8; 64];
+        sk64[..32].copy_from_slice(&seed);
+        sk64[32..].copy_from_slice(&pk);
+        let so_sk = sign::SecretKey(sk64);
+        let so_pk = sign::PublicKey(pk);
+
+        let msg = b"fleet identity attestation";
+        // sodiumoxide signs -> dalek verifies
+        let so_sig = sign::sign_detached(msg, &so_sk);
+        let vk = VerifyingKey::from_bytes(&pk).unwrap();
+        let dalek_sig = Signature::from_bytes(&so_sig.to_bytes());
+        assert!(vk.verify(msg, &dalek_sig).is_ok(), "dalek must accept sodiumoxide's signature");
+
+        // dalek signs -> sodiumoxide verifies
+        let d_sig = dev.sign(msg);
+        let so_sig2 = sign::Signature::new(d_sig.to_bytes());
+        assert!(sign::verify_detached(&so_sig2, msg, &so_pk), "sodiumoxide must accept dalek's signature");
     }
 
     #[test]
