@@ -801,11 +801,29 @@ impl Client {
                                 let (asymmetric_value, symmetric_value, key) =
                                     create_symmetric_key_msg(their_pk_b);
                                 let mut msg_out = Message::new();
-                                msg_out.set_public_key(PublicKey {
+                                #[allow(unused_mut)]
+                                let mut public_key = PublicKey {
                                     asymmetric_value,
                                     symmetric_value,
                                     ..Default::default()
-                                });
+                                };
+                                // FGTW: if enrolled, prove our fleet device key over this channel
+                                // by binding a signature to our box key + the host's identity key
+                                // (sign_pk). A non-fleet/vanilla host ignores the field; a host in
+                                // our fleet authorizes us without a password. Costs nothing when
+                                // not applicable.
+                                #[cfg(feature = "fgtw")]
+                                if public_key.asymmetric_value.len() == 32 {
+                                    let mut client_box_pk = [0u8; 32];
+                                    client_box_pk.copy_from_slice(&public_key.asymmetric_value);
+                                    if let Some(payload) = crate::fgtw_auth::build_hs_payload(
+                                        &client_box_pk,
+                                        &sign_pk.0,
+                                    ) {
+                                        public_key.fgtw = payload.into();
+                                    }
+                                }
+                                msg_out.set_public_key(public_key);
                                 timeout(CONNECT_TIMEOUT, conn.send(&msg_out)).await??;
                                 conn.set_key(key);
                             } else {
