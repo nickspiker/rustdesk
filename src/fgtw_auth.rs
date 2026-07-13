@@ -188,7 +188,12 @@ impl EnrollState {
 
     pub fn save(&self) -> Result<(), String> {
         let bytes = self.to_bytes()?;
-        std::fs::write(state_path(), bytes).map_err(|e| format!("write fgtw state: {e}"))
+        let path = state_path();
+        // The config dir may not exist yet on a first run (fresh install / scratch config).
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("create fgtw state dir: {e}"))?;
+        }
+        std::fs::write(&path, bytes).map_err(|e| format!("write fgtw state: {e}"))
     }
 }
 
@@ -396,13 +401,32 @@ pub fn enroll(handle_input: &str) -> Result<String, String> {
     let me = device_key.public.to_bytes();
     let t = RdTransport::enroll();
 
-    match fgtw::client::ensure_member(&t, &device_key, &handle_proof, &identity_seed) {
-        Ok(()) => {}
-        // Not a member and a fleet already exists → must be added from an existing device.
-        Err(e) if e.contains("enroll it from an existing device") => {
-            return pair_flow(&t, &device_key, &handle_proof);
+    // ensure_member publishes a genesis then re-fetches to adjudicate; the fleet server's
+    // storage is read-after-write eventually consistent, so a fresh genesis can miss its own
+    // immediate re-fetch. Retry a few times — a later fetch sees the persisted chain.
+    let mut last_err = String::new();
+    let mut established = false;
+    for attempt in 0..4 {
+        match fgtw::client::ensure_member(&t, &device_key, &handle_proof, &identity_seed) {
+            Ok(()) => {
+                established = true;
+                break;
+            }
+            // Not a member and a fleet already exists → must be added from an existing device.
+            Err(e) if e.contains("enroll it from an existing device") => {
+                return pair_flow(&t, &device_key, &handle_proof);
+            }
+            Err(e) => {
+                last_err = e;
+                if attempt < 3 {
+                    println!("  establishing fleet... (retry {})", attempt + 1);
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
         }
-        Err(e) => return Err(e),
+    }
+    if !established {
+        return Err(last_err);
     }
     let (members, tip) = fgtw::client::current_members_with_ts(&t, &handle_proof)?;
     EnrollState { handle_proof, members: members.clone(), tip_osc: tip, fetched_at: now_secs() }
