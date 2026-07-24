@@ -587,6 +587,26 @@ impl UI {
         serde_json::to_string(&get_lan_peers()).unwrap_or_default()
     }
 
+    fn get_fleet_peers(&self) -> String {
+        #[cfg(feature = "fgtw")]
+        return serde_json::to_string(&get_fleet_peers()).unwrap_or_default();
+        #[cfg(not(feature = "fgtw"))]
+        "[]".to_owned()
+    }
+
+    fn refresh_fleet_peers(&self) {
+        #[cfg(feature = "fgtw")]
+        refresh_fleet_peers();
+    }
+
+    /// The fleet tab shows only when this build has fgtw AND the machine is enrolled.
+    fn has_fleet(&self) -> bool {
+        #[cfg(feature = "fgtw")]
+        return crate::fgtw_auth::is_enrolled();
+        #[cfg(not(feature = "fgtw"))]
+        false
+    }
+
     fn get_uuid(&self) -> String {
         get_uuid()
     }
@@ -805,6 +825,9 @@ impl sciter::EventHandler for UI {
         fn create_shortcut(String);
         fn discover();
         fn get_lan_peers();
+        fn get_fleet_peers();
+        fn refresh_fleet_peers();
+        fn has_fleet();
         fn get_uuid();
         fn has_hwcodec();
         fn has_vram();

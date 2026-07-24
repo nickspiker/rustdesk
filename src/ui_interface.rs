@@ -821,6 +821,50 @@ pub fn get_lan_peers() -> Vec<HashMap<&'static str, String>> {
         .collect()
 }
 
+/// Cached fleet chooser rows — the UI renders this synchronously; [`refresh_fleet_peers`]
+/// fills it from the network off-thread (fleet fold + sealed ID map can take seconds).
+#[cfg(feature = "fgtw")]
+static FLEET_PEERS: std::sync::Mutex<Vec<HashMap<&'static str, String>>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[inline]
+#[cfg(feature = "fgtw")]
+pub fn get_fleet_peers() -> Vec<HashMap<&'static str, String>> {
+    FLEET_PEERS.lock().map(|v| v.clone()).unwrap_or_default()
+}
+
+/// Refresh the fleet chooser cache in the background (called when the tab is opened).
+/// Same session-row shape as LAN discovery, plus `alias` = the fleet-scoped device name so
+/// the tile renders the name with the ID as tooltip. Devices that haven't published an ID
+/// yet still show (empty id → connect is a no-op) so the fleet view matches the fold.
+#[cfg(feature = "fgtw")]
+pub fn refresh_fleet_peers() {
+    std::thread::spawn(|| {
+        let rows = match crate::fgtw_auth::fleet_roster() {
+            Ok(devices) => devices
+                .into_iter()
+                .filter(|d| !d.is_self)
+                .map(|d| {
+                    HashMap::<&str, String>::from_iter([
+                        ("id", d.rustdesk_id.unwrap_or_default()),
+                        ("username", String::new()),
+                        ("hostname", String::new()),
+                        ("platform", String::new()),
+                        ("alias", d.name),
+                    ])
+                })
+                .collect(),
+            Err(e) => {
+                log::warn!("fgtw: fleet chooser refresh failed: {e}");
+                return; // keep the last good list rather than blanking the tab
+            }
+        };
+        if let Ok(mut v) = FLEET_PEERS.lock() {
+            *v = rows;
+        }
+    });
+}
+
 #[inline]
 pub fn remove_discovered(id: String) {
     let mut peers = config::LanPeers::load().peers;

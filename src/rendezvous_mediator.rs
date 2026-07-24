@@ -784,6 +784,9 @@ impl RendezvousMediator {
                 log::info!("UUID_MISMATCH received from {}", self.host);
                 Config::set_key_confirmed(false);
                 Config::update_id();
+                // Fleet chooser map keys connect-by-ID off this value — track the change.
+                #[cfg(feature = "fgtw")]
+                crate::fgtw_auth::republish_own_id();
                 *solving = self.host.clone();
             } else {
                 return Ok(());

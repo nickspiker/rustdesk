@@ -543,6 +543,7 @@ class MultipleSessions: Reactor.Component {
                         <span class={!type ? 'active' : 'inactive'}>{translate('Recent sessions')}</span>
                         <span #fav class={type == "fav" ? 'active' : 'inactive'}>{translate('Favorites')}</span>
                         {handler.is_installed() && <span #lan class={type == "lan" ? 'active' : 'inactive'}>{translate('Discovered')}</span>}
+                        {handler.has_fleet() && <span #fleet class={type == "fleet" ? 'active' : 'inactive'}>{translate('My Fleet')}</span>}
                         {!disable_account && !disable_ab && <span #ab class={type == "ab" ? 'active' : 'inactive'}>{translate('Address book')}</span>}
                     </div>
                     {!this.hidden && !(disable_account && type == "ab") && <SearchBar type={type} />}
@@ -551,6 +552,7 @@ class MultipleSessions: Reactor.Component {
                 {!this.hidden && 
                 ((type == "fav" && <Favorites />) ||
                 (type == "lan" && handler.is_installed() && <LanPeers />) ||
+                (type == "fleet" && handler.has_fleet() && <FleetPeers />) ||
                 (type == "ab" && !disable_account && !disable_ab && <AddressBook />) ||
                 <SessionList sessions={handler.get_recent_sessions()} />)}
             </div>;
@@ -571,6 +573,9 @@ class MultipleSessions: Reactor.Component {
     event click $(div#sessions-type span.inactive) (_, el) {
         if (el.id == "lan") {
             discover();
+        }
+        if (el.id == "fleet") {
+            refreshFleet();
         }
         handler.set_local_option('show-sessions-type', el.id || "");
         this.stupidUpdate();
@@ -623,6 +628,39 @@ class LanPeers: Reactor.Component {
             sessions = JSON.parse(handler.get_lan_peers());
         } catch (_) {}
         return <SessionList sessions={sessions} type="lan" />;
+    }
+}
+
+// Fleet refresh runs off-thread Rust-side (fold + sealed ID map); poll a few re-renders
+// while it lands — same shape as discover()'s update loop.
+function refreshFleet() {
+    handler.refresh_fleet_peers();
+    var tries = 15;
+    function update() {
+        self.timer(300ms, function() {
+            tries -= 1;
+            if (tries == 0) return;
+            update();
+            var p = (app || {}).multipleSessions;
+            if (p) {
+                p.update();
+            }
+        });
+    }
+    update();
+}
+
+if (getSessionsType() == "fleet" && handler.has_fleet()) {
+    refreshFleet();
+}
+
+class FleetPeers: Reactor.Component {
+    function render() {
+        var sessions = [];
+        try {
+            sessions = JSON.parse(handler.get_fleet_peers());
+        } catch (_) {}
+        return <SessionList sessions={sessions} type="fleet" />;
     }
 }
 

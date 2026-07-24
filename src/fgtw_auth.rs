@@ -384,6 +384,21 @@ fn publish_own_id_inner(state: &EnrollState, device_key: &Keypair) -> Result<(),
     fgtw::client::push_fstate(&t, &RdSealer, &state.handle_proof, device_key, &key, &fs)
 }
 
+/// Re-publish this device's RustDesk ID after it changed (e.g. the rendezvous server forced
+/// a new one on UUID mismatch), so the fleet's chooser map tracks it. Off-thread — callers
+/// sit in async/networking paths and publish_own_id blocks on HTTP. No-op when not enrolled.
+pub fn republish_own_id() {
+    if !is_enrolled() {
+        return;
+    }
+    std::thread::spawn(|| {
+        let (Some(state), Ok(kp)) = (EnrollState::load(), device_keypair()) else {
+            return;
+        };
+        publish_own_id(&state, &kp);
+    });
+}
+
 /// One fleet device as the chooser renders it.
 pub struct FleetDevice {
     pub pubkey: [u8; 32],
