@@ -48,6 +48,25 @@ rustdesk --fgtw-enroll <handle>
 State is written to `<config>/fgtw_auth.vsf` (handle proof, verified member set, chain tip,
 fetch time). Run enrollment with the same privilege as the running service.
 
+## Device chooser (fleet roster)
+
+`fgtw_auth::fleet_roster()` returns the fleet as a chooser list: every member pubkey with a
+fleet-scoped two-word name (`device_name_default`, keyed on pubkey + identity seed) and,
+where published, that device's RustDesk ID. Liveness/NAT traversal stays with the normal
+rendezvous connect path — hand it the ID; trust stays with the FGTW handshake.
+
+The ID map rides the fleet's sealed device-settings state (`fgtw::fstate::DeviceSettings`,
+per-device single-writer, key `rustdesk.id`): each device publishes its own ID at enroll via
+`publish_own_id` (pull-merge-push, best-effort). The blob is sealed under the fan-out fleet
+key with `RdSealer` (kete-compatible AEAD: 12-byte nonce ‖ ChaCha20-Poly1305), so photon and
+rustdesk share one fleet-state slot and a revoked device — absent from the next epoch's
+fan-out — can't even read the roster. A freshly-paired device has no fan-out wrap until its
+sponsor's confirm rotation; until then publishing/reading degrades gracefully (names-only,
+retry later). UI injection (a "My Fleet" peer group) is not wired yet.
+
+The enrollment state file now persists `identity_seed` (needed for fleet-scoped naming);
+pre-seed state files read as not-enrolled — re-enroll once.
+
 ## Options
 
 - `enable-fgtw-auth=N` — host opt-out (disables passless fleet auth on this host).

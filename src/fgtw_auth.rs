@@ -94,12 +94,15 @@ pub fn device_keypair() -> ResultType<Keypair> {
 
 // ── enrollment state ──
 
-/// What enrollment persists: the handle proof (identifies the fleet), the last verified
-/// member set + its chain-tip time (a monotonic freshness guard), and when it was fetched
-/// (staleness bound for offline auth).
+/// What enrollment persists: the handle proof (identifies the fleet), the identity seed
+/// (fleet-scoped device naming + fleet-state addressing — verification-only material, no
+/// signing power, same at-rest exposure class as the proof), the last verified member set +
+/// its chain-tip time (a monotonic freshness guard), and when it was fetched (staleness
+/// bound for offline auth).
 #[derive(Clone)]
 pub struct EnrollState {
     pub handle_proof: [u8; 32],
+    pub identity_seed: [u8; 32],
     pub members: Vec<[u8; 32]>,
     pub tip_osc: i64,
     pub fetched_at: u64,
@@ -117,6 +120,7 @@ impl EnrollState {
     fn to_bytes(&self) -> Result<Vec<u8>, String> {
         let mut section = vsf::VsfSection::new("fgtw_enroll");
         section.add_field("hp", VsfType::hP(self.handle_proof.to_vec()));
+        section.add_field("is", VsfType::hP(self.identity_seed.to_vec()));
         // One multi-valued field: repeated same-name fields don't accumulate on read.
         section.add_field_multi(
             "m",
@@ -148,6 +152,16 @@ impl EnrollState {
             }
             _ => return Err("fgtw state: missing handle proof".into()),
         };
+        // Pre-seed state files lack this field; a missing seed reads as unreadable state, which
+        // load() surfaces as "not enrolled" — re-enroll to regenerate (dev-phase flag day).
+        let identity_seed = match section.get_field("is").and_then(|f| f.values.first()) {
+            Some(VsfType::hP(b)) if b.len() == 32 => {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(b);
+                a
+            }
+            _ => return Err("fgtw state: missing identity seed (re-enroll)".into()),
+        };
         let members = section
             .get_field("m")
             .map(|f| {
@@ -172,7 +186,7 @@ impl EnrollState {
             Some(VsfType::hR(b)) if b.len() == 8 => u64::from_le_bytes(b.as_slice().try_into().unwrap()),
             _ => 0,
         };
-        Ok(Self { handle_proof: hp, members, tip_osc, fetched_at })
+        Ok(Self { handle_proof: hp, identity_seed, members, tip_osc, fetched_at })
     }
 
     pub fn load() -> Option<Self> {
@@ -270,6 +284,157 @@ fn current_fleet(state: &EnrollState) -> Result<Vec<[u8; 32]>, String> {
             }
         }
     }
+}
+
+// ── fleet-shared state (device chooser) ──
+//
+// Each device publishes its own RustDesk ID into the fleet's sealed device-settings map
+// (fgtw::fstate DeviceSettings — per-device, single-writer, CRDT-merged), and the chooser
+// reads the map back to render "My Fleet": every member pubkey named by device_name_default
+// plus the RustDesk ID to hand to the ordinary rendezvous connect path. The rendezvous
+// server keeps doing discovery + NAT traversal only; trust stays with the FGTW handshake.
+// The map is sealed under the fan-out fleet key, so a revoked device (absent from the next
+// epoch's fan-out) can't even read the roster.
+
+/// Settings key under which a device publishes its RustDesk ID in its own device map.
+const SETTING_RUSTDESK_ID: &str = "rustdesk.id";
+
+/// Fleet-state AEAD, wire-compatible with photon's `kete` (`random 12-byte nonce ‖
+/// ChaCha20-Poly1305 ct`) so rustdesk and photon devices share one fleet-state blob.
+struct RdSealer;
+
+impl fgtw::client::FleetSealer for RdSealer {
+    fn seal(&self, plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+        use hbb_common::rand::RngCore;
+        let cipher = ChaCha20Poly1305::new(key.into());
+        let mut nonce_bytes = [0u8; 12];
+        hbb_common::rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let ct = cipher
+            .encrypt(&Nonce::from(nonce_bytes), plaintext)
+            .map_err(|e| format!("fgtw seal: {e}"))?;
+        let mut out = Vec::with_capacity(12 + ct.len());
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    fn open(&self, sealed: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+        if sealed.len() < 12 + 16 {
+            return Err(format!("fgtw open: blob too short ({} bytes)", sealed.len()));
+        }
+        let (nonce_bytes, ct) = sealed.split_at(12);
+        let nonce = Nonce::try_from(nonce_bytes).map_err(|_| "fgtw open: bad nonce".to_string())?;
+        ChaCha20Poly1305::new(key.into())
+            .decrypt(&nonce, ct)
+            .map_err(|e| format!("fgtw open: {e}"))
+    }
+}
+
+/// The fleet key for this device, or why we can't have it right now. `recover_or_establish`
+/// mints epoch 1 when this device is the genesis founder; a freshly-paired device whose wrap
+/// hasn't been rotated in yet gets `None` — that's the two-phase gate, not an error.
+fn fleet_key(t: &RdTransport, state: &EnrollState) -> Result<[u8; 32], String> {
+    let kp = device_keypair().map_err(|e| e.to_string())?;
+    fgtw::client::recover_or_establish_fleet_key(t, &state.handle_proof, &kp)?
+        .ok_or_else(|| "no fleet-key wrap for this device yet (awaiting sponsor rotation)".into())
+}
+
+/// Publish this device's RustDesk ID into its own fleet device-settings map.
+/// Pull-merge-push (like photon's push_roster) so sibling maps and the roster ride along
+/// untouched. Best-effort: chooser data, not auth — failure is logged, never fatal, and the
+/// next enroll/ID-change retries.
+pub fn publish_own_id(state: &EnrollState, device_key: &Keypair) {
+    if let Err(e) = publish_own_id_inner(state, device_key) {
+        log::warn!("fgtw: publishing rustdesk id to fleet failed (will retry later): {e}");
+    }
+}
+
+fn publish_own_id_inner(state: &EnrollState, device_key: &Keypair) -> Result<(), String> {
+    use fgtw::fstate::{DeviceSetting, DeviceSettings};
+    let t = RdTransport::enroll();
+    let key = fleet_key(&t, state)?;
+    let mut fs = fgtw::client::pull_fstate(&t, &RdSealer, &state.handle_proof, &key)?
+        .unwrap_or_default();
+    let me = device_key.public.to_bytes();
+    let now = vsf::eagle_time_oscillations();
+    let entry = DeviceSetting {
+        key: SETTING_RUSTDESK_ID.to_owned(),
+        value: Config::get_id().into_bytes(),
+        updated: now,
+        linked: false, // per-device by nature; never follows a fleet-global value
+    };
+    match fs.device_settings.iter_mut().find(|d| d.device_pubkey == me) {
+        Some(map) => {
+            match map.entries.iter_mut().find(|e| e.key == SETTING_RUSTDESK_ID) {
+                Some(e) => *e = entry,
+                None => map.entries.push(entry),
+            }
+            map.updated = now;
+        }
+        None => fs.device_settings.push(DeviceSettings {
+            device_pubkey: me,
+            updated: now,
+            entries: vec![entry],
+        }),
+    }
+    fgtw::client::push_fstate(&t, &RdSealer, &state.handle_proof, device_key, &key, &fs)
+}
+
+/// One fleet device as the chooser renders it.
+pub struct FleetDevice {
+    pub pubkey: [u8; 32],
+    /// Fleet-scoped two-word default name (`device_name_default`); the roster petname
+    /// supersedes this once roster sync lands.
+    pub name: String,
+    /// The device's RustDesk ID for the rendezvous connect path; `None` until that device
+    /// has published it (older build, or publish still pending).
+    pub rustdesk_id: Option<String>,
+    /// True for this machine's own entry (the chooser greys it out).
+    pub is_self: bool,
+}
+
+/// The current fleet as a chooser list: every member (fresh fold, cache fallback within
+/// bound) with its fleet-scoped name and, where published, its RustDesk ID. Liveness is the
+/// rendezvous server's job — hand `rustdesk_id` to the normal connect path.
+pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
+    let state = EnrollState::load().ok_or("not enrolled")?;
+    let members = current_fleet(&state)?;
+    let me = device_keypair().map(|k| k.public.to_bytes()).ok();
+    // ID map is best-effort: an unreachable slot or missing wrap degrades to names-only.
+    let ids: HashMap<[u8; 32], String> = (|| -> Result<_, String> {
+        let t = RdTransport::auth();
+        let key = fleet_key(&t, &state)?;
+        let fs = fgtw::client::pull_fstate(&t, &RdSealer, &state.handle_proof, &key)?
+            .unwrap_or_default();
+        Ok(fs
+            .device_settings
+            .into_iter()
+            .filter_map(|d| {
+                d.entries
+                    .into_iter()
+                    .find(|e| e.key == SETTING_RUSTDESK_ID)
+                    .and_then(|e| String::from_utf8(e.value).ok())
+                    .map(|id| (d.device_pubkey, id))
+            })
+            .collect())
+    })()
+    .unwrap_or_else(|e| {
+        log::warn!("fgtw: fleet id map unavailable ({e}); chooser degrades to names-only");
+        HashMap::new()
+    });
+    Ok(members
+        .iter()
+        .map(|m| FleetDevice {
+            pubkey: *m,
+            name: fgtw::pair::device_name_default(m, &state.identity_seed),
+            rustdesk_id: ids.get(m).cloned(),
+            is_self: me == Some(*m),
+        })
+        .collect())
 }
 
 // ── handshake payload ──
@@ -414,7 +579,7 @@ pub fn enroll(handle_input: &str) -> Result<String, String> {
             }
             // Not a member and a fleet already exists → must be added from an existing device.
             Err(e) if e.contains("enroll it from an existing device") => {
-                return pair_flow(&t, &device_key, &handle_proof);
+                return pair_flow(&t, &device_key, &handle_proof, &identity_seed);
             }
             Err(e) => {
                 last_err = e;
@@ -429,9 +594,16 @@ pub fn enroll(handle_input: &str) -> Result<String, String> {
         return Err(last_err);
     }
     let (members, tip) = fgtw::client::current_members_with_ts(&t, &handle_proof)?;
-    EnrollState { handle_proof, members: members.clone(), tip_osc: tip, fetched_at: now_secs() }
-        .save()?;
+    let state = EnrollState {
+        handle_proof,
+        identity_seed,
+        members: members.clone(),
+        tip_osc: tip,
+        fetched_at: now_secs(),
+    };
+    state.save()?;
     seed_rustdesk_identity(&device_key);
+    publish_own_id(&state, &device_key);
     Ok(format!(
         "Enrolled. This device ({:02x?}…) is one of {} fleet member(s).",
         &me[..4],
@@ -452,31 +624,45 @@ fn seed_rustdesk_identity(device_key: &Keypair) {
     Config::set_key_pair((sk, pk.to_vec()));
 }
 
-fn pair_flow(t: &RdTransport, device_key: &Keypair, handle_proof: &[u8; 32]) -> Result<String, String> {
+fn pair_flow(
+    t: &RdTransport,
+    device_key: &Keypair,
+    handle_proof: &[u8; 32],
+    identity_seed: &[u8; 32],
+) -> Result<String, String> {
     let me = device_key.public.to_bytes();
-    let pairing = fgtw::pair::new_pairing_id();
-    fgtw::client::post_pairing_request(t, &pairing, &me, handle_proof)?;
+    // Post the binding request: device-signed consent, co-signed by the identity key (the
+    // registry write gate). No NFC secret from a CLI enroll — all-zero = none offered.
+    fgtw::client::bindreq_put(t, device_key, identity_seed, handle_proof, &[0u8; 32])?;
     println!("\nThis device isn't in the fleet yet. On an already-enrolled device (e.g. Photon),");
     println!("approve pairing for these words:\n");
-    println!("    {}\n", fgtw::pair::pair_words(&pairing.public.to_bytes()));
+    println!("    {}\n", fgtw::pair::masked_device_words(&me, identity_seed));
     println!("Waiting up to 5 minutes for approval...");
     // The approving device runs bind_device, which folds our pubkey into the chain; we detect
-    // completion by our pubkey appearing in the current member set.
-    for _ in 0..150 {
+    // completion by our pubkey appearing in the current member set. The request stamp lapses
+    // at 5 min, so re-post at ~3.5 min in case the human is slow to pick up the other device.
+    for i in 0..150 {
         std::thread::sleep(std::time::Duration::from_secs(2));
+        if i == 105 {
+            let _ = fgtw::client::bindreq_put(t, device_key, identity_seed, handle_proof, &[0u8; 32]);
+        }
         let (members, tip) = match fgtw::client::current_members_with_ts(t, handle_proof) {
             Ok(v) => v,
             Err(_) => continue,
         };
         if members.contains(&me) {
-            EnrollState {
+            // Best-effort: clear our own request now that we're bound (else the stamp lapses).
+            let _ = fgtw::client::bindreq_withdraw(t, device_key, handle_proof);
+            let state = EnrollState {
                 handle_proof: *handle_proof,
+                identity_seed: *identity_seed,
                 members: members.clone(),
                 tip_osc: tip,
                 fetched_at: now_secs(),
-            }
-            .save()?;
+            };
+            state.save()?;
             seed_rustdesk_identity(device_key);
+            publish_own_id(&state, device_key);
             return Ok(format!(
                 "Paired. This device ({:02x?}…) is now one of {} fleet member(s).",
                 &me[..4],
@@ -564,9 +750,22 @@ mod tests {
     }
 
     #[test]
+    fn sealer_round_trips_and_rejects_wrong_key() {
+        use fgtw::client::FleetSealer;
+        let key = [7u8; 32];
+        let sealed = RdSealer.seal(b"fleet state bytes", &key).unwrap();
+        // kete wire form: 12-byte nonce ‖ ct(+16 tag)
+        assert_eq!(sealed.len(), 12 + 17 + 16);
+        assert_eq!(RdSealer.open(&sealed, &key).unwrap(), b"fleet state bytes");
+        assert!(RdSealer.open(&sealed, &[8u8; 32]).is_err());
+        assert!(RdSealer.open(&sealed[..20], &key).is_err());
+    }
+
+    #[test]
     fn enroll_state_round_trips() {
         let s = EnrollState {
             handle_proof: [5u8; 32],
+            identity_seed: [6u8; 32],
             members: vec![[1u8; 32], [2u8; 32]],
             tip_osc: 123456789,
             fetched_at: 99,
@@ -574,6 +773,7 @@ mod tests {
         let bytes = s.to_bytes().unwrap();
         let back = EnrollState::from_bytes(&bytes).unwrap();
         assert_eq!(back.handle_proof, s.handle_proof);
+        assert_eq!(back.identity_seed, s.identity_seed);
         assert_eq!(back.members, s.members);
         assert_eq!(back.tip_osc, s.tip_osc);
         assert_eq!(back.fetched_at, s.fetched_at);
