@@ -610,6 +610,14 @@ impl UI {
         refresh_fleet_peers();
     }
 
+    /// This machine's fleet name for the home screen — what the rest of the fleet calls us.
+    fn get_fleet_self_name(&self) -> String {
+        #[cfg(feature = "fgtw")]
+        return crate::fgtw_auth::self_fleet_name().unwrap_or_default();
+        #[cfg(not(feature = "fgtw"))]
+        String::new()
+    }
+
     /// The fleet tab shows when this build has fgtw AND the machine is enrolled or has a
     /// login session to adopt (opening the tab triggers the adoption).
     fn has_fleet(&self) -> bool {
@@ -840,6 +848,7 @@ impl sciter::EventHandler for UI {
         fn get_fleet_peers();
         fn refresh_fleet_peers();
         fn has_fleet();
+        fn get_fleet_self_name();
         fn get_uuid();
         fn has_hwcodec();
         fn has_vram();

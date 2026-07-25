@@ -133,6 +133,15 @@ span.clear-input:hover {
     color: black;
 }
 
+/* This machine's fleet name — what every other fleet device calls us. The name is the
+   identity; the numeric ID below is plumbing. */
+.fleet-self-name {
+    font-size: 1.5em;
+    font-weight: bold;
+    color: color(text);
+    margin-top: 0.3em;
+}
+
 .your-desktop {
     border-spacing: 0.5em;
     border-left: color(accent) solid 2px;

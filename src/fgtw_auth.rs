@@ -399,6 +399,18 @@ pub fn republish_own_id() {
     });
 }
 
+/// This machine's own fleet-scoped name — the label every other fleet device shows for
+/// us in its chooser (device_name_default over our pubkey + the identity seed). Pure
+/// local derivation; `None` when not enrolled.
+pub fn self_fleet_name() -> Option<String> {
+    let state = EnrollState::load()?;
+    let kp = device_keypair().ok()?;
+    Some(fgtw::pair::device_name_default(
+        &kp.public.to_bytes(),
+        &state.identity_seed,
+    ))
+}
+
 /// One fleet device as the chooser renders it.
 pub struct FleetDevice {
     pub pubkey: [u8; 32],

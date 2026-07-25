@@ -717,6 +717,7 @@ class App: Reactor.Component
                         </div>
                         <div .lighter-text>{outgoing_only ? translate('outgoing_only_desk_tip') : translate('desk_tip')}</div>
                         {outgoing_only ? <div style="position:absolute; left:-10000px; top:-10000px; width:0; height:0; overflow:hidden"><MyIdMenu /></div> : ""}
+                        {handler.get_fleet_self_name() && <div .fleet-self-name>{handler.get_fleet_self_name()}</div>}
                         {!outgoing_only && <div .your-desktop>
                             <MyIdMenu />
                             {key_confirmed ? <input type="text" readonly value={formatId(get_id())}/> : translate("Generating ...")}
