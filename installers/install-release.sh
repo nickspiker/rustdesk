@@ -102,9 +102,14 @@ fi
 
 echo "Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
-mv "$TMP_BINARY" "$INSTALL_DIR/$BINARY_NAME"
+# cp (not mv): mv from /tmp drags the SELinux user_tmp_t label along on Fedora-family
+# systems, and dlopen of a tmp-labeled library is denied — the app then can't find its
+# UI runtime. A fresh copy inherits the destination context.
+cp "$TMP_BINARY" "$INSTALL_DIR/$BINARY_NAME"
 # The sciter loader searches the executable's own directory.
-mv "$TMP_SCITER" "$INSTALL_DIR/$SCITER_NAME"
+cp "$TMP_SCITER" "$INSTALL_DIR/$SCITER_NAME"
+rm -f "$TMP_BINARY" "$TMP_SCITER"
+command -v restorecon >/dev/null 2>&1 && restorecon "$INSTALL_DIR/$BINARY_NAME" "$INSTALL_DIR/$SCITER_NAME" 2>/dev/null || true
 if [ "$OS" = "Darwin" ]; then
     xattr -c "$INSTALL_DIR/$BINARY_NAME" "$INSTALL_DIR/$SCITER_NAME" 2>/dev/null || true
 fi

@@ -57,6 +57,17 @@ pub fn start(args: &mut [String]) {
                 break;
             }
         }
+        // User-local install (install-release.sh): the .so ships next to the binary and
+        // wins over the package paths, so ~/.local/bin/rustdesk runs without root.
+        // set_library makes rust-sciter try ONLY this path — without this branch an
+        // inline build ignores the exe-dir .so entirely and dies on unpackaged installs.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(p) = exe.parent().map(|d| d.join("libsciter-gtk.so")) {
+                if p.exists() {
+                    so_path = p.to_string_lossy().to_string();
+                }
+            }
+        }
         sciter::set_library(&so_path).ok();
     }
     #[cfg(windows)]
