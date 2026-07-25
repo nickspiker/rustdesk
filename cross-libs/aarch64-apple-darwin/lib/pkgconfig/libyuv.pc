@@ -1,0 +1,9 @@
+prefix=/mnt/Octopus/Code/rustdesk/cross-libs/aarch64-apple-darwin
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: libyuv
+Description: YUV conversion and scaling library (static, aarch64-apple-darwin)
+Version: 1.0.0
+Libs: -L${libdir} -lyuv -lc++
+Cflags: -I${includedir}

@@ -8,7 +8,12 @@ fn build_windows() {
     println!("cargo:rerun-if-changed={}", file2);
 }
 
-#[cfg(target_os = "macos")]
+// No host cfg: build scripts compile for the HOST, so gating this on
+// target_os = "macos" silently skipped macos.mm when cross-compiling from Linux
+// (osxcross), leaving ~14 extern "C" symbols in platform/macos.rs undefined at link.
+// The caller gates on CARGO_CFG_TARGET_OS instead; cc picks the right compiler from
+// CXX_aarch64_apple_darwin. The 10.14 sniff only ever matches on a native mac host,
+// which is exactly when it's relevant.
 fn build_mac() {
     let file = "src/platform/macos.mm";
     let mut b = cc::Build::new();
@@ -86,7 +91,6 @@ fn main() {
     build_windows();
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
     if target_os == "macos" {
-        #[cfg(target_os = "macos")]
         build_mac();
         println!("cargo:rustc-link-lib=framework=ApplicationServices");
     }
