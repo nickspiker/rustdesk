@@ -12,6 +12,16 @@ set -e
 cd "$(dirname "$0")"
 source scripts/lib/github.sh
 
+# One deploy at a time (photon's publish-lock lesson, relearned 2026-07-25: two
+# concurrent deploys computed the same release number; the loser died on the duplicate
+# tag AFTER overwriting R2, stranding the GitHub mirror + website stamp). fd 9 held for
+# the script's life; a second deploy blocks here until the first finishes.
+exec 9>>/tmp/rustdesk-publish.lock
+if ! flock -n 9; then
+    echo "Another deploy is running — waiting for it to finish..."
+    flock 9
+fi
+
 if [ -n "$(git status --porcelain)" ]; then
     echo "ERROR: working tree is dirty — a release stamps HEAD into the signed manifest."
     echo "       Commit (or stash) first."
