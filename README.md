@@ -13,6 +13,81 @@
 > The developers of RustDesk do not condone or support any unethical or illegal use of this software. Misuse, such as unauthorized access, control or invasion of privacy, is strictly against our guidelines. The authors are not responsible for any misuse of the application.
 
 
+---
+
+# This fork: passless remote desktop
+
+**Your machines just show up. Click one. You're in.**
+
+No password. No click-to-accept. No account. No server you have to trust.
+
+This fork replaces RustDesk's server-based trust with [passless](https://holdmyoscilloscope.com/passless/) fleet
+authentication: your devices already know each other, so connecting to your own
+machine requires proving nothing to anybody — least of all to a rendezvous server.
+
+## Why
+
+Stock RustDesk, like everything else, inherits the fifty-year-old design flaw:
+trust lives with a counterparty, and you rent it back. The rendezvous server
+vouches for who's who; a per-machine password or a human clicking "Accept"
+papers over the gap. Every one of those is a secret or a ceremony standing in
+for a fact the machines could simply know.
+
+Passless deletes the counterparty. A name you choose is transformed — on your
+own hardware, by open one-way mathematics — into keys that never leave it. Your
+devices bind into a **fleet** by a signed membership chain. Two members of the
+same fleet verify *each other* against their *own* copy of that chain. The
+rendezvous server is demoted to what it should have been all along: dumb NAT
+plumbing, with no say in who trusts whom.
+
+## What it feels like
+
+- **If you're logged in** (e.g. [Photon](https://holdmyoscilloscope.com/photon/) attested this machine), RustDesk adopts
+  that login automatically. Zero setup. The **My Fleet** tab lists your machines
+  by name; click one and you're on it.
+- **Connecting is passless both ways.** The host proves itself to you (its
+  identity is signed by a fleet key you can check yourself), and you prove
+  yourself to the host (a per-connection signature bound to the session — a
+  replay is worthless). No password prompt, no one clicking "allow" at the
+  other end.
+- **Losing a device is losing a device, not your identity.** Remove it from any
+  other device; the fleet key rotates away from it and it's cryptographically
+  locked out — including out of the fleet roster itself.
+- **Strangers get stock RustDesk.** Non-fleet peers see the normal
+  password/consent flow, untouched. Built without the feature flag, the binary
+  is byte-identical to vanilla.
+
+## Setup
+
+Nothing, usually. If the machine has a passless login (Photon), RustDesk adopts
+it at startup — membership is proven by the fleet key itself, not by anything
+you type. On a machine with no login yet, once:
+
+```
+rustdesk --fgtw-enroll <handle>
+```
+
+First machine ever claims the fleet; later machines show pair-words you approve
+from a device you already hold. That enrollment *is* the machine's login — every
+passless app shares it from then on. Details: [docs/fgtw.md](docs/fgtw.md), macOS: [MAC-SETUP.md](MAC-SETUP.md).
+
+## Build
+
+Needs the passless substrate crates checked out as siblings of this repo —
+[`tohu`](https://github.com/nickspiker/tohu) (device identity), [`ihi`](https://github.com/nickspiker/ihi) (one-way primitives), [`fgtw`](https://github.com/nickspiker/fgtw) (the fleet), [`vsf`](https://github.com/nickspiker/vsf) (the wire) —
+plus this fork's `hbb_common` submodule. Then:
+
+```
+cargo build --release --features fgtw
+```
+
+The feature is off by default; without it this fork builds and behaves as
+upstream RustDesk (MSRV unchanged). With it, rustc ≥ 1.85.
+
+Passless has no company, no telemetry, and nothing to sell you.
+
+---
+
 Chat with us: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk) | [YouTube](https://www.youtube.com/@rustdesk)
 
 [![RustDesk Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-Advanced%20Features-blue)](https://rustdesk.com/pricing.html)
