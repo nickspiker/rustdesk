@@ -33,7 +33,7 @@ table > tbody {
   behavior: select-multiple;
   overflow-y: scroll-indicator;
   size: *;
-  background: white;
+  background: color(bg);
 }
 
 table th {
@@ -78,8 +78,8 @@ table.has_current thead th:current {
   font-weight: bold;
 }
 
-table tr:nth-child(odd) { background-color: white; } /* each odd row */
-table tr:nth-child(even) { background-color: #F4F5F6; } /* each even row */
+table tr:nth-child(odd) { background-color: color(bg); } /* each odd row */
+table tr:nth-child(even) { background-color: color(menu-hover); } /* each even row */
 
 table.has_current tr:current /* current row */
 {
@@ -151,7 +151,7 @@ div.toolbar > div.button {
 
 div.toolbar > div.button:active {
   opacity: 1;
-  background-color: #ddd;
+  background-color: color(menu-hover);
 }
 
 div.toolbar > div.button:hover {

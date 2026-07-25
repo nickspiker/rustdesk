@@ -388,7 +388,7 @@ div#myid svg#menu, div#tags-label svg#menu {
 }
 
 div#tags-label svg#menu:hover {
-    background-color: #ddd;
+    background-color: color(menu-hover);
 }
 
 div.remote-session svg#menu {

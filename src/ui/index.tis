@@ -487,14 +487,10 @@ function open_proxy_dialog() {
 }
 
 function updateTheme() {
+    // Dark is the default palette; "enable-darktheme" uses the generic enable- semantics
+    // (on unless explicitly N), and only N applies the light override.
     var root_element = self;
-    if (handler.get_option("allow-darktheme") == "Y") {
-        // enable dark theme
-        root_element.attributes.toggleClass("darktheme", true);
-    } else {
-        // disable dark theme
-        root_element.attributes.toggleClass("darktheme", false);
-    }
+    root_element.attributes.toggleClass("lighttheme", handler.get_option("enable-darktheme") == "N");
 }
 
 class MyIdMenu: Reactor.Component {
@@ -544,7 +540,7 @@ class MyIdMenu: Reactor.Component {
                 <li #login>{translate('Login')}</li>)}
                 {!disable_change_id && !disable_settings && handler.is_ok_change_id() && key_confirmed && connect_status > 0 ? <li #change-id>{translate('Change ID')}</li> : ""}
                 <div .separator />
-                <li #allow-darktheme><span>{svg_checkmark}</span>{translate('Dark Theme')}</li>
+                <li #enable-darktheme><span>{svg_checkmark}</span>{translate('Dark Theme')}</li>
                 <Languages />
                 {disable_installation ? "" : <li #allow-auto-update><span>{svg_checkmark}</span>{translate('Auto update')}</li>} 
                 <li #about>{translate('About')} {" "}{handler.get_app_name()}</li>
@@ -657,7 +653,7 @@ class MyIdMenu: Reactor.Component {
                 check_status();
                 return " ";
             }, msgbox_default_height, get_msgbox_width());
-        } else if (me.id == "allow-darktheme") {
+        } else if (me.id == "enable-darktheme") {
             updateTheme();
         } else if (me.id == "about") {
             this.showAbout()

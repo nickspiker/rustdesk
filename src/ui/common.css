@@ -1,15 +1,19 @@
+/* Dark by default: subtle dark surfaces, bright-ish (never pure white) text.
+   Light is the opt-out (enable-darktheme=N) — inverting the default means every
+   window (main, connection manager, install, msgbox) is dark even before any
+   theme code runs. */
 html {
     var(accent): #0071ff;
     var(button): #2C8CFF;
-    var(gray-bg): #eee;
-    var(bg): white;
-    var(border): #ccc;
-    var(hover-border): #999;
-    var(text): #222;
-    var(placeholder): #aaa;
-    var(lighter-text): #888;
-    var(light-text): #666;
-    var(menu-hover): #D7E4F2;
+    var(gray-bg): #0f1318;
+    var(bg): #15191f;
+    var(border): #3a4148;
+    var(hover-border): #5a6470;
+    var(text): #dfe6ee;
+    var(placeholder): #5c6672;
+    var(lighter-text): #7e8894;
+    var(light-text): #9aa4ae;
+    var(menu-hover): #242b34;
     var(dark-red): #A72145;
     var(dark-yellow): #FBC732;
     var(dark-blue): #2E2459;
@@ -19,20 +23,20 @@ html {
     var(light-green): #D4EAB7;
     var(dark-green): #5CB85C;
     var(blood-red): #F82600;
-    var(gray-bg-osx): rgba(238, 238, 238, 0.75);
+    var(gray-bg-osx): rgba(21, 25, 31, 0.75);
 }
 
-html.darktheme {
-    var(bg): #252525;
-    var(gray-bg): #141414;
-    var(menu-hover): #2D3033;
-    var(border): #555;
-
-    var(text): white;
-    var(light-text): #999;
-    var(lighter-text): #777;
-    var(placeholder): #555;
-    var(gray-bg-osx): rgba(37, 37, 37, 0.75);
+html.lighttheme {
+    var(gray-bg): #eee;
+    var(bg): white;
+    var(border): #ccc;
+    var(hover-border): #999;
+    var(text): #222;
+    var(placeholder): #aaa;
+    var(lighter-text): #888;
+    var(light-text): #666;
+    var(menu-hover): #D7E4F2;
+    var(gray-bg-osx): rgba(238, 238, 238, 0.75);
 }
 
 body {
@@ -117,13 +121,13 @@ textarea:empty {
 {
   .prev { display:none; }
   .next { display:none; }
-  .base, .next-page, .prev-page { background: white;}
-  .slider { background: #bbb; border: white solid 4px; }
+  .base, .next-page, .prev-page { background: color(gray-bg);}
+  .slider { background: #4a545e; border: color(gray-bg) solid 4px; }
   .base:disabled { background: transparent; }
   .slider:hover  { background: grey; }
   .slider:active { background: grey; }
   .base { size: 16px; }
-  .corner { background: white; }
+  .corner { background: color(gray-bg); }
 }
 
 @mixin ELLIPSIS {
@@ -177,7 +181,7 @@ header div.window-icon {
 
 @media platform != "OSX" {
 header {
-  background: white;
+  background: color(bg);
   height: 30px;
 }
 
@@ -405,7 +409,7 @@ menu li.line-through, menu li.line-through :hover {
 
 div#msgbox .msgbox-icon svg {
   size: 80px;
-  background: white;
+  background: color(bg);
 
 }
 

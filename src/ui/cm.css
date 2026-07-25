@@ -34,11 +34,11 @@ div.chaticon:hover svg {
 }
 
 div.chaticon:active {
-    background: white;
+    background: color(menu-hover);
 }
 
 div.right-panel {
-    background: white;
+    background: color(bg);
     border-left: color(border) 1px solid;
     size: *;
 }
@@ -86,7 +86,7 @@ div.permissions icon {
 }
 
 div.permissions > div.disabled {
-    background: #ddd;
+    background: color(menu-hover);
 }
 
 div.permissions > div:active {
@@ -268,7 +268,7 @@ div.tab-arrows {
     position: absolute;
     right: 2px;
     font-weight: bold;
-    background: white;
+    background: color(bg);
 }
 
 div.tab-arrows span {
@@ -286,5 +286,5 @@ div.tab-arrows span:hover {
 
 div.tab-arrows span:active {
     opacity: 1;
-    background-color: #ddd;
+    background-color: color(menu-hover);
 }
