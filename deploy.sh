@@ -69,9 +69,10 @@ fetch_sciter "https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.os
 # BUILD PHASE — nothing public until every artefact exists and is signed.
 # ════════════════════════════════════════════════════════════════════════════════════
 
-# Release tools first — photon's signer + manifest builder.
+# Release tools first — photon's signer + manifest builder. PHOTON_ALLOW_RELEASE unblocks
+# photon's build.rs release-guard (same as photon's own deploy.sh does).
 echo "Building release tools (signer + manifest)..."
-( cd ../photon && cargo build --release --bin photon-signature-signer --bin photon-manifest )
+( cd ../photon && PHOTON_ALLOW_RELEASE=1 cargo build --release --bin photon-signature-signer --bin photon-manifest )
 
 # Inline the sciter UI — without this an installed binary shows a blank window
 # (non-inline builds load UI pages from file:// relative to cwd).
