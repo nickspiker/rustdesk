@@ -250,17 +250,19 @@ fn main() {
     gen_vcpkg_package("libyuv", "yuv_ffi.h", "yuv_ffi.rs", ".*");
     // ffmpeg();
 
+    // TARGET os, not host cfg!() — host cfgs picked x11 for a mac binary cross-compiled
+    // from Linux (host is unix), compiling the wayland/x11 capture stack into it.
     if target_os == "ios" {
         // nothing
     } else if target_os == "android" {
         println!("cargo:rustc-cfg=android");
-    } else if cfg!(windows) {
+    } else if target_os == "windows" {
         // The first choice is Windows because DXGI is amazing.
         println!("cargo:rustc-cfg=dxgi");
-    } else if cfg!(target_os = "macos") {
+    } else if target_os == "macos" {
         // Quartz is second because macOS is the (annoying) exception.
         println!("cargo:rustc-cfg=quartz");
-    } else if cfg!(unix) {
+    } else {
         // On UNIX we pray that X11 (with XCB) is available.
         println!("cargo:rustc-cfg=x11");
     }

@@ -57,6 +57,20 @@ plumbing, with no say in who trusts whom.
   password/consent flow, untouched. Built without the feature flag, the binary
   is byte-identical to vanilla.
 
+## Install
+
+One line, prebuilt, verified (Linux x86_64 / macOS Apple Silicon; more coming):
+
+```
+curl -sSfL https://brobdingnagian.holdmyoscilloscope.com/rustdesk/install-release.sh | sh
+```
+
+Fallback mirror: grab the same binaries from
+[GitHub releases](https://github.com/nickspiker/rustdesk/releases) (latest `fgtw-v*` tag).
+macOS asks you to grant Screen Recording + Accessibility on first use. The machine is
+reachable by your fleet while the app is running (service autostart is a later phase).
+Building from source is a developer path only — see [MAC-SETUP.md](MAC-SETUP.md).
+
 ## Setup
 
 Nothing, usually. If the machine has a passless login (Photon), RustDesk adopts
