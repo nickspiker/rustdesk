@@ -566,6 +566,55 @@ pub fn verify_host_signed_id(signed_id: &[u8]) -> Option<(String, [u8; 32])> {
     None
 }
 
+// ── session adoption (the passless path) ──
+
+/// Adopt this machine's existing login: read the tohu session registers (set by whichever
+/// app the user attested in — e.g. Photon) and prove membership with the FLEET KEY — if this
+/// device's key opens a wrap in the fleet's fan-out, the machine is a current member; no
+/// handle typed, no ceremony. Persists EnrollState, seeds the RustDesk identity from the
+/// fleet key, and publishes our RustDesk ID to the fleet's chooser map.
+///
+/// `Err` means "couldn't adopt right now", not "unauthorized": no session (nobody logged in
+/// on this machine), no wrap yet (freshly-bound device awaiting its sponsor's confirm
+/// rotation), or the fleet server is unreachable. Callers retry later or fall back to
+/// `--fgtw-enroll <handle>` bootstrap.
+pub fn adopt_session() -> Result<String, String> {
+    let s = tohu::session()
+        .ok_or("no session on this machine — log in (e.g. Photon), or run --fgtw-enroll <handle>")?;
+    let device_key = device_keypair().map_err(|e| e.to_string())?;
+    let t = RdTransport::enroll();
+    // The fleet-key gate: only current members hold a wrap in the fan-out.
+    fgtw::client::recover_fleet_key(&t, &s.handle_proof, &device_key)?
+        .ok_or("this device has no fleet-key wrap yet (not a member, or awaiting sponsor rotation)")?;
+    let (members, tip) = fgtw::client::current_members_with_ts(&t, &s.handle_proof)?;
+    let state = EnrollState {
+        handle_proof: s.handle_proof,
+        identity_seed: s.identity_seed,
+        members: members.clone(),
+        tip_osc: tip,
+        fetched_at: now_secs(),
+    };
+    state.save()?;
+    seed_rustdesk_identity(&device_key);
+    publish_own_id(&state, &device_key);
+    Ok(format!(
+        "Adopted session: fleet member on this machine ({} member(s)).",
+        members.len()
+    ))
+}
+
+/// Best-effort background adoption for service/UI startup: only fires when there's a session
+/// to adopt and no (readable) enrollment yet, and never blocks the caller.
+pub fn try_adopt_session() {
+    if EnrollState::load().is_some() {
+        return;
+    }
+    std::thread::spawn(|| match adopt_session() {
+        Ok(msg) => log::info!("fgtw: {msg}"),
+        Err(e) => log::info!("fgtw: session adoption not available: {e}"),
+    });
+}
+
 // ── enrollment (CLI) ──
 
 /// Enroll this machine into the fleet for `handle_input`. Creates the fleet genesis if none
@@ -577,6 +626,19 @@ pub fn enroll(handle_input: &str) -> Result<String, String> {
     println!("Deriving identity for \"{handle}\" (memory-hard, ~1s)...");
     let identity_seed = *ihi::handle_to_hash(&handle).as_bytes();
     let handle_proof = *ihi::handle_to_proof(&handle).as_bytes();
+    // On success this bootstrap IS the machine's login: park the derived roots in the tohu
+    // session registers so every other app (and future rustdesk runs) adopts them instead of
+    // re-prompting for the handle. The string itself is dropped here, never stored.
+    let session_regs = tohu::SessionIdentity {
+        identity_seed,
+        vault_seed: tohu::handle_seed(&handle),
+        handle_proof,
+    };
+    let park_session = move || {
+        if let Err(e) = tohu::set_session(&session_regs) {
+            log::warn!("fgtw: couldn't park session registers: {e}");
+        }
+    };
     let device_key = device_keypair().map_err(|e| e.to_string())?;
     let me = device_key.public.to_bytes();
     let t = RdTransport::enroll();
@@ -594,7 +656,10 @@ pub fn enroll(handle_input: &str) -> Result<String, String> {
             }
             // Not a member and a fleet already exists → must be added from an existing device.
             Err(e) if e.contains("enroll it from an existing device") => {
-                return pair_flow(&t, &device_key, &handle_proof, &identity_seed);
+                return pair_flow(&t, &device_key, &handle_proof, &identity_seed).map(|msg| {
+                    park_session();
+                    msg
+                });
             }
             Err(e) => {
                 last_err = e;
@@ -619,6 +684,7 @@ pub fn enroll(handle_input: &str) -> Result<String, String> {
     state.save()?;
     seed_rustdesk_identity(&device_key);
     publish_own_id(&state, &device_key);
+    park_session();
     Ok(format!(
         "Enrolled. This device ({:02x?}…) is one of {} fleet member(s).",
         &me[..4],

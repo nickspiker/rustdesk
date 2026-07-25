@@ -461,8 +461,15 @@ pub fn core_main() -> Option<Vec<String>> {
                     Ok(msg) => println!("{msg}"),
                     Err(e) => println!("Enrollment failed: {e}"),
                 }
+            } else if args.len() == 1 {
+                // Passless: adopt the machine's existing login (e.g. Photon's) — membership
+                // proven by the fleet key, no handle typed.
+                match crate::fgtw_auth::adopt_session() {
+                    Ok(msg) => println!("{msg}"),
+                    Err(e) => println!("Adoption failed: {e}"),
+                }
             } else {
-                println!("Usage: --fgtw-enroll <handle>");
+                println!("Usage: --fgtw-enroll [handle]   (no handle = adopt this machine's login)");
             }
             #[cfg(not(feature = "fgtw"))]
             println!("This build has no FGTW support (rebuild with --features fgtw).");

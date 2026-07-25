@@ -611,6 +611,11 @@ pub async fn start_server(is_server: bool, no_server: bool) {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        // Passless fleet auth: adopt the machine's login (fleet-key gate) off-thread, so a
+        // host whose user attested in Photon authorizes fleet peers with zero setup. Only
+        // sees the session when running in the user's login scope (XDG_RUNTIME_DIR).
+        #[cfg(feature = "fgtw")]
+        crate::fgtw_auth::try_adopt_session();
         #[cfg(target_os = "linux")]
         {
             log::info!("DISPLAY={:?}", std::env::var("DISPLAY"));

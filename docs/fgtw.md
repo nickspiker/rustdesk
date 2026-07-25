@@ -37,16 +37,30 @@ CXXFLAGS="-include cstdint" cargo build --release --features fgtw
 
 ## Enroll
 
+**Passless (the normal path): nothing.** If the user is logged in on this machine (e.g.
+Photon attested — the tohu session registers hold `{identity_seed, vault_seed,
+handle_proof}`), rustdesk adopts that login automatically at server start / first My Fleet
+open, or explicitly via `rustdesk --fgtw-enroll` (no handle). Membership is proven by the
+**fleet key**: this device's key (same fingerprint → same key as photon derives) opens its
+wrap in the fleet fan-out, or adoption is refused. No handle typed, no ceremony.
+
+**Bootstrap (no login on this machine yet):**
+
 ```
 rustdesk --fgtw-enroll <handle>
 ```
 
 - First device on a fresh handle: claims the fleet genesis.
-- Later device: prints pair-words; approve them from an already-enrolled device (e.g. Photon),
-  and enrollment completes when the fleet chain folds in this device.
+- Later device: posts a bind request and prints masked pair-words; approve them from an
+  already-enrolled device (e.g. Photon), and enrollment completes when the chain folds
+  this device in.
+- On success the derived roots are parked in the tohu session registers — the bootstrap IS
+  the machine's login; other apps (and future rustdesk runs) adopt it, the handle string is
+  dropped.
 
-State is written to `<config>/fgtw_auth.vsf` (handle proof, verified member set, chain tip,
-fetch time). Run enrollment with the same privilege as the running service.
+State is written to `<config>/fgtw_auth.vsf` (handle proof, identity seed, verified member
+set, chain tip, fetch time). Session adoption reads `$XDG_RUNTIME_DIR` — the running service
+must share the user's login scope to see it (or enroll/adopt at the service's privilege).
 
 ## Device chooser (fleet roster)
 

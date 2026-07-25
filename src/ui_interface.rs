@@ -840,6 +840,13 @@ pub fn get_fleet_peers() -> Vec<HashMap<&'static str, String>> {
 #[cfg(feature = "fgtw")]
 pub fn refresh_fleet_peers() {
     std::thread::spawn(|| {
+        // Passless: adopt the machine's login on first use (fleet-key gate; no-op if enrolled).
+        if !crate::fgtw_auth::is_enrolled() {
+            if let Err(e) = crate::fgtw_auth::adopt_session() {
+                log::info!("fgtw: session adoption failed: {e}");
+                return;
+            }
+        }
         let rows = match crate::fgtw_auth::fleet_roster() {
             Ok(devices) => devices
                 .into_iter()

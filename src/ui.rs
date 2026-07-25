@@ -599,10 +599,11 @@ impl UI {
         refresh_fleet_peers();
     }
 
-    /// The fleet tab shows only when this build has fgtw AND the machine is enrolled.
+    /// The fleet tab shows when this build has fgtw AND the machine is enrolled or has a
+    /// login session to adopt (opening the tab triggers the adoption).
     fn has_fleet(&self) -> bool {
         #[cfg(feature = "fgtw")]
-        return crate::fgtw_auth::is_enrolled();
+        return crate::fgtw_auth::is_enrolled() || tohu::session().is_some();
         #[cfg(not(feature = "fgtw"))]
         false
     }
