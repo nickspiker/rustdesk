@@ -61,20 +61,38 @@ Notes:
   this is usually unnecessary — add it only if libwebm fails on a missing `uint64_t`.
 - The `fgtw` feature pulls chacha20poly1305 0.11-rc → needs rustc ≥ 1.85.
 
-## 4. Enroll + test
+## 4. Sciter runtime
+
+The (non-Flutter) UI loads Sciter dynamically; put the dylib next to the binary:
 
 ```sh
-./target/release/rustdesk --fgtw-enroll <your-handle>
+curl -sL -o target/release/libsciter.dylib \
+  https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.osx/libsciter.dylib
+```
+
+## 5. Run — passless
+
+```sh
+./target/release/rustdesk
+```
+
+No enroll. If Photon is logged in on this machine, rustdesk adopts that login at startup
+(look for `fgtw: Adopted session: fleet member on this machine`): membership is proven by
+the fleet key — this machine's device key opening its wrap in the fan-out — and the
+**My Fleet** tab lists your machines by name.
+
+Fallback for a machine with no login (`fgtw: session adoption not available: no session`):
+
+```sh
+./target/release/rustdesk --fgtw-enroll <your-handle>   # once; becomes the machine login
 ```
 
 - First device on a fresh handle claims the fleet genesis.
-- A later device prints pair-words; approve them from an already-enrolled device (Photon)
-  to fold this device into the fleet.
+- A later device posts a bind request and prints masked pair-words; approve from an
+  already-enrolled device (Photon) to fold it in.
 
 State: `~/Library/Application Support/RustDesk/fgtw_auth.vsf` (+ the identity keypair is
-seeded into `RustDesk.toml`). Enrolling as the same machine already in your Photon fleet
-means RustDesk derives the **same** device key — no separate enrollment needed if the
-fingerprint matches.
+seeded into `RustDesk.toml`). Same machine as your Photon fleet ⇒ same device key.
 
 For a two-device live test, see the matrix in [docs/fgtw.md](docs/fgtw.md). In debug builds
 `RUSTDESK_FGTW_FINGERPRINT=<string>` overrides the device identity so one machine can play
