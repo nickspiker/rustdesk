@@ -15,7 +15,8 @@ use fluor::event::{ElementState, Event as FEvent, Key, MouseButton, MouseScrollD
 use fluor::host::app::{run_app, Context, FluorApp};
 use fluor::host::{EventResponse, WakeSender};
 use fluor::paint::draw_image;
-use fluor::Coord;
+use fluor::pixel::Blend;
+use fluor::{BlendMode, Coord};
 
 use hbb_common::config::keys;
 use hbb_common::{log, message_proto::*, rendezvous_proto::ConnType};
@@ -189,6 +190,9 @@ const BTN_LEFT: i32 = 1;
 const BTN_RIGHT: i32 = 2;
 const BTN_MIDDLE: i32 = 4;
 
+/// Opaque dark-grey letterbox, α+darkness packed (darkness 0xC0 → visible 0x3F).
+const BACKDROP: u32 = 0xFFC0_C0C0;
+
 struct FluorViewer {
     session: Session<FluorHandler>,
     shared: Arc<Shared>,
@@ -283,13 +287,16 @@ impl FluorApp for FluorViewer {
     fn on_event(&mut self, event: &FEvent, ctx: &mut Context) -> EventResponse {
         match event {
             FEvent::CloseRequested => return EventResponse::Close,
-            FEvent::CursorMoved { x, y } => {
-                self.last_cursor = (*x, *y);
+            FEvent::CursorMoved { .. } => {
+                // Use ctx.cursor_x/y (window-relative), NOT the event's x/y — those are raw
+                // screen coords offset by the window origin in fluor's fullscreen-compositor
+                // model, which desyncs the mapping (the "cram hard left"). See opsin.
+                let (cx, cy) = (ctx.cursor_x, ctx.cursor_y);
+                self.last_cursor = (cx, cy);
                 if self.panning {
-                    // right/middle drag pans the view (opsin model)
                     return EventResponse::Handled;
                 }
-                self.send_move(ctx, *x, *y);
+                self.send_move(ctx, cx, cy);
             }
             FEvent::MouseInput { state, button } => {
                 let (cx, cy) = (ctx.cursor_x, ctx.cursor_y);
@@ -350,22 +357,51 @@ impl FluorApp for FluorViewer {
                 target.len()
             );
         }
-        // dark backdrop
+        // Start transparent: draw_image composes UNDER existing content, so an opaque
+        // pre-fill would hide the video entirely (that was the grey box). Backdrop goes
+        // under everything at the END.
         for px in target.iter_mut() {
-            *px = 0xFF808080; // mid-grey in α+darkness = mid-grey visible
+            *px = 0;
         }
         let (scale, ox, oy, fw, fh) = self.transform(ctx);
         let f = self.shared.frame.lock().unwrap();
         if fw == 0 || fh == 0 || f.pixels.len() < fw * fh {
+            drop(f);
+            for px in target.iter_mut() {
+                *px = BACKDROP;
+            }
             return;
         }
-        self.last_seen_gen = f.gen;
-        let mut canvas = Canvas::new(target, bw, bh, ctx.damage);
+        // One-shot diagnostic on the first painted frame: confirm draw_image runs and sample
+        // a center pixel, to tell "grey = never blitted" from "grey = present/format issue".
+        if self.last_seen_gen != f.gen {
+            self.last_seen_gen = f.gen;
+            let mid = (fh / 2) * fw + fw / 2;
+            log::info!(
+                "fluor: blit gen={} dst={}x{} at ({},{}) scale={:.3} sample_px=0x{:08x}",
+                f.gen,
+                (fw as f32 * scale) as i32,
+                (fh as f32 * scale) as i32,
+                ox as i32,
+                oy as i32,
+                scale,
+                f.pixels.get(mid).copied().unwrap_or(0)
+            );
+        }
         let dst_w = fw as f32 * scale;
         let dst_h = fh as f32 * scale;
         let cx = ox + dst_w * 0.5;
         let cy = oy + dst_h * 0.5;
-        draw_image(&mut canvas, &f.pixels, fw, fh, cx, cy, dst_w, dst_h, None);
+        {
+            let mut canvas = Canvas::new(target, bw, bh, ctx.damage);
+            draw_image(&mut canvas, &f.pixels, fw, fh, cx, cy, dst_w, dst_h, None);
+        }
+        drop(f);
+        // Backdrop UNDER everything: fills the letterbox and makes the window opaque, while
+        // the (opaque) video pixels ride through unchanged.
+        for px in target.iter_mut() {
+            *px = px.under(BACKDROP, BlendMode::Normal);
+        }
     }
 
     fn cursor_for(
