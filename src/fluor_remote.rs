@@ -24,10 +24,10 @@ use scrap::ImageFormat;
 use crate::ui_session_interface::{io_loop, InvokeUiSession, Session};
 
 /// Cross-thread wake payload: the io_loop thread nudges the fluor UI thread.
+/// (Real connection-drop teardown is a Phase-4 item; today the user closes the window.)
 #[derive(Clone, Copy)]
 pub enum Wake {
     Frame,
-    Closed,
 }
 
 /// A decoded frame already converted to fluor's α+darkness packing, plus its dimensions.
@@ -48,7 +48,6 @@ struct Shared {
     proxy: Mutex<Option<Arc<dyn WakeSender<Wake>>>>,
     /// Remote cursor position (device px in the remote's space), for drawing our own pointer.
     cursor: Mutex<(i32, i32)>,
-    closed: Mutex<bool>,
 }
 
 impl Shared {
@@ -104,8 +103,10 @@ impl InvokeUiSession for FluorHandler {
     }
 
     fn close_success(&self) {
-        *self.shared.closed.lock().unwrap() = true;
-        self.shared.wake(Wake::Closed);
+        // Despite the name, this fires on the FIRST FRAME to dismiss the "connecting…"
+        // dialog — it means CONNECTED, not closed. Do NOT tear down the window here.
+        log::info!("fluor: first frame — connected");
+        self.shared.wake(Wake::Frame);
     }
 
     fn msgbox(&self, msgtype: &str, title: &str, text: &str, _link: &str, _retry: bool) {
@@ -272,7 +273,6 @@ impl FluorApp for FluorViewer {
     fn on_user_event(&mut self, event: Self::UserEvent, ctx: &mut Context) -> EventResponse {
         match event {
             Wake::Frame => ctx.window.request_redraw(),
-            Wake::Closed => return EventResponse::Close,
         }
         EventResponse::Pass
     }
