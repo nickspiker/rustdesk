@@ -1585,15 +1585,98 @@ pub fn current_resolution(name: &str) -> ResultType<Resolution> {
 }
 
 pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> ResultType<()> {
-    Command::new("xrandr")
-        .args(vec![
-            "--output",
-            name,
-            "--mode",
-            &format!("{}x{}", width, height),
-        ])
-        .spawn()?;
+    // The userspace "virtual display driver": when the requested mode doesn't exist,
+    // mint a CVT reduced-blanking modeline and add it on the fly, so the display can
+    // follow ANY window size a controlling peer asks for (VirtualBox-style follow).
+    let mode = format!("{}x{}", width, height);
+    let listed = Command::new("xrandr")
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim_start().split_whitespace().next() == Some(mode.as_str()))
+        })
+        .unwrap_or(false);
+    let mode_name = if listed { mode } else { mint_mode(name, width, height)? };
+    let out = Command::new("xrandr")
+        .args(vec!["--output", name, "--mode", &mode_name])
+        .output()?;
+    if !out.status.success() {
+        bail!(
+            "xrandr --mode {mode_name} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // Retire the previously minted mode (can't remove while it was active).
+    let mut last = LAST_MINTED_MODE.lock().unwrap();
+    if let Some(old) = last.take() {
+        if old != mode_name {
+            Command::new("xrandr").args(vec!["--delmode", name, &old]).output().ok();
+            Command::new("xrandr").args(vec!["--rmmode", &old]).output().ok();
+        }
+    }
+    if !listed {
+        *last = Some(mode_name);
+    }
     Ok(())
+}
+
+static LAST_MINTED_MODE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Create an xrandr mode for `width`x`height` @60Hz using CVT reduced-blanking timings
+/// (the LCD-appropriate variant: fixed 160px h-blank, minimal v-blank >= 460us) and attach
+/// it to `output`. Returns the minted mode name.
+fn mint_mode(output: &str, width: usize, height: usize) -> ResultType<String> {
+    let refresh = 60.0f64;
+    let h_total = (width + 160) as f64;
+    // Lines of v-blank: enough that v-blank time >= 460us at the target refresh.
+    let h_period_est = ((1.0e6 / refresh) - 460.0) / height as f64; // us per line
+    let mut vbi = (460.0 / h_period_est).floor() as usize + 1;
+    let v_sync = 10usize; // cvt's fallback for arbitrary aspect ratios
+    if vbi < 3 + v_sync + 6 {
+        vbi = 3 + v_sync + 6;
+    }
+    let v_total = (height + vbi) as f64;
+    let pclk_mhz = (refresh * h_total * v_total / 1.0e6 / 0.25).round() * 0.25;
+    let (hss, hse) = (width + 48, width + 48 + 32);
+    let (vss, vse) = (height + 3, height + 3 + v_sync);
+    let mode_name = format!("{}x{}_fgtw", width, height);
+    let timings = vec![
+        format!("{:.2}", pclk_mhz),
+        width.to_string(),
+        hss.to_string(),
+        hse.to_string(),
+        (h_total as usize).to_string(),
+        height.to_string(),
+        vss.to_string(),
+        vse.to_string(),
+        (v_total as usize).to_string(),
+        "+HSync".to_owned(),
+        "-VSync".to_owned(),
+    ];
+    // newmode may fail if a stale mode with this name survived a crash — remove and retry.
+    let newmode = |name: &str| -> ResultType<bool> {
+        let mut args = vec!["--newmode".to_owned(), name.to_owned()];
+        args.extend(timings.iter().cloned());
+        Ok(Command::new("xrandr").args(&args).output()?.status.success())
+    };
+    if !newmode(&mode_name)? {
+        Command::new("xrandr").args(vec!["--delmode", output, &mode_name]).output().ok();
+        Command::new("xrandr").args(vec!["--rmmode", &mode_name]).output().ok();
+        if !newmode(&mode_name)? {
+            bail!("xrandr --newmode {mode_name} failed");
+        }
+    }
+    let out = Command::new("xrandr")
+        .args(vec!["--addmode", output, &mode_name])
+        .output()?;
+    if !out.status.success() {
+        bail!(
+            "xrandr --addmode {mode_name} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(mode_name)
 }
 
 #[inline]

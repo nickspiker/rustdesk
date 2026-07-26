@@ -560,6 +560,7 @@ impl sciter::EventHandler for SciterSession {
         fn save_image_quality(String);
         fn save_custom_image_quality(i32);
         fn refresh_video(i32);
+        fn change_resolution(i32, i32, i32);
         fn record_screen(bool);
         fn is_screenshot_supported();
         fn take_screenshot(i32, String);

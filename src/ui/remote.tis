@@ -102,6 +102,37 @@ function adaptDisplay() {
     };
 }
 
+// VirtualBox-style follow: at 1:1 (original) view, resizing this window asks the remote
+// display to BECOME the window size — the linux host mints the xrandr mode on demand.
+// Debounced so a drag sends one request; linux hosts only (they accept arbitrary modes).
+var follow_gen = 0;
+var follow_last_w = 0;
+var follow_last_h = 0;
+function requestFollowResize() {
+    if (!display_width) return;
+    if (!isRemoteLinux()) return;
+    if (handler.get_view_style() != "original") return;
+    var hh = $(header).box(#height, #border);
+    var w = ($(body).box(#width, #border) * scaleFactor).toInteger();
+    var h = (($(body).box(#height, #border) - hh) * scaleFactor).toInteger();
+    w = w - (w % 2); h = h - (h % 2);  // even sizes keep yuv420 encoders happy
+    if (w < 640 || h < 480) return;
+    if (w == display_width && h == display_height) return;
+    if (w == follow_last_w && h == follow_last_h) return;
+    follow_last_w = w; follow_last_h = h;
+    handler.change_resolution((pi.current_display || 0), w, h);
+}
+if (!is_file_transfer && !is_port_forward) {
+    view.on("size", function() {
+        follow_gen += 1;
+        var gen = follow_gen;
+        self.timer(400ms, function() {
+            if (gen != follow_gen) return;
+            requestFollowResize();
+        });
+    });
+}
+
 // https://sciter.com/event-handling/
 // https://sciter.com/docs/content/sciter/Event.htm
 
