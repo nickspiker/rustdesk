@@ -211,6 +211,7 @@ struct FluorViewer {
     // last cursor pos in viewport px, for pan + move mapping
     last_cursor: (Coord, Coord),
     panning: bool,
+    move_ctr: u32,
 }
 
 impl FluorViewer {
@@ -287,14 +288,23 @@ impl FluorApp for FluorViewer {
     fn on_event(&mut self, event: &FEvent, ctx: &mut Context) -> EventResponse {
         match event {
             FEvent::CloseRequested => return EventResponse::Close,
-            FEvent::CursorMoved { .. } => {
-                // Use ctx.cursor_x/y (window-relative), NOT the event's x/y — those are raw
-                // screen coords offset by the window origin in fluor's fullscreen-compositor
-                // model, which desyncs the mapping (the "cram hard left"). See opsin.
+            FEvent::CursorMoved { x, y } => {
                 let (cx, cy) = (ctx.cursor_x, ctx.cursor_y);
                 self.last_cursor = (cx, cy);
                 if self.panning {
                     return EventResponse::Handled;
+                }
+                // DIAGNOSTIC (throttled): compare ctx.cursor vs event x/y vs the transform, so
+                // we can see the true coordinate space (points vs backing) and where it breaks.
+                self.move_ctr = self.move_ctr.wrapping_add(1);
+                if self.move_ctr % 30 == 0 {
+                    let (scale, ox, oy, fw, fh) = self.transform(ctx);
+                    let rx = ((cx - ox) / scale) as i32;
+                    let ry = ((cy - oy) / scale) as i32;
+                    log::info!(
+                        "fluor mouse: ctx=({:.0},{:.0}) evt=({:.0},{:.0}) vp={}x{} scale={:.3} ox={:.0} oy={:.0} frame={}x{} -> remote=({},{})",
+                        cx, cy, x, y, ctx.viewport.width_px, ctx.viewport.height_px, scale, ox, oy, fw, fh, rx, ry
+                    );
                 }
                 self.send_move(ctx, cx, cy);
             }
@@ -511,6 +521,7 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
         last_seen_gen: 0,
         last_cursor: (0.0, 0.0),
         panning: false,
+        move_ctr: 0,
     };
     if let Err(e) = run_app(app) {
         log::error!("fluor viewer event loop: {e:?}");
