@@ -1566,6 +1566,14 @@ impl<T: InvokeUiSession> Session<T> {
 
     #[inline]
     fn try_change_init_resolution(&self, display: i32) {
+        // fgtw: never auto-change the host's resolution on connect unless follow is
+        // explicitly opted in. A stale custom resolution saved during a follow session would
+        // otherwise shrink the host every connect (and desync mouse coords), disrupting a
+        // daily-driver desktop whose DE auto-scales by DPI. Default: leave the host at native.
+        #[cfg(feature = "fgtw")]
+        if hbb_common::config::Config::get_option("fgtw-resolution-follow") != "Y" {
+            return;
+        }
         let Some((w, h)) = self.lc.read().unwrap().get_custom_resolution(display) else {
             return;
         };
