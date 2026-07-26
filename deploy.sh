@@ -101,7 +101,7 @@ snap_cargo() { ( cd "$SNAP_DIR" && cargo "$@" ); }
 echo ""
 echo "Building Linux x86_64 release..."
 CXXFLAGS="-include cstdint" \
-snap_cargo build --release --features inline,fgtw,linux-pkg-config
+snap_cargo build --release --features inline,fgtw,fluor-viewer,linux-pkg-config
 
 echo ""
 echo "Building macOS arm64 release (osxcross)..."
@@ -117,7 +117,7 @@ PKG_CONFIG_ALLOW_CROSS=1 \
 PKG_CONFIG_PATH_aarch64_apple_darwin=$XLIBS/lib/pkgconfig \
 PKG_CONFIG_LIBDIR_aarch64_apple_darwin=$XLIBS/lib/pkgconfig \
 PKG_CONFIG_SYSROOT_DIR_aarch64_apple_darwin=/ \
-snap_cargo build --release --target aarch64-apple-darwin --features inline,fgtw,linux-pkg-config
+snap_cargo build --release --target aarch64-apple-darwin --features inline,fgtw,fluor-viewer,linux-pkg-config
 
 LINUX_BIN=target/release/rustdesk
 MAC_BIN=target/aarch64-apple-darwin/release/rustdesk

@@ -32,6 +32,8 @@ vram = ["scrap/vram"]
 mediacodec = ["scrap/mediacodec"]
 plugin_framework = []
 fgtw = ["dep:fgtw", "dep:tohu", "dep:ihi", "dep:vsf", "dep:ed25519-dalek", "dep:blake3", "dep:chacha20poly1305"]
+# Passless remote viewer on fluor (true device pixels; retina-correct). Additive to fgtw.
+fluor-viewer = ["dep:fluor"]
 linux-pkg-config = ["magnum-opus/linux-pkg-config", "scrap/linux-pkg-config"]
 unix-file-copy-paste = [
     "dep:x11-clipboard",
@@ -58,6 +60,10 @@ ed25519-dalek = { version = "2", default-features = false, features = ["alloc"],
 blake3 = { version = "1", default-features = false, optional = true }
 # Fleet-state AEAD (RdSealer) — same version fgtw's fanout already pulls, so this adds no new tree.
 chacha20poly1305 = { version = "0.11.0-rc.2", optional = true }
+# fluor: pure-Rust CPU compositor for the passless remote viewer — true device pixels on every
+# platform (kills the sciter-on-retina scaling/mouse mess). Cross-compiles to macOS arm64 via
+# osxcross (proven by photon). host-winit pulls winit+softbuffer (Linux/Win) and wgpu/Metal (mac).
+fluor = { path = "../fluor", default-features = false, features = ["std", "text", "simd", "rayon", "host-winit"], optional = true }
 serde_derive = "1.0"
 serde = "1.0"
 serde_json = "1.0"

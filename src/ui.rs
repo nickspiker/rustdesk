@@ -37,6 +37,19 @@ lazy_static::lazy_static! {
 struct UIHostHandler;
 
 pub fn start(args: &mut [String]) {
+    // Passless remote viewer: divert a plain remote-desktop connection to the fluor window
+    // (true device pixels — retina-correct, crisp 1:1, exact mouse) instead of the sciter
+    // remote.html. Only "--connect" (not file-transfer/port-forward/rdp, which need the sciter
+    // file UI) and only in a child process that has an id. The sciter main window (peer list,
+    // My Fleet) is untouched. Opt out with RUSTDESK_NO_FLUOR=1 to fall back to sciter.
+    #[cfg(feature = "fluor-viewer")]
+    if args.len() > 1 && args[0] == "--connect" && std::env::var("RUSTDESK_NO_FLUOR").is_err() {
+        let id = args[1].to_owned();
+        let pass = args.get(2).cloned().unwrap_or_default();
+        let rest: Vec<String> = args.iter().skip(3).cloned().collect();
+        crate::fluor_remote::run("--connect".to_owned(), id, pass, rest);
+        return;
+    }
     #[cfg(target_os = "macos")]
     crate::platform::delegate::show_dock();
     #[cfg(all(target_os = "linux", feature = "inline"))]
