@@ -197,68 +197,65 @@ struct FluorViewer {
     session: Session<FluorHandler>,
     shared: Arc<Shared>,
     // opsin-style view transform: fractional so it rides resizes. zoom_rel * span = px scale.
-    zoom_rel: f32,
-    cx_frac: f32,
-    cy_frac: f32,
-    /// The frame dimensions we last computed the fit for; (0,0) = not fit yet. Re-fit when
-    /// the frame size first becomes known or changes (resolution switch), NOT on a bare
-    /// first render before any frame — that left zoom_rel at its bogus init and blitted the
-    /// video off-screen (grey) while collapsing the mouse to x≈0.
-    fitted: (usize, usize),
+    /// 1:1 by default (each remote pixel → one viewport pixel = crisp, opsin's model). Scroll
+    /// pans; the frame is bigger than the window so we show a portion and pan to reach the rest.
+    zoom: f32,
+    /// Pan: remote-pixel coordinate shown at the window's top-left. Clamped to the frame.
+    pan_x: f32,
+    pan_y: f32,
+    /// The exact (frame-left, frame-top, zoom) used in the last render, in viewport-pixel
+    /// space — the mouse maps with this so it's ALWAYS consistent with what's drawn:
+    /// remote = (cursor − frame_origin) / zoom.  At zoom=1 that's plain subtraction.
+    view_fx: f32,
+    view_fy: f32,
     // input bookkeeping
     buttons: i32, // currently-held button mask
     last_seen_gen: u64,
-    // last cursor pos in viewport px, for pan + move mapping
-    last_cursor: (Coord, Coord),
-    panning: bool,
-    move_ctr: u32,
 }
 
 impl FluorViewer {
-    /// Fit a frame of `(fw, fh)` inside the viewport (1:1 if it's smaller, else scaled down).
-    fn fit(&mut self, ctx: &Context, fw: usize, fh: usize) {
-        if fw == 0 || fh == 0 {
-            return;
-        }
-        let vw = ctx.viewport.width_px as f32;
-        let vh = ctx.viewport.height_px as f32;
-        let span = 2.0 * vw * vh / (vw + vh);
-        let scale = (vw / fw as f32).min(vh / fh as f32).min(1.0);
-        self.zoom_rel = scale / span;
-        self.cx_frac = 0.5;
-        self.cy_frac = 0.5;
-    }
-
-    /// Current (scale, origin_x, origin_y) mapping remote px → viewport px.
-    fn transform(&self, ctx: &Context) -> (f32, f32, f32, usize, usize) {
+    /// Frame dimensions, or (0,0) if none yet.
+    fn frame_dims(&self) -> (usize, usize) {
         let f = self.shared.frame.lock().unwrap();
-        let (fw, fh) = (f.w, f.h);
-        drop(f);
-        let vw = ctx.viewport.width_px as f32;
-        let vh = ctx.viewport.height_px as f32;
-        let span = 2.0 * vw * vh / (vw + vh);
-        let scale = self.zoom_rel * span;
-        let ox = vw * 0.5 - self.cx_frac * fw as f32 * scale;
-        let oy = vh * 0.5 - self.cy_frac * fh as f32 * scale;
-        (scale, ox, oy, fw, fh)
+        (f.w, f.h)
     }
 
-    /// Map a viewport-px cursor to a remote-px coordinate, clamped to the frame.
-    fn to_remote(&self, ctx: &Context, x: Coord, y: Coord) -> Option<(i32, i32)> {
-        let (scale, ox, oy, fw, fh) = self.transform(ctx);
-        if scale <= 0.0 || fw == 0 {
+    /// Where the frame's top-left sits in the window this frame (viewport px), given the
+    /// current zoom + pan. Centered when the scaled frame is smaller than the window; panned
+    /// (clamped so you can't scroll past the edges) when it's bigger.
+    fn frame_origin(&self, vw: f32, vh: f32, fw: f32, fh: f32) -> (f32, f32) {
+        let dst_w = fw * self.zoom;
+        let dst_h = fh * self.zoom;
+        let fx = if dst_w <= vw {
+            (vw - dst_w) * 0.5
+        } else {
+            -self.pan_x.clamp(0.0, fw - vw / self.zoom) * self.zoom
+        };
+        let fy = if dst_h <= vh {
+            (vh - dst_h) * 0.5
+        } else {
+            -self.pan_y.clamp(0.0, fh - vh / self.zoom) * self.zoom
+        };
+        (fx, fy)
+    }
+
+    /// Map a cursor position (viewport px) to a remote-px coordinate using the EXACT transform
+    /// the last render drew with — pure `(cursor − frame_origin) / zoom`. Clamped to the frame.
+    fn to_remote(&self, x: Coord, y: Coord) -> Option<(i32, i32)> {
+        let (fw, fh) = self.frame_dims();
+        if fw == 0 || self.zoom <= 0.0 {
             return None;
         }
-        let rx = ((x - ox) / scale).floor() as i32;
-        let ry = ((y - oy) / scale).floor() as i32;
+        let rx = ((x - self.view_fx) / self.zoom).floor() as i32;
+        let ry = ((y - self.view_fy) / self.zoom).floor() as i32;
         if rx < 0 || ry < 0 || rx >= fw as i32 || ry >= fh as i32 {
             return None;
         }
         Some((rx, ry))
     }
 
-    fn send_move(&self, ctx: &Context, x: Coord, y: Coord) {
-        if let Some((rx, ry)) = self.to_remote(ctx, x, y) {
+    fn send_move(&self, x: Coord, y: Coord) {
+        if let Some((rx, ry)) = self.to_remote(x, y) {
             self.session
                 .send_mouse((self.buttons << 3) | TYPE_MOVE, rx, ry, false, false, false, false);
         }
@@ -272,9 +269,7 @@ impl FluorApp for FluorViewer {
         *self.shared.proxy.lock().unwrap() = Some(proxy);
     }
 
-    fn init(&mut self, _ctx: &mut Context) {
-        self.fitted = (0, 0);
-    }
+    fn init(&mut self, _ctx: &mut Context) {}
 
     fn on_resize(&mut self, _w: u32, _h: u32, _ctx: &mut Context) {}
 
@@ -288,25 +283,8 @@ impl FluorApp for FluorViewer {
     fn on_event(&mut self, event: &FEvent, ctx: &mut Context) -> EventResponse {
         match event {
             FEvent::CloseRequested => return EventResponse::Close,
-            FEvent::CursorMoved { x, y } => {
-                let (cx, cy) = (ctx.cursor_x, ctx.cursor_y);
-                self.last_cursor = (cx, cy);
-                if self.panning {
-                    return EventResponse::Handled;
-                }
-                // DIAGNOSTIC (throttled): compare ctx.cursor vs event x/y vs the transform, so
-                // we can see the true coordinate space (points vs backing) and where it breaks.
-                self.move_ctr = self.move_ctr.wrapping_add(1);
-                if self.move_ctr % 30 == 0 {
-                    let (scale, ox, oy, fw, fh) = self.transform(ctx);
-                    let rx = ((cx - ox) / scale) as i32;
-                    let ry = ((cy - oy) / scale) as i32;
-                    log::info!(
-                        "fluor mouse: ctx=({:.0},{:.0}) evt=({:.0},{:.0}) vp={}x{} scale={:.3} ox={:.0} oy={:.0} frame={}x{} -> remote=({},{})",
-                        cx, cy, x, y, ctx.viewport.width_px, ctx.viewport.height_px, scale, ox, oy, fw, fh, rx, ry
-                    );
-                }
-                self.send_move(ctx, cx, cy);
+            FEvent::CursorMoved { .. } => {
+                self.send_move(ctx.cursor_x, ctx.cursor_y);
             }
             FEvent::MouseInput { state, button } => {
                 let (cx, cy) = (ctx.cursor_x, ctx.cursor_y);
@@ -326,20 +304,27 @@ impl FluorApp for FluorViewer {
                 } else {
                     self.buttons &= !btn;
                 }
-                if let Some((rx, ry)) = self.to_remote(ctx, cx, cy) {
+                if let Some((rx, ry)) = self.to_remote(cx, cy) {
                     self.session
                         .send_mouse((btn << 3) | ty, rx, ry, false, false, false, false);
                 }
             }
             FEvent::MouseWheel { delta } => {
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::Lines(x, y) => (*x as i32, *y as i32),
-                    MouseScrollDelta::Pixels(x, y) => {
-                        ((*x / 20.0) as i32, (*y / 20.0) as i32)
-                    }
+                // Scroll pans the 1:1 view (the frame is bigger than the window). Shift isn't
+                // tracked yet, so vertical scroll pans vertically; that's enough to reach the
+                // whole remote height, and the remote-cursor auto-nudge covers width.
+                let (_dx, dy) = match delta {
+                    MouseScrollDelta::Lines(x, y) => (*x * 40.0, *y * 40.0),
+                    MouseScrollDelta::Pixels(x, y) => (*x, *y),
                 };
-                self.session
-                    .send_mouse(TYPE_WHEEL << 3, dx, dy, false, false, false, false);
+                self.pan_y -= dy;
+                let (fw, fh) = self.frame_dims();
+                let vh = ctx.viewport.height_px as f32;
+                if fh as f32 > vh / self.zoom {
+                    self.pan_y = self.pan_y.clamp(0.0, fh as f32 - vh / self.zoom);
+                }
+                let _ = fw;
+                ctx.window.request_redraw();
             }
             FEvent::KeyboardInput { event } => {
                 let down = matches!(event.state, ElementState::Pressed);
@@ -353,28 +338,15 @@ impl FluorApp for FluorViewer {
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
         let bw = ctx.viewport.width_px as usize;
         let bh = ctx.viewport.height_px as usize;
-        let (fw, fh) = {
-            let f = self.shared.frame.lock().unwrap();
-            (f.w, f.h)
-        };
-        // Fit once the frame size is known, and re-fit if it changes. One-time diag so we can
-        // confirm the true macOS pixel dims (viewport vs backing) for crispness tuning.
-        if fw != 0 && (fw, fh) != self.fitted {
-            self.fit(ctx, fw, fh);
-            self.fitted = (fw, fh);
-            log::info!(
-                "fluor: fit frame {fw}x{fh} into viewport {bw}x{bh} (target={} px)",
-                target.len()
-            );
-        }
-        // Start transparent: draw_image composes UNDER existing content, so an opaque
-        // pre-fill would hide the video entirely (that was the grey box). Backdrop goes
-        // under everything at the END.
+        let vw = bw as f32;
+        let vh = bh as f32;
+        // Transparent first — draw_image composes UNDER existing content, so an opaque pre-fill
+        // would hide the video (that was the grey box). Backdrop goes under at the END.
         for px in target.iter_mut() {
             *px = 0;
         }
-        let (scale, ox, oy, fw, fh) = self.transform(ctx);
         let f = self.shared.frame.lock().unwrap();
+        let (fw, fh) = (f.w, f.h);
         if fw == 0 || fh == 0 || f.pixels.len() < fw * fh {
             drop(f);
             for px in target.iter_mut() {
@@ -382,26 +354,23 @@ impl FluorApp for FluorViewer {
             }
             return;
         }
-        // One-shot diagnostic on the first painted frame: confirm draw_image runs and sample
-        // a center pixel, to tell "grey = never blitted" from "grey = present/format issue".
+        // 1:1 by default (zoom=1): each remote pixel → one viewport pixel, crisp. Frame is
+        // drawn at (fx, fy); draw_image clips the part that's off-window. Store the exact
+        // origin so the mouse maps with the identical transform.
+        let (fx, fy) = self.frame_origin(vw, vh, fw as f32, fh as f32);
+        self.view_fx = fx;
+        self.view_fy = fy;
         if self.last_seen_gen != f.gen {
             self.last_seen_gen = f.gen;
-            let mid = (fh / 2) * fw + fw / 2;
             log::info!(
-                "fluor: blit gen={} dst={}x{} at ({},{}) scale={:.3} sample_px=0x{:08x}",
-                f.gen,
-                (fw as f32 * scale) as i32,
-                (fh as f32 * scale) as i32,
-                ox as i32,
-                oy as i32,
-                scale,
-                f.pixels.get(mid).copied().unwrap_or(0)
+                "fluor: 1:1 blit frame {fw}x{fh} zoom={:.2} origin=({:.0},{:.0}) viewport {bw}x{bh}",
+                self.zoom, fx, fy
             );
         }
-        let dst_w = fw as f32 * scale;
-        let dst_h = fh as f32 * scale;
-        let cx = ox + dst_w * 0.5;
-        let cy = oy + dst_h * 0.5;
+        let dst_w = fw as f32 * self.zoom;
+        let dst_h = fh as f32 * self.zoom;
+        let cx = fx + dst_w * 0.5;
+        let cy = fy + dst_h * 0.5;
         {
             let mut canvas = Canvas::new(target, bw, bh, ctx.damage);
             draw_image(&mut canvas, &f.pixels, fw, fh, cx, cy, dst_w, dst_h, None);
@@ -426,48 +395,50 @@ impl FluorApp for FluorViewer {
 
 impl FluorViewer {
     fn send_key(&self, _ctx: &Context, key: &Key, down: bool, text: Option<&str>) {
-        // Minimal keyboard: characters + a few named keys via the legacy text path.
-        // (Full keycode mapping is a follow-up; this is enough to type.)
-        use hbb_common::message_proto::*;
-        let mut evt = KeyEvent::new();
-        evt.down = down;
-        match key {
-            Key::Character(s) => {
-                if let Some(c) = s.chars().next() {
-                    evt.set_chr(c as u32);
-                }
-            }
-            Key::Named(n) => {
-                let ck = match n {
-                    NamedKey::Enter => Some(ControlKey::Return),
-                    NamedKey::Backspace => Some(ControlKey::Backspace),
-                    NamedKey::Tab => Some(ControlKey::Tab),
-                    NamedKey::Escape => Some(ControlKey::Escape),
-                    NamedKey::Space => Some(ControlKey::Space),
-                    NamedKey::Delete => Some(ControlKey::Delete),
-                    NamedKey::ArrowLeft => Some(ControlKey::LeftArrow),
-                    NamedKey::ArrowRight => Some(ControlKey::RightArrow),
-                    NamedKey::ArrowUp => Some(ControlKey::UpArrow),
-                    NamedKey::ArrowDown => Some(ControlKey::DownArrow),
-                    NamedKey::Home => Some(ControlKey::Home),
-                    NamedKey::End => Some(ControlKey::End),
-                    NamedKey::Shift => Some(ControlKey::Shift),
-                    NamedKey::Control => Some(ControlKey::Control),
-                    NamedKey::Alt => Some(ControlKey::Alt),
-                    NamedKey::Super => Some(ControlKey::Meta),
-                    _ => None,
-                };
-                if let Some(ck) = ck {
-                    evt.set_control_key(ck);
-                } else if let Some(t) = text {
-                    if let Some(c) = t.chars().next() {
-                        evt.set_chr(c as u32);
-                    }
-                }
-            }
-            _ => return,
+        // RustDesk's `chr` field is a VIRTUAL KEYCODE, not a Unicode codepoint — stuffing a
+        // char into it scrambles every key (what "keymap completely fucked" was). Two correct
+        // paths instead: named keys go through set_control_key (down+up); printable text is
+        // TYPED verbatim via a Legacy `seq` on the down edge — layout-agnostic, so Dvorak (or
+        // anything) on either side produces exactly the character the sender saw.
+        let control = match key {
+            Key::Named(n) => match n {
+                NamedKey::Enter => Some(ControlKey::Return),
+                NamedKey::Backspace => Some(ControlKey::Backspace),
+                NamedKey::Tab => Some(ControlKey::Tab),
+                NamedKey::Escape => Some(ControlKey::Escape),
+                NamedKey::Delete => Some(ControlKey::Delete),
+                NamedKey::ArrowLeft => Some(ControlKey::LeftArrow),
+                NamedKey::ArrowRight => Some(ControlKey::RightArrow),
+                NamedKey::ArrowUp => Some(ControlKey::UpArrow),
+                NamedKey::ArrowDown => Some(ControlKey::DownArrow),
+                NamedKey::Home => Some(ControlKey::Home),
+                NamedKey::End => Some(ControlKey::End),
+                NamedKey::PageUp => Some(ControlKey::PageUp),
+                NamedKey::PageDown => Some(ControlKey::PageDown),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(ck) = control {
+            let mut evt = KeyEvent::new();
+            evt.mode = KeyboardMode::Legacy.into();
+            evt.down = down;
+            evt.set_control_key(ck);
+            self.session.send_key_event(&evt);
+            return;
         }
-        self.session.send_key_event(&evt);
+        // Printable character (incl. NamedKey::Space via its text " "): type on the down edge.
+        if down {
+            let t = text.unwrap_or("");
+            let is_printable = t.chars().next().map(|c| !c.is_control()).unwrap_or(false);
+            if is_printable {
+                let mut evt = KeyEvent::new();
+                evt.mode = KeyboardMode::Legacy.into();
+                evt.press = true;
+                evt.set_seq(t.to_string());
+                self.session.send_key_event(&evt);
+            }
+        }
     }
 }
 
@@ -513,15 +484,13 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
     let app = FluorViewer {
         session,
         shared,
-        zoom_rel: 1.0,
-        cx_frac: 0.5,
-        cy_frac: 0.5,
-        fitted: (0, 0),
+        zoom: 1.0,
+        pan_x: 0.0,
+        pan_y: 0.0,
+        view_fx: 0.0,
+        view_fy: 0.0,
         buttons: 0,
         last_seen_gen: 0,
-        last_cursor: (0.0, 0.0),
-        panning: false,
-        move_ctr: 0,
     };
     if let Err(e) = run_app(app) {
         log::error!("fluor viewer event loop: {e:?}");
