@@ -196,7 +196,11 @@ struct FluorViewer {
     zoom_rel: f32,
     cx_frac: f32,
     cy_frac: f32,
-    fit_pending: bool,
+    /// The frame dimensions we last computed the fit for; (0,0) = not fit yet. Re-fit when
+    /// the frame size first becomes known or changes (resolution switch), NOT on a bare
+    /// first render before any frame — that left zoom_rel at its bogus init and blitted the
+    /// video off-screen (grey) while collapsing the mouse to x≈0.
+    fitted: (usize, usize),
     // input bookkeeping
     buttons: i32, // currently-held button mask
     last_seen_gen: u64,
@@ -206,16 +210,15 @@ struct FluorViewer {
 }
 
 impl FluorViewer {
-    /// Fit the remote frame inside the viewport (1:1 if it's smaller).
-    fn fit(&mut self, ctx: &Context) {
-        let f = self.shared.frame.lock().unwrap();
-        if f.w == 0 || f.h == 0 {
+    /// Fit a frame of `(fw, fh)` inside the viewport (1:1 if it's smaller, else scaled down).
+    fn fit(&mut self, ctx: &Context, fw: usize, fh: usize) {
+        if fw == 0 || fh == 0 {
             return;
         }
         let vw = ctx.viewport.width_px as f32;
         let vh = ctx.viewport.height_px as f32;
         let span = 2.0 * vw * vh / (vw + vh);
-        let scale = (vw / f.w as f32).min(vh / f.h as f32).min(1.0);
+        let scale = (vw / fw as f32).min(vh / fh as f32).min(1.0);
         self.zoom_rel = scale / span;
         self.cx_frac = 0.5;
         self.cy_frac = 0.5;
@@ -265,7 +268,7 @@ impl FluorApp for FluorViewer {
     }
 
     fn init(&mut self, _ctx: &mut Context) {
-        self.fit_pending = true;
+        self.fitted = (0, 0);
     }
 
     fn on_resize(&mut self, _w: u32, _h: u32, _ctx: &mut Context) {}
@@ -331,12 +334,22 @@ impl FluorApp for FluorViewer {
     }
 
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
-        if self.fit_pending {
-            self.fit(ctx);
-            self.fit_pending = false;
-        }
         let bw = ctx.viewport.width_px as usize;
         let bh = ctx.viewport.height_px as usize;
+        let (fw, fh) = {
+            let f = self.shared.frame.lock().unwrap();
+            (f.w, f.h)
+        };
+        // Fit once the frame size is known, and re-fit if it changes. One-time diag so we can
+        // confirm the true macOS pixel dims (viewport vs backing) for crispness tuning.
+        if fw != 0 && (fw, fh) != self.fitted {
+            self.fit(ctx, fw, fh);
+            self.fitted = (fw, fh);
+            log::info!(
+                "fluor: fit frame {fw}x{fh} into viewport {bw}x{bh} (target={} px)",
+                target.len()
+            );
+        }
         // dark backdrop
         for px in target.iter_mut() {
             *px = 0xFF808080; // mid-grey in α+darkness = mid-grey visible
@@ -457,7 +470,7 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
         zoom_rel: 1.0,
         cx_frac: 0.5,
         cy_frac: 0.5,
-        fit_pending: true,
+        fitted: (0, 0),
         buttons: 0,
         last_seen_gen: 0,
         last_cursor: (0.0, 0.0),
