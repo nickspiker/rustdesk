@@ -1623,6 +1623,42 @@ pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> Re
 
 static LAST_MINTED_MODE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// Safety net: if a crash or hard exit left a display parked on a minted `*_fgtw` mode
+/// (so the desktop is stuck small/"massive"), switch each such output back to its preferred
+/// mode and remove the stray mode. Called at server start; a no-op on a clean system.
+pub fn reset_leftover_minted_modes() {
+    let Ok(out) = Command::new("xrandr").output() else { return };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut current_output = String::new();
+    let mut native: std::collections::HashMap<String, String> = Default::default();
+    let mut stranded: Vec<(String, String)> = Vec::new(); // (output, active _fgtw mode)
+    for line in text.lines() {
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            if let Some(name) = line.split_whitespace().next() {
+                current_output = name.to_owned();
+            }
+        } else if !current_output.is_empty() {
+            if let Some(mode) = line.split_whitespace().next() {
+                // xrandr lists a connected output's modes highest-first; the first real
+                // (non-minted) mode we see for an output is its native/preferred one.
+                if !mode.ends_with("_fgtw") {
+                    native.entry(current_output.clone()).or_insert_with(|| mode.to_owned());
+                } else if line.contains('*') {
+                    stranded.push((current_output.clone(), mode.to_owned()));
+                }
+            }
+        }
+    }
+    for (output, mode) in stranded {
+        if let Some(real) = native.get(&output) {
+            log::warn!("fgtw: display '{output}' stranded on minted '{mode}' — restoring {real}");
+            Command::new("xrandr").args(vec!["--output", &output, "--mode", real]).output().ok();
+        }
+        Command::new("xrandr").args(vec!["--delmode", &output, &mode]).output().ok();
+        Command::new("xrandr").args(vec!["--rmmode", &mode]).output().ok();
+    }
+}
+
 /// Create an xrandr mode for `width`x`height` @60Hz using CVT reduced-blanking timings
 /// (the LCD-appropriate variant: fixed 160px h-blank, minimal v-blank >= 460us) and attach
 /// it to `output`. Returns the minted mode name.

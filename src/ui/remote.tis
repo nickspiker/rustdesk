@@ -95,6 +95,11 @@ var follow_gen = 0;
 function scheduleFollow() {
     if (is_file_transfer || is_port_forward) return;
     if (!isRemoteLinux()) return;
+    // OFF by default: changing a physical desktop's resolution makes the remote's DE
+    // (e.g. Cinnamon auto-DPI) re-scale, and that doesn't cleanly revert on disconnect —
+    // it leaves the daily driver "massive". Opt in with fgtw-resolution-follow=Y once the
+    // scale round-trip is solved. Default = crisp native 1:1 (fullscreen for a full view).
+    if (handler.get_option("fgtw-resolution-follow") != "Y") return;
     follow_gen += 1;
     var gen = follow_gen;
     self.timer(400ms, function() {

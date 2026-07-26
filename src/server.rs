@@ -616,6 +616,11 @@ pub async fn start_server(is_server: bool, no_server: bool) {
         // sees the session when running in the user's login scope (XDG_RUNTIME_DIR).
         #[cfg(feature = "fgtw")]
         crate::fgtw_auth::try_adopt_session();
+        // Undo a stranded resolution: if a prior session's resolution-follow left the
+        // display parked on a minted mode (crash/hard-exit), restore native so the desktop
+        // isn't stuck "massive".
+        #[cfg(all(feature = "fgtw", target_os = "linux"))]
+        crate::platform::linux::reset_leftover_minted_modes();
         #[cfg(target_os = "linux")]
         {
             log::info!("DISPLAY={:?}", std::env::var("DISPLAY"));

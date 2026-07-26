@@ -348,8 +348,9 @@ fn fleet_key(t: &RdTransport, state: &EnrollState) -> Result<[u8; 32], String> {
 /// untouched. Best-effort: chooser data, not auth — failure is logged, never fatal, and the
 /// next enroll/ID-change retries.
 pub fn publish_own_id(state: &EnrollState, device_key: &Keypair) {
-    if let Err(e) = publish_own_id_inner(state, device_key) {
-        log::warn!("fgtw: publishing rustdesk id to fleet failed (will retry later): {e}");
+    match publish_own_id_inner(state, device_key) {
+        Ok(()) => log::info!("fgtw: published this device's rustdesk id ({}) to the fleet", Config::get_id()),
+        Err(e) => log::warn!("fgtw: publishing rustdesk id to fleet failed (will retry later): {e}"),
     }
 }
 
@@ -615,10 +616,18 @@ pub fn adopt_session() -> Result<String, String> {
     ))
 }
 
-/// Best-effort background adoption for service/UI startup: only fires when there's a session
-/// to adopt and no (readable) enrollment yet, and never blocks the caller.
+/// Best-effort background fleet bootstrap for service/UI startup, off-thread, never blocks.
+/// Not enrolled yet → adopt the machine's login. Already enrolled → (re)publish our rustdesk
+/// id every start, because the id is what the My Fleet chooser connects by: the original
+/// enroll-time publish can fail (offline, no fleet-key wrap yet) or go stale (id changed, map
+/// reset), and without a re-publish the fleet tile stays unconnectable forever.
 pub fn try_adopt_session() {
-    if EnrollState::load().is_some() {
+    if let Some(state) = EnrollState::load() {
+        std::thread::spawn(move || {
+            if let Ok(kp) = device_keypair() {
+                publish_own_id(&state, &kp);
+            }
+        });
         return;
     }
     std::thread::spawn(|| match adopt_session() {
