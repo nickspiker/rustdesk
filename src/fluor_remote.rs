@@ -239,14 +239,20 @@ struct FluorViewer {
     follow_target: (i32, i32), // most recent window backing size seen
     follow_at: Option<Instant>, // when the debounce elapses and we send the follow
     last_follow: (i32, i32),   // last size actually requested (avoids resend spam)
+    /// Cursor derived from the last raw CursorMoved (raw − window_origin, pass-0 px). Used by
+    /// MouseInput (which carries no position) and as the send_move source.
+    last_cursor: (Coord, Coord),
     // ── on-screen diagnostic HUD (Ctrl+Alt+H toggles) ──
     hud: bool,
-    dbg_cur: (Coord, Coord),   // ctx.cursor_x/y as the handler saw it
-    dbg_vp: (u32, u32),        // ctx.viewport.width_px/height_px
-    dbg_zoom: f32,             // effective zoom used to map
-    dbg_org: (f32, f32),      // frame origin used to map
-    dbg_rem: (i32, i32),       // resulting remote px sent (−1,−1 = off-frame)
-    dbg_key: String,           // last keypress: logical key + text + path taken
+    dbg_raw: (Coord, Coord),     // raw winit event position (untransformed)
+    dbg_worg: (i32, i32),        // ctx.window_origin at that event
+    dbg_cur: (Coord, Coord),     // raw − window_origin = what we map with
+    dbg_ctx_cur: (Coord, Coord), // fluor's ctx.cursor_x/y (for comparison — mac reads 0)
+    dbg_vp: (u32, u32),          // ctx.viewport.width_px/height_px
+    dbg_zoom: f32,               // effective zoom used to map
+    dbg_org: (f32, f32),         // frame origin used to map
+    dbg_rem: (i32, i32),         // resulting remote px sent (−1,−1 = off-frame)
+    dbg_key: String,             // last keypress: logical key + text + path taken
 }
 
 impl FluorViewer {
@@ -376,8 +382,14 @@ impl FluorApp for FluorViewer {
         }
         match event {
             FEvent::CloseRequested => return EventResponse::Close,
-            FEvent::CursorMoved { .. } => {
-                let (cx, cy) = (ctx.cursor_x, ctx.cursor_y);
+            FEvent::CursorMoved { x, y } => {
+                // Map from the RAW winit position minus the window's origin — both in pass-0
+                // pixel space — bypassing fluor's internal cursor bookkeeping entirely. On the
+                // Mac (fullscreen-compositor host) ctx.cursor_x arrives ≈0 with garbage y; the
+                // raw event position is the one value winit reports directly from the OS.
+                let wo = ctx.window_origin;
+                let (cx, cy) = (*x - wo.0 as Coord, *y - wo.1 as Coord);
+                self.last_cursor = (cx, cy);
                 // Capture the exact runtime values for the on-screen HUD — this is the ground
                 // truth we could never get off the Mac's logs.
                 let (fw, fh) = self.frame_dims();
@@ -387,7 +399,10 @@ impl FluorApp for FluorViewer {
                     fw as f32,
                     fh as f32,
                 );
+                self.dbg_raw = (*x, *y);
+                self.dbg_worg = wo;
                 self.dbg_cur = (cx, cy);
+                self.dbg_ctx_cur = (ctx.cursor_x, ctx.cursor_y);
                 self.dbg_vp = (ctx.viewport.width_px, ctx.viewport.height_px);
                 self.dbg_zoom = zoom;
                 self.dbg_org = (fx, fy);
@@ -398,7 +413,7 @@ impl FluorApp for FluorViewer {
                 }
             }
             FEvent::MouseInput { state, button } => {
-                let (cx, cy) = (ctx.cursor_x, ctx.cursor_y);
+                let (cx, cy) = self.last_cursor;
                 let btn = match button {
                     MouseButton::Left => BTN_LEFT,
                     MouseButton::Right => BTN_RIGHT,
@@ -539,13 +554,14 @@ impl FluorApp for FluorViewer {
         // ── On-screen diagnostic HUD (Ctrl+Alt+H). Drawn last so it sits over everything. ──
         if self.hud {
             let line1 = format!(
-                "cur={:.0},{:.0}  vp={}x{}  frame={}x{}",
-                self.dbg_cur.0, self.dbg_cur.1, self.dbg_vp.0, self.dbg_vp.1, fw, fh
+                "raw={:.0},{:.0}  worg={},{}  cur={:.0},{:.0}  fluorcur={:.0},{:.0}",
+                self.dbg_raw.0, self.dbg_raw.1, self.dbg_worg.0, self.dbg_worg.1,
+                self.dbg_cur.0, self.dbg_cur.1, self.dbg_ctx_cur.0, self.dbg_ctx_cur.1
             );
             let line2 = format!(
-                "fit={}  zoom={:.3}  org={:.0},{:.0}  ->remote={},{}  follow={}x{}",
-                self.fit, self.dbg_zoom, self.dbg_org.0, self.dbg_org.1, self.dbg_rem.0, self.dbg_rem.1,
-                self.last_follow.0, self.last_follow.1
+                "vp={}x{}  frame={}x{}  follow={}x{}  fit={}  zoom={:.3}  org={:.0},{:.0}  ->remote={},{}",
+                self.dbg_vp.0, self.dbg_vp.1, fw, fh, self.last_follow.0, self.last_follow.1,
+                self.fit, self.dbg_zoom, self.dbg_org.0, self.dbg_org.1, self.dbg_rem.0, self.dbg_rem.1
             );
             let line3 = format!("key: {}", self.dbg_key);
             let line4 = "Ctrl+Alt: Enter=fullscreen  Space=fit/1:1  H=hud";
@@ -672,8 +688,12 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
         follow_target: (0, 0),
         follow_at: None,
         last_follow: (0, 0),
+        last_cursor: (0.0, 0.0),
         hud: true,
+        dbg_raw: (0.0, 0.0),
+        dbg_worg: (0, 0),
         dbg_cur: (0.0, 0.0),
+        dbg_ctx_cur: (0.0, 0.0),
         dbg_vp: (0, 0),
         dbg_zoom: 1.0,
         dbg_org: (0.0, 0.0),
