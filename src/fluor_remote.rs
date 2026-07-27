@@ -49,6 +49,9 @@ struct Shared {
     proxy: Mutex<Option<Arc<dyn WakeSender<Wake>>>>,
     /// Remote cursor position (device px in the remote's space), for drawing our own pointer.
     cursor: Mutex<(i32, i32)>,
+    /// The current display's origin (x, y) in the remote's virtual-desktop space. Added to
+    /// mapped coords so a non-primary monitor (origin != 0,0) targets the right pixels.
+    display_origin: Mutex<(i32, i32)>,
 }
 
 impl Shared {
@@ -117,7 +120,9 @@ impl InvokeUiSession for FluorHandler {
     // ── everything below is not needed by a bare viewer (yet) ──
     fn set_cursor_data(&self, _cd: CursorData) {}
     fn set_cursor_id(&self, _id: String) {}
-    fn set_display(&self, _x: i32, _y: i32, _w: i32, _h: i32, _cursor_embedded: bool, _scale: f64) {}
+    fn set_display(&self, x: i32, y: i32, _w: i32, _h: i32, _cursor_embedded: bool, _scale: f64) {
+        *self.shared.display_origin.lock().unwrap() = (x, y);
+    }
     fn switch_display(&self, _display: &hbb_common::message_proto::SwitchDisplay) {}
     fn set_peer_info(&self, _pi: &hbb_common::message_proto::PeerInfo) {}
     fn set_displays(&self, _displays: &Vec<hbb_common::message_proto::DisplayInfo>) {}
@@ -203,14 +208,10 @@ struct FluorViewer {
     /// Pan: remote-pixel coordinate shown at the window's top-left. Clamped to the frame.
     pan_x: f32,
     pan_y: f32,
-    /// The exact (frame-left, frame-top, zoom) used in the last render, in viewport-pixel
-    /// space — the mouse maps with this so it's ALWAYS consistent with what's drawn:
-    /// remote = (cursor − frame_origin) / zoom.  At zoom=1 that's plain subtraction.
-    view_fx: f32,
-    view_fy: f32,
     // input bookkeeping
     buttons: i32, // currently-held button mask
     last_seen_gen: u64,
+    move_ctr: u32, // throttle for the temp mouse diagnostic
 }
 
 impl FluorViewer {
@@ -239,23 +240,29 @@ impl FluorViewer {
         (fx, fy)
     }
 
-    /// Map a cursor position (viewport px) to a remote-px coordinate using the EXACT transform
-    /// the last render drew with — pure `(cursor − frame_origin) / zoom`. Clamped to the frame.
-    fn to_remote(&self, x: Coord, y: Coord) -> Option<(i32, i32)> {
+    /// Map a cursor position to a remote-px coordinate, computing the frame origin from the
+    /// SAME Context the cursor came from (never a stored value from a possibly-different render
+    /// pass — that desync was the "hard left / random vertical"). Plain `(cursor − origin) /
+    /// zoom`, clamped to the frame, plus the display's origin for multi-monitor hosts.
+    fn to_remote(&self, ctx: &Context, x: Coord, y: Coord) -> Option<(i32, i32)> {
         let (fw, fh) = self.frame_dims();
         if fw == 0 || self.zoom <= 0.0 {
             return None;
         }
-        let rx = ((x - self.view_fx) / self.zoom).floor() as i32;
-        let ry = ((y - self.view_fy) / self.zoom).floor() as i32;
+        let vw = ctx.viewport.width_px as f32;
+        let vh = ctx.viewport.height_px as f32;
+        let (fx, fy) = self.frame_origin(vw, vh, fw as f32, fh as f32);
+        let rx = ((x - fx) / self.zoom).floor() as i32;
+        let ry = ((y - fy) / self.zoom).floor() as i32;
         if rx < 0 || ry < 0 || rx >= fw as i32 || ry >= fh as i32 {
             return None;
         }
-        Some((rx, ry))
+        let (ox, oy) = *self.shared.display_origin.lock().unwrap();
+        Some((rx + ox, ry + oy))
     }
 
-    fn send_move(&self, x: Coord, y: Coord) {
-        if let Some((rx, ry)) = self.to_remote(x, y) {
+    fn send_move(&self, ctx: &Context, x: Coord, y: Coord) {
+        if let Some((rx, ry)) = self.to_remote(ctx, x, y) {
             self.session
                 .send_mouse((self.buttons << 3) | TYPE_MOVE, rx, ry, false, false, false, false);
         }
@@ -284,7 +291,24 @@ impl FluorApp for FluorViewer {
         match event {
             FEvent::CloseRequested => return EventResponse::Close,
             FEvent::CursorMoved { .. } => {
-                self.send_move(ctx.cursor_x, ctx.cursor_y);
+                let (cx, cy) = (ctx.cursor_x, ctx.cursor_y);
+                // TEMP diagnostic (throttled): confirm the runtime mouse mapping.
+                self.move_ctr = self.move_ctr.wrapping_add(1);
+                if self.move_ctr % 30 == 0 {
+                    let (fw, fh) = self.frame_dims();
+                    let (fx, fy) = self.frame_origin(
+                        ctx.viewport.width_px as f32,
+                        ctx.viewport.height_px as f32,
+                        fw as f32,
+                        fh as f32,
+                    );
+                    log::info!(
+                        "fluor mouse: cursor=({:.0},{:.0}) vp={}x{} origin=({:.0},{:.0}) zoom={:.2} frame={}x{} -> remote={:?}",
+                        cx, cy, ctx.viewport.width_px, ctx.viewport.height_px, fx, fy, self.zoom, fw, fh,
+                        self.to_remote(ctx, cx, cy)
+                    );
+                }
+                self.send_move(ctx, cx, cy);
             }
             FEvent::MouseInput { state, button } => {
                 let (cx, cy) = (ctx.cursor_x, ctx.cursor_y);
@@ -297,6 +321,12 @@ impl FluorApp for FluorViewer {
                 if btn == 0 {
                     return EventResponse::Pass;
                 }
+                // Position the host cursor with a MOVE first (proven sciter protocol), THEN the
+                // button event with x=0,y=0 — the host reuses the last MOVE position for clicks.
+                if self.to_remote(ctx, cx, cy).is_none() {
+                    return EventResponse::Pass; // click outside the frame
+                }
+                self.send_move(ctx, cx, cy);
                 let pressed = matches!(state, ElementState::Pressed);
                 let ty = if pressed { TYPE_DOWN } else { TYPE_UP };
                 if pressed {
@@ -304,10 +334,8 @@ impl FluorApp for FluorViewer {
                 } else {
                     self.buttons &= !btn;
                 }
-                if let Some((rx, ry)) = self.to_remote(cx, cy) {
-                    self.session
-                        .send_mouse((btn << 3) | ty, rx, ry, false, false, false, false);
-                }
+                self.session
+                    .send_mouse((btn << 3) | ty, 0, 0, false, false, false, false);
             }
             FEvent::MouseWheel { delta } => {
                 // Scroll pans the 1:1 view (the frame is bigger than the window). Shift isn't
@@ -358,8 +386,6 @@ impl FluorApp for FluorViewer {
         // drawn at (fx, fy); draw_image clips the part that's off-window. Store the exact
         // origin so the mouse maps with the identical transform.
         let (fx, fy) = self.frame_origin(vw, vh, fw as f32, fh as f32);
-        self.view_fx = fx;
-        self.view_fy = fy;
         if self.last_seen_gen != f.gen {
             self.last_seen_gen = f.gen;
             log::info!(
@@ -487,10 +513,9 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
         zoom: 1.0,
         pan_x: 0.0,
         pan_y: 0.0,
-        view_fx: 0.0,
-        view_fy: 0.0,
         buttons: 0,
         last_seen_gen: 0,
+        move_ctr: 0,
     };
     if let Err(e) = run_app(app) {
         log::error!("fluor viewer event loop: {e:?}");
