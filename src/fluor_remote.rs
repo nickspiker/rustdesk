@@ -242,6 +242,10 @@ struct FluorViewer {
     /// Cursor derived from the last raw CursorMoved (raw − window_origin, pass-0 px). Used by
     /// MouseInput (which carries no position) and as the send_move source.
     last_cursor: (Coord, Coord),
+    /// Last time HUD telemetry was chatted to the host (throttle ~2s). The host logs HUD|
+    /// lines, giving us the viewer's runtime numbers on the HOST's disk — readable even when
+    /// the viewer machine is unreachable.
+    last_telemetry: Option<std::time::Instant>,
     // ── on-screen diagnostic HUD (Ctrl+Alt+H toggles) ──
     hud: bool,
     dbg_raw: (Coord, Coord),     // raw winit event position (untransformed)
@@ -408,6 +412,21 @@ impl FluorApp for FluorViewer {
                 self.dbg_org = (fx, fy);
                 self.dbg_rem = self.to_remote(ctx, cx, cy).unwrap_or((-1, -1));
                 self.send_move(ctx, cx, cy);
+                // Telemetry: ship the same numbers the HUD draws to the HOST's log (throttled).
+                let due = self
+                    .last_telemetry
+                    .map_or(true, |t| t.elapsed().as_millis() >= 2000);
+                if due {
+                    self.last_telemetry = Some(std::time::Instant::now());
+                    self.session.send_chat(format!(
+                        "HUD|raw={:.0},{:.0}|worg={},{}|cur={:.0},{:.0}|fluorcur={:.0},{:.0}|vp={}x{}|frame={}x{}|follow={}x{}|zoom={:.3}|org={:.0},{:.0}|rem={},{}",
+                        self.dbg_raw.0, self.dbg_raw.1, self.dbg_worg.0, self.dbg_worg.1,
+                        self.dbg_cur.0, self.dbg_cur.1, self.dbg_ctx_cur.0, self.dbg_ctx_cur.1,
+                        self.dbg_vp.0, self.dbg_vp.1, fw, fh,
+                        self.last_follow.0, self.last_follow.1,
+                        zoom, fx, fy, self.dbg_rem.0, self.dbg_rem.1
+                    ));
+                }
                 if self.hud {
                     ctx.window.request_redraw();
                 }
@@ -482,20 +501,24 @@ impl FluorApp for FluorViewer {
                     }
                 }
                 self.send_key(ctx, &event.logical_key, down, event.text.as_deref());
+                // Show what we saw + what we sent, so keyboard bugs are visible on screen —
+                // and ship it to the host log too (unthrottled; key events are sparse).
+                let kd = match &event.logical_key {
+                    Key::Named(n) => format!("Named({:?})", n),
+                    Key::Character(c) => format!("Char({:?})", c),
+                    Key::Unidentified => "Unidentified".to_string(),
+                };
+                self.dbg_key = format!(
+                    "{} text={:?} mods[c{} a{} s{} m{}] {}",
+                    kd,
+                    event.text.as_deref().unwrap_or(""),
+                    m.ctrl as u8, m.alt as u8, m.shift as u8, m.meta as u8,
+                    if down { "DOWN" } else { "up" }
+                );
+                if down {
+                    self.session.send_chat(format!("HUD|key|{}", self.dbg_key));
+                }
                 if self.hud {
-                    // Show what we saw + what we sent, so keyboard bugs are visible on screen.
-                    let kd = match &event.logical_key {
-                        Key::Named(n) => format!("Named({:?})", n),
-                        Key::Character(c) => format!("Char({:?})", c),
-                        Key::Unidentified => "Unidentified".to_string(),
-                    };
-                    self.dbg_key = format!(
-                        "{} text={:?} mods[c{} a{} s{} m{}] {}",
-                        kd,
-                        event.text.as_deref().unwrap_or(""),
-                        m.ctrl as u8, m.alt as u8, m.shift as u8, m.meta as u8,
-                        if down { "DOWN" } else { "up" }
-                    );
                     ctx.window.request_redraw();
                 }
             }
@@ -689,6 +712,7 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
         follow_at: None,
         last_follow: (0, 0),
         last_cursor: (0.0, 0.0),
+        last_telemetry: None,
         hud: true,
         dbg_raw: (0.0, 0.0),
         dbg_worg: (0, 0),
