@@ -1699,6 +1699,18 @@ fn process_seq(en: &mut Enigo, sequence: &str) {
         return;
     }
 
+    // X11: type each codepoint DIRECTLY as a keysym (Key::Layout -> xdo "U{:X}"), NOT via
+    // xdo_enter_text's physical-key lookup, which re-maps through the host's layout and
+    // double-translated every char on a Dvorak host ("the" -> "kjd"). Layout-independent, so
+    // a Dvorak (or any) client types exactly what the sender pressed — matches process_unicode.
+    #[cfg(target_os = "linux")]
+    if crate::platform::linux::is_x11() {
+        for c in sequence.chars() {
+            en.key_click(Key::Layout(c));
+        }
+        return;
+    }
+
     en.key_sequence(&sequence);
 }
 
