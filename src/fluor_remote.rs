@@ -267,23 +267,22 @@ impl FluorViewer {
     /// When the frame fits in the window it's centered; when it's bigger you pan, and the
     /// origin is just `−pan` (clamped so you can't scroll past an edge). This is the ONLY view
     /// transform — render draws at it, the mouse subtracts it. Two numbers, nothing else.
-    fn frame_origin(&self, vw: f32, vh: f32, fw: f32, fh: f32) -> (f32, f32) {
-        let fx = if fw <= vw {
-            (vw - fw) * 0.5
-        } else {
-            -self.pan_x.clamp(0.0, fw - vw)
-        };
-        let fy = if fh <= vh {
-            (vh - fh) * 0.5
-        } else {
-            -self.pan_y.clamp(0.0, fh - vh)
-        };
-        (fx, fy)
+    /// The rectangle (in window/viewport pixels) that the whole remote frame is drawn into:
+    /// the ENTIRE frame scaled to fit the window, aspect preserved, centered (letterboxed).
+    /// Returns `(ox, oy, scale)` — top-left of the drawn video + the frame→window scale.
+    /// This is the ONE source of truth: render draws the frame here, the mouse inverts it. The
+    /// whole desktop is always visible and the cursor can always reach every corner.
+    fn view_rect(&self, vw: f32, vh: f32, fw: f32, fh: f32) -> (f32, f32, f32) {
+        let scale = (vw / fw).min(vh / fh).max(1e-4);
+        let dw = fw * scale;
+        let dh = fh * scale;
+        ((vw - dw) * 0.5, (vh - dh) * 0.5, scale)
     }
 
-    /// Map a window cursor position to a remote pixel: the remote pixel under the cursor is the
-    /// cursor minus the frame's top-left. Two subtractions, no scale, no divide. Clamped to the
-    /// frame so a click near an edge still lands (never swallowed).
+    /// Map a window cursor position to a remote pixel. The cursor's position WITHIN the drawn
+    /// video rectangle, as a fraction, times the frame size. Because it's a fraction of the
+    /// visible video (never a raw absolute), it is mathematically incapable of collapsing to a
+    /// column — move to the right edge of the video and you get the right edge of the frame.
     fn to_remote(&self, ctx: &Context, x: Coord, y: Coord) -> Option<(i32, i32)> {
         let (fw, fh) = self.frame_dims();
         if fw == 0 {
@@ -291,9 +290,9 @@ impl FluorViewer {
         }
         let vw = ctx.viewport.width_px as f32;
         let vh = ctx.viewport.height_px as f32;
-        let (fx, fy) = self.frame_origin(vw, vh, fw as f32, fh as f32);
-        let rx = (x - fx) as i32;
-        let ry = (y - fy) as i32;
+        let (ox, oy, scale) = self.view_rect(vw, vh, fw as f32, fh as f32);
+        let rx = ((x - ox) / scale) as i32;
+        let ry = ((y - oy) / scale) as i32;
         Some((rx.clamp(0, fw as i32 - 1), ry.clamp(0, fh as i32 - 1)))
     }
 
@@ -382,7 +381,7 @@ impl FluorApp for FluorViewer {
                 // Capture the exact runtime values for the on-screen HUD — this is the ground
                 // truth we could never get off the Mac's logs.
                 let (fw, fh) = self.frame_dims();
-                let (fx, fy) = self.frame_origin(
+                let (ox, oy, _scale) = self.view_rect(
                     ctx.viewport.width_px as f32,
                     ctx.viewport.height_px as f32,
                     fw as f32,
@@ -393,7 +392,7 @@ impl FluorApp for FluorViewer {
                 self.dbg_cur = (cx, cy);
                 self.dbg_ctx_cur = (ctx.cursor_x, ctx.cursor_y);
                 self.dbg_vp = (ctx.viewport.width_px, ctx.viewport.height_px);
-                self.dbg_org = (fx, fy);
+                self.dbg_org = (ox, oy);
                 self.dbg_rem = self.to_remote(ctx, cx, cy).unwrap_or((-1, -1));
                 self.send_move(ctx, cx, cy);
                 if self.hud {
@@ -511,20 +510,24 @@ impl FluorApp for FluorViewer {
             }
             return;
         }
-        // Same origin the mouse maps with — draw + input can't disagree. ALWAYS 1:1.
-        let (fx, fy) = self.frame_origin(vw, vh, fw as f32, fh as f32);
+        // The WHOLE frame, scaled to fit the window (aspect preserved). Same rect the mouse
+        // inverts — draw and input can't disagree. The entire desktop is always visible and the
+        // cursor reaches every corner.
+        let (ox, oy, scale) = self.view_rect(vw, vh, fw as f32, fh as f32);
+        let dw = fw as f32 * scale;
+        let dh = fh as f32 * scale;
         if self.last_seen_gen != f.gen {
             self.last_seen_gen = f.gen;
             log::info!(
-                "fluor: blit frame {fw}x{fh} 1:1 origin=({:.0},{:.0}) viewport {bw}x{bh}",
-                fx, fy
+                "fluor: blit frame {fw}x{fh} fit scale={:.3} rect=({:.0},{:.0} {:.0}x{:.0}) viewport {bw}x{bh}",
+                scale, ox, oy, dw, dh
             );
         }
-        let cx = fx + fw as f32 * 0.5;
-        let cy = fy + fh as f32 * 0.5;
+        let cx = ox + dw * 0.5;
+        let cy = oy + dh * 0.5;
         {
             let mut canvas = Canvas::new(target, bw, bh, ctx.damage);
-            draw_image(&mut canvas, &f.pixels, fw, fh, cx, cy, fw as f32, fh as f32, None);
+            draw_image(&mut canvas, &f.pixels, fw, fh, cx, cy, dw, dh, None);
         }
         drop(f);
         // Backdrop UNDER everything: fills the letterbox and makes the window opaque, while
