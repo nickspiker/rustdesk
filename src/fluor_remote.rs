@@ -9,6 +9,7 @@
 //! render, and translate input back into `send_mouse`/`send_key`).
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use fluor::canvas::Canvas;
 use fluor::event::{ElementState, Event as FEvent, Key, MouseButton, MouseScrollDelta, NamedKey};
@@ -53,6 +54,8 @@ struct Shared {
     /// The current display's origin (x, y) in the remote's virtual-desktop space. Added to
     /// mapped coords so a non-primary monitor (origin != 0,0) targets the right pixels.
     display_origin: Mutex<(i32, i32)>,
+    /// Which host display index we're viewing — the target of resolution-follow.
+    display_idx: Mutex<i32>,
 }
 
 impl Shared {
@@ -124,8 +127,13 @@ impl InvokeUiSession for FluorHandler {
     fn set_display(&self, x: i32, y: i32, _w: i32, _h: i32, _cursor_embedded: bool, _scale: f64) {
         *self.shared.display_origin.lock().unwrap() = (x, y);
     }
-    fn switch_display(&self, _display: &hbb_common::message_proto::SwitchDisplay) {}
-    fn set_peer_info(&self, _pi: &hbb_common::message_proto::PeerInfo) {}
+    fn switch_display(&self, display: &hbb_common::message_proto::SwitchDisplay) {
+        *self.shared.display_idx.lock().unwrap() = display.display;
+        *self.shared.display_origin.lock().unwrap() = (display.x, display.y);
+    }
+    fn set_peer_info(&self, pi: &hbb_common::message_proto::PeerInfo) {
+        *self.shared.display_idx.lock().unwrap() = pi.current_display;
+    }
     fn set_displays(&self, _displays: &Vec<hbb_common::message_proto::DisplayInfo>) {}
     fn set_platform_additions(&self, _data: &str) {}
     fn on_connected(&self, _conn_type: ConnType) {}
@@ -199,6 +207,10 @@ const BTN_MIDDLE: i32 = 4;
 /// Opaque dark-grey letterbox, α+darkness packed (darkness 0xC0 → visible 0x3F).
 const BACKDROP: u32 = 0xFFC0_C0C0;
 
+/// Quiet time after the last window-size change before we ask the host to follow — long enough
+/// that dragging the window doesn't mint an xrandr mode per pixel, short enough to feel live.
+const FOLLOW_DEBOUNCE: Duration = Duration::from_millis(300);
+
 /// Visible-RGB → fluor's α+darkness packing (same as on_rgba / opsin's `argb`). Const so HUD
 /// colours are compile-time.
 const fn argb(r: u8, g: u8, b: u8, a: u8) -> u32 {
@@ -212,9 +224,9 @@ const HUD_SHADOW: u32 = argb(0x00, 0x00, 0x00, 0xFF);
 struct FluorViewer {
     session: Session<FluorHandler>,
     shared: Arc<Shared>,
-    /// `true` (default): scale the whole remote screen to fit the window (letterboxed) so you
-    /// see everything at once. `false`: 1:1 pixel-perfect, pan with the scroll wheel to reach
-    /// the parts off-window. Toggle with Ctrl+Alt+Space.
+    /// `false` (default): 1:1 pixel-perfect — never resampled, exactly what fluor's 1:1 blit
+    /// gives. Pan with the scroll wheel (or go fullscreen) to reach parts off-window. `true`:
+    /// scale the whole remote screen to fit the window (soft overview). Toggle: Ctrl+Alt+Space.
     fit: bool,
     /// Pan (1:1 mode only): remote-pixel coordinate shown at the window's top-left. Clamped.
     pan_x: f32,
@@ -222,6 +234,11 @@ struct FluorViewer {
     // input bookkeeping
     buttons: i32, // currently-held button mask
     last_seen_gen: u64,
+    // ── resolution-follow: ask the host to render at exactly this window's backing size, so
+    //    the frame fills the window 1:1 (no scaling) and the mouse maps by identity ──
+    follow_target: (i32, i32), // most recent window backing size seen
+    follow_at: Option<Instant>, // when the debounce elapses and we send the follow
+    last_follow: (i32, i32),   // last size actually requested (avoids resend spam)
     // ── on-screen diagnostic HUD (Ctrl+Alt+H toggles) ──
     hud: bool,
     dbg_cur: (Coord, Coord),   // ctx.cursor_x/y as the handler saw it
@@ -295,6 +312,38 @@ impl FluorViewer {
                 .send_mouse((self.buttons << 3) | TYPE_MOVE, rx, ry, false, false, false, false);
         }
     }
+
+    /// Resolution-follow: ask the host to render at exactly this window's backing-pixel size.
+    /// When it does, frame == viewport, so the video fills the window 1:1 (crisp, no scaling)
+    /// and `to_remote` becomes identity — the whole "hard-left" transform class disappears.
+    /// Debounced so dragging the window doesn't mint an xrandr mode per pixel. Returns `true`
+    /// while a follow is still pending (caller keeps redrawing so the flush isn't stranded on a
+    /// static screen with no input).
+    fn maybe_follow(&mut self, ctx: &Context) -> bool {
+        let target = (ctx.viewport.width_px as i32, ctx.viewport.height_px as i32);
+        if target.0 <= 0 || target.1 <= 0 {
+            return false;
+        }
+        if target != self.follow_target {
+            // Size changed — (re)start the debounce; don't send mid-drag.
+            self.follow_target = target;
+            self.follow_at = Some(Instant::now() + FOLLOW_DEBOUNCE);
+            return true;
+        }
+        if target != self.last_follow {
+            let due = self.follow_at.map_or(true, |t| Instant::now() >= t);
+            if due {
+                let idx = *self.shared.display_idx.lock().unwrap();
+                self.session.change_resolution(idx, target.0, target.1);
+                self.last_follow = target;
+                self.follow_at = None;
+                log::info!("fluor follow: requested host resolution {}x{}", target.0, target.1);
+                return false;
+            }
+            return true; // waiting for the debounce
+        }
+        false
+    }
 }
 
 impl FluorApp for FluorViewer {
@@ -306,7 +355,12 @@ impl FluorApp for FluorViewer {
 
     fn init(&mut self, _ctx: &mut Context) {}
 
-    fn on_resize(&mut self, _w: u32, _h: u32, _ctx: &mut Context) {}
+    fn on_resize(&mut self, _w: u32, _h: u32, ctx: &mut Context) {
+        // Window resized → the host should follow to the new backing size.
+        if self.maybe_follow(ctx) {
+            ctx.window.request_redraw();
+        }
+    }
 
     fn on_user_event(&mut self, event: Self::UserEvent, ctx: &mut Context) -> EventResponse {
         match event {
@@ -316,6 +370,10 @@ impl FluorApp for FluorViewer {
     }
 
     fn on_event(&mut self, event: &FEvent, ctx: &mut Context) -> EventResponse {
+        // Keep the host sized to this window (debounced inside). Cheap; runs on every event.
+        if self.maybe_follow(ctx) {
+            ctx.window.request_redraw();
+        }
         match event {
             FEvent::CloseRequested => return EventResponse::Close,
             FEvent::CursorMoved { .. } => {
@@ -436,6 +494,11 @@ impl FluorApp for FluorViewer {
         let bh = ctx.viewport.height_px as usize;
         let vw = bw as f32;
         let vh = bh as f32;
+        // Drive resolution-follow from render too, so the initial follow fires even if the user
+        // never moves the mouse (keep ticking until the debounce flushes, then stop).
+        if self.maybe_follow(ctx) {
+            ctx.window.request_redraw();
+        }
         // Transparent first — draw_image composes UNDER existing content, so an opaque pre-fill
         // would hide the video (that was the grey box). Backdrop goes under at the END.
         for px in target.iter_mut() {
@@ -480,8 +543,9 @@ impl FluorApp for FluorViewer {
                 self.dbg_cur.0, self.dbg_cur.1, self.dbg_vp.0, self.dbg_vp.1, fw, fh
             );
             let line2 = format!(
-                "fit={}  zoom={:.3}  org={:.0},{:.0}  ->remote={},{}",
-                self.fit, self.dbg_zoom, self.dbg_org.0, self.dbg_org.1, self.dbg_rem.0, self.dbg_rem.1
+                "fit={}  zoom={:.3}  org={:.0},{:.0}  ->remote={},{}  follow={}x{}",
+                self.fit, self.dbg_zoom, self.dbg_org.0, self.dbg_org.1, self.dbg_rem.0, self.dbg_rem.1,
+                self.last_follow.0, self.last_follow.1
             );
             let line3 = format!("key: {}", self.dbg_key);
             let line4 = "Ctrl+Alt: Enter=fullscreen  Space=fit/1:1  H=hud";
@@ -600,11 +664,14 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
     let app = FluorViewer {
         session,
         shared,
-        fit: true,
+        fit: false,
         pan_x: 0.0,
         pan_y: 0.0,
         buttons: 0,
         last_seen_gen: 0,
+        follow_target: (0, 0),
+        follow_at: None,
+        last_follow: (0, 0),
         hud: true,
         dbg_cur: (0.0, 0.0),
         dbg_vp: (0, 0),
