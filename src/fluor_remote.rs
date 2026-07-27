@@ -293,9 +293,10 @@ impl FluorViewer {
         (zoom, fx, fy)
     }
 
-    /// Map a cursor position to a remote-px coordinate, computing the transform from the SAME
-    /// Context the cursor came from. `(cursor − origin) / zoom`, clamped to the frame, plus the
-    /// display's origin for multi-monitor hosts.
+    /// Map a window cursor position to a remote pixel. It is exactly two subtractions: the
+    /// remote pixel under the cursor is the cursor minus the frame's top-left offset in the
+    /// window. `fx/fy` IS that top-left (from view_params; 0,0 at 1:1 unpanned). No zoom divide
+    /// at 1:1, no clamp that could swallow the event — clicks always land where the pointer is.
     fn to_remote(&self, ctx: &Context, x: Coord, y: Coord) -> Option<(i32, i32)> {
         let (fw, fh) = self.frame_dims();
         if fw == 0 {
@@ -304,16 +305,9 @@ impl FluorViewer {
         let vw = ctx.viewport.width_px as f32;
         let vh = ctx.viewport.height_px as f32;
         let (zoom, fx, fy) = self.view_params(vw, vh, fw as f32, fh as f32);
-        if zoom <= 0.0 {
-            return None;
-        }
-        let rx = ((x - fx) / zoom).floor() as i32;
-        let ry = ((y - fy) / zoom).floor() as i32;
-        if rx < 0 || ry < 0 || rx >= fw as i32 || ry >= fh as i32 {
-            return None;
-        }
-        let (ox, oy) = *self.shared.display_origin.lock().unwrap();
-        Some((rx + ox, ry + oy))
+        let rx = ((x - fx) / zoom) as i32;
+        let ry = ((y - fy) / zoom) as i32;
+        Some((rx.clamp(0, fw as i32 - 1), ry.clamp(0, fh as i32 - 1)))
     }
 
     fn send_move(&self, ctx: &Context, x: Coord, y: Coord) {
@@ -335,7 +329,10 @@ impl FluorViewer {
             return false;
         }
         if target != self.follow_target {
-            // Size changed — (re)start the debounce; don't send mid-drag.
+            // Size changed — (re)start the debounce; don't send mid-drag. Chat it so we see
+            // (on the HOST log) whether the target keeps oscillating and never settles.
+            self.session
+                .send_chat(format!("HUD|follow-arm|{}x{}|was|{}x{}", target.0, target.1, self.follow_target.0, self.follow_target.1));
             self.follow_target = target;
             self.follow_at = Some(Instant::now() + FOLLOW_DEBOUNCE);
             return true;
@@ -347,7 +344,8 @@ impl FluorViewer {
                 self.session.change_resolution(idx, target.0, target.1);
                 self.last_follow = target;
                 self.follow_at = None;
-                log::info!("fluor follow: requested host resolution {}x{}", target.0, target.1);
+                self.session
+                    .send_chat(format!("HUD|follow-sent|{}x{}|idx|{}", target.0, target.1, idx));
                 return false;
             }
             return true; // waiting for the debounce
@@ -442,11 +440,13 @@ impl FluorApp for FluorViewer {
                 if btn == 0 {
                     return EventResponse::Pass;
                 }
-                // Position the host cursor with a MOVE first (proven sciter protocol), THEN the
-                // button event with x=0,y=0 — the host reuses the last MOVE position for clicks.
-                if self.to_remote(ctx, cx, cy).is_none() {
+                // Send the REAL coordinate on down/up — NOT 0,0. The old "host reuses the last
+                // MOVE position" assumption was false for this host: it took the 0,0 literally
+                // and every click landed at the top-left. Position with a MOVE, then click at
+                // the SAME coordinate.
+                let Some((rx, ry)) = self.to_remote(ctx, cx, cy) else {
                     return EventResponse::Pass; // click outside the frame
-                }
+                };
                 self.send_move(ctx, cx, cy);
                 let pressed = matches!(state, ElementState::Pressed);
                 let ty = if pressed { TYPE_DOWN } else { TYPE_UP };
@@ -456,7 +456,7 @@ impl FluorApp for FluorViewer {
                     self.buttons &= !btn;
                 }
                 self.session
-                    .send_mouse((btn << 3) | ty, 0, 0, false, false, false, false);
+                    .send_mouse((btn << 3) | ty, rx, ry, false, false, false, false);
             }
             FEvent::MouseWheel { delta } => {
                 // Scroll pans the 1:1 view (the frame is bigger than the window). No-op in fit
@@ -647,14 +647,20 @@ impl FluorViewer {
             return;
         }
         // Printable character (incl. NamedKey::Space via its text " "): type on the down edge.
+        // Send each codepoint as Unicode (NOT Seq): the host types it as a direct keysym,
+        // layout-independent. Seq went through xdo_enter_text's physical-key lookup, which a
+        // Dvorak host re-translated ("the" -> "kjd"). `text` already holds the layout-resolved
+        // character fluor produced, so this is exactly what the user pressed.
         if down {
             let t = text.unwrap_or("");
-            let is_printable = t.chars().next().map(|c| !c.is_control()).unwrap_or(false);
-            if is_printable {
+            for c in t.chars() {
+                if c.is_control() {
+                    continue;
+                }
                 let mut evt = KeyEvent::new();
                 evt.mode = KeyboardMode::Legacy.into();
                 evt.press = true;
-                evt.set_seq(t.to_string());
+                evt.set_unicode(c as u32);
                 self.session.send_key_event(&evt);
             }
         }
@@ -703,7 +709,7 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
     let app = FluorViewer {
         session,
         shared,
-        fit: false,
+        fit: true,
         pan_x: 0.0,
         pan_y: 0.0,
         buttons: 0,

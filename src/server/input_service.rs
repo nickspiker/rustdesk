@@ -1672,6 +1672,15 @@ fn process_unicode(en: &mut Enigo, chr: u32) {
     }
 
     if let Ok(chr) = char::try_from(chr) {
+        // X11: type the codepoint DIRECTLY as a keysym (xdo "U0074"), NOT via
+        // xdo_enter_text's physical-key lookup — that lookup re-maps through the host's
+        // layout, so a Dvorak host double-translated every char ("the" -> "kjd"). Key::Layout
+        // routes to keysequence()'s `U{:X}` path, which is layout-independent.
+        #[cfg(target_os = "linux")]
+        if crate::platform::linux::is_x11() {
+            en.key_click(Key::Layout(chr));
+            return;
+        }
         en.key_sequence(&chr.to_string());
     }
 }
