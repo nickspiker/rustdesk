@@ -2867,6 +2867,9 @@ impl Connection {
             match msg.union {
                 #[allow(unused_mut)]
                 Some(message::Union::MouseEvent(mut me)) => {
+                    // TEMP full-rate diagnostic: the EXACT mouse event this host receives off the
+                    // wire, before any processing — ground truth for the x=0 stream.
+                    log::info!("rx-mouse: mask={} x={} y={}", me.mask, me.x, me.y);
                     if self.is_authed_view_camera_conn() {
                         return true;
                     }

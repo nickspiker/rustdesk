@@ -224,11 +224,9 @@ const HUD_SHADOW: u32 = argb(0x00, 0x00, 0x00, 0xFF);
 struct FluorViewer {
     session: Session<FluorHandler>,
     shared: Arc<Shared>,
-    /// `false` (default): 1:1 pixel-perfect — never resampled, exactly what fluor's 1:1 blit
-    /// gives. Pan with the scroll wheel (or go fullscreen) to reach parts off-window. `true`:
-    /// scale the whole remote screen to fit the window (soft overview). Toggle: Ctrl+Alt+Space.
-    fit: bool,
-    /// Pan (1:1 mode only): remote-pixel coordinate shown at the window's top-left. Clamped.
+    /// Pan: the remote-pixel coordinate shown at the window's top-left. Scroll to move it.
+    /// The frame is ALWAYS drawn 1:1 (no scaling, ever); when it's bigger than the window you
+    /// pan to reach the rest. Clamped so you can't scroll past the edges.
     pan_x: f32,
     pan_y: f32,
     // input bookkeeping
@@ -253,7 +251,6 @@ struct FluorViewer {
     dbg_cur: (Coord, Coord),     // raw − window_origin = what we map with
     dbg_ctx_cur: (Coord, Coord), // fluor's ctx.cursor_x/y (for comparison — mac reads 0)
     dbg_vp: (u32, u32),          // ctx.viewport.width_px/height_px
-    dbg_zoom: f32,               // effective zoom used to map
     dbg_org: (f32, f32),         // frame origin used to map
     dbg_rem: (i32, i32),         // resulting remote px sent (−1,−1 = off-frame)
     dbg_key: String,             // last keypress: logical key + text + path taken
@@ -266,37 +263,27 @@ impl FluorViewer {
         (f.w, f.h)
     }
 
-    /// The SINGLE source of truth for the view transform: given a viewport (from whatever
-    /// Context is asking) and the frame size, return `(zoom, frame_origin_x, frame_origin_y)`
-    /// in viewport pixels. Render draws with it and input maps with it, computed from the SAME
-    /// `ctx.viewport` each call — so draw and mouse can never disagree (that desync was the
-    /// "hard left / random vertical"). `fit` scales the whole frame to the window; otherwise 1:1
-    /// + pan. Centered when the scaled frame is smaller than the window.
-    fn view_params(&self, vw: f32, vh: f32, fw: f32, fh: f32) -> (f32, f32, f32) {
-        let zoom = if self.fit {
-            (vw / fw).min(vh / fh).max(0.01)
+    /// The frame's top-left corner in the window, in window pixels. ALWAYS 1:1 (no scale).
+    /// When the frame fits in the window it's centered; when it's bigger you pan, and the
+    /// origin is just `−pan` (clamped so you can't scroll past an edge). This is the ONLY view
+    /// transform — render draws at it, the mouse subtracts it. Two numbers, nothing else.
+    fn frame_origin(&self, vw: f32, vh: f32, fw: f32, fh: f32) -> (f32, f32) {
+        let fx = if fw <= vw {
+            (vw - fw) * 0.5
         } else {
-            1.0
+            -self.pan_x.clamp(0.0, fw - vw)
         };
-        let dst_w = fw * zoom;
-        let dst_h = fh * zoom;
-        let fx = if dst_w <= vw {
-            (vw - dst_w) * 0.5
+        let fy = if fh <= vh {
+            (vh - fh) * 0.5
         } else {
-            -self.pan_x.clamp(0.0, fw - vw / zoom) * zoom
+            -self.pan_y.clamp(0.0, fh - vh)
         };
-        let fy = if dst_h <= vh {
-            (vh - dst_h) * 0.5
-        } else {
-            -self.pan_y.clamp(0.0, fh - vh / zoom) * zoom
-        };
-        (zoom, fx, fy)
+        (fx, fy)
     }
 
-    /// Map a window cursor position to a remote pixel. It is exactly two subtractions: the
-    /// remote pixel under the cursor is the cursor minus the frame's top-left offset in the
-    /// window. `fx/fy` IS that top-left (from view_params; 0,0 at 1:1 unpanned). No zoom divide
-    /// at 1:1, no clamp that could swallow the event — clicks always land where the pointer is.
+    /// Map a window cursor position to a remote pixel: the remote pixel under the cursor is the
+    /// cursor minus the frame's top-left. Two subtractions, no scale, no divide. Clamped to the
+    /// frame so a click near an edge still lands (never swallowed).
     fn to_remote(&self, ctx: &Context, x: Coord, y: Coord) -> Option<(i32, i32)> {
         let (fw, fh) = self.frame_dims();
         if fw == 0 {
@@ -304,9 +291,9 @@ impl FluorViewer {
         }
         let vw = ctx.viewport.width_px as f32;
         let vh = ctx.viewport.height_px as f32;
-        let (zoom, fx, fy) = self.view_params(vw, vh, fw as f32, fh as f32);
-        let rx = ((x - fx) / zoom) as i32;
-        let ry = ((y - fy) / zoom) as i32;
+        let (fx, fy) = self.frame_origin(vw, vh, fw as f32, fh as f32);
+        let rx = (x - fx) as i32;
+        let ry = (y - fy) as i32;
         Some((rx.clamp(0, fw as i32 - 1), ry.clamp(0, fh as i32 - 1)))
     }
 
@@ -395,7 +382,7 @@ impl FluorApp for FluorViewer {
                 // Capture the exact runtime values for the on-screen HUD — this is the ground
                 // truth we could never get off the Mac's logs.
                 let (fw, fh) = self.frame_dims();
-                let (zoom, fx, fy) = self.view_params(
+                let (fx, fy) = self.frame_origin(
                     ctx.viewport.width_px as f32,
                     ctx.viewport.height_px as f32,
                     fw as f32,
@@ -406,25 +393,9 @@ impl FluorApp for FluorViewer {
                 self.dbg_cur = (cx, cy);
                 self.dbg_ctx_cur = (ctx.cursor_x, ctx.cursor_y);
                 self.dbg_vp = (ctx.viewport.width_px, ctx.viewport.height_px);
-                self.dbg_zoom = zoom;
                 self.dbg_org = (fx, fy);
                 self.dbg_rem = self.to_remote(ctx, cx, cy).unwrap_or((-1, -1));
                 self.send_move(ctx, cx, cy);
-                // Telemetry: ship the same numbers the HUD draws to the HOST's log (throttled).
-                let due = self
-                    .last_telemetry
-                    .map_or(true, |t| t.elapsed().as_millis() >= 2000);
-                if due {
-                    self.last_telemetry = Some(std::time::Instant::now());
-                    self.session.send_chat(format!(
-                        "HUD|raw={:.0},{:.0}|worg={},{}|cur={:.0},{:.0}|fluorcur={:.0},{:.0}|vp={}x{}|frame={}x{}|follow={}x{}|zoom={:.3}|org={:.0},{:.0}|rem={},{}",
-                        self.dbg_raw.0, self.dbg_raw.1, self.dbg_worg.0, self.dbg_worg.1,
-                        self.dbg_cur.0, self.dbg_cur.1, self.dbg_ctx_cur.0, self.dbg_ctx_cur.1,
-                        self.dbg_vp.0, self.dbg_vp.1, fw, fh,
-                        self.last_follow.0, self.last_follow.1,
-                        zoom, fx, fy, self.dbg_rem.0, self.dbg_rem.1
-                    ));
-                }
                 if self.hud {
                     ctx.window.request_redraw();
                 }
@@ -459,39 +430,28 @@ impl FluorApp for FluorViewer {
                     .send_mouse((btn << 3) | ty, rx, ry, false, false, false, false);
             }
             FEvent::MouseWheel { delta } => {
-                // Scroll pans the 1:1 view (the frame is bigger than the window). No-op in fit
-                // mode — the whole screen is already visible. Vertical scroll pans vertically.
-                if !self.fit {
-                    let (_dx, dy) = match delta {
-                        MouseScrollDelta::Lines(x, y) => (*x * 40.0, *y * 40.0),
-                        MouseScrollDelta::Pixels(x, y) => (*x, *y),
-                    };
-                    self.pan_y -= dy;
-                    let (_fw, fh) = self.frame_dims();
-                    let vh = ctx.viewport.height_px as f32;
-                    // zoom is 1.0 in !fit mode, so the clamp is in remote px directly.
-                    if fh as f32 > vh {
-                        self.pan_y = self.pan_y.clamp(0.0, fh as f32 - vh);
-                    }
-                    ctx.window.request_redraw();
+                // Scroll pans the 1:1 view when the frame is bigger than the window.
+                let (_dx, dy) = match delta {
+                    MouseScrollDelta::Lines(x, y) => (*x * 40.0, *y * 40.0),
+                    MouseScrollDelta::Pixels(x, y) => (*x, *y),
+                };
+                self.pan_y -= dy;
+                let (_fw, fh) = self.frame_dims();
+                let vh = ctx.viewport.height_px as f32;
+                if fh as f32 > vh {
+                    self.pan_y = self.pan_y.clamp(0.0, fh as f32 - vh);
                 }
+                ctx.window.request_redraw();
             }
             FEvent::KeyboardInput { event } => {
                 let down = matches!(event.state, ElementState::Pressed);
                 // Local hotkeys FIRST (Ctrl+Alt+… or Cmd+Alt+…) — intercepted, never sent to the
-                // remote. Enter=fullscreen toggle, Space=fit/1:1, H=HUD.
+                // remote. Enter=fullscreen toggle, H=HUD.
                 let m = ctx.modifiers;
                 let hotkey = (m.ctrl || m.meta) && m.alt;
                 if hotkey && down {
                     match &event.logical_key {
                         Key::Named(NamedKey::Enter) => return EventResponse::ToggleMaximized,
-                        Key::Named(NamedKey::Space) => {
-                            self.fit = !self.fit;
-                            self.pan_x = 0.0;
-                            self.pan_y = 0.0;
-                            ctx.window.request_redraw();
-                            return EventResponse::Handled;
-                        }
                         Key::Character(c) if c.eq_ignore_ascii_case("h") => {
                             self.hud = !self.hud;
                             ctx.window.request_redraw();
@@ -551,22 +511,20 @@ impl FluorApp for FluorViewer {
             }
             return;
         }
-        // Same transform the mouse maps with (view_params) — draw + input can't disagree.
-        let (zoom, fx, fy) = self.view_params(vw, vh, fw as f32, fh as f32);
+        // Same origin the mouse maps with — draw + input can't disagree. ALWAYS 1:1.
+        let (fx, fy) = self.frame_origin(vw, vh, fw as f32, fh as f32);
         if self.last_seen_gen != f.gen {
             self.last_seen_gen = f.gen;
             log::info!(
-                "fluor: blit frame {fw}x{fh} fit={} zoom={:.3} origin=({:.0},{:.0}) viewport {bw}x{bh}",
-                self.fit, zoom, fx, fy
+                "fluor: blit frame {fw}x{fh} 1:1 origin=({:.0},{:.0}) viewport {bw}x{bh}",
+                fx, fy
             );
         }
-        let dst_w = fw as f32 * zoom;
-        let dst_h = fh as f32 * zoom;
-        let cx = fx + dst_w * 0.5;
-        let cy = fy + dst_h * 0.5;
+        let cx = fx + fw as f32 * 0.5;
+        let cy = fy + fh as f32 * 0.5;
         {
             let mut canvas = Canvas::new(target, bw, bh, ctx.damage);
-            draw_image(&mut canvas, &f.pixels, fw, fh, cx, cy, dst_w, dst_h, None);
+            draw_image(&mut canvas, &f.pixels, fw, fh, cx, cy, fw as f32, fh as f32, None);
         }
         drop(f);
         // Backdrop UNDER everything: fills the letterbox and makes the window opaque, while
@@ -582,12 +540,12 @@ impl FluorApp for FluorViewer {
                 self.dbg_cur.0, self.dbg_cur.1, self.dbg_ctx_cur.0, self.dbg_ctx_cur.1
             );
             let line2 = format!(
-                "vp={}x{}  frame={}x{}  follow={}x{}  fit={}  zoom={:.3}  org={:.0},{:.0}  ->remote={},{}",
-                self.dbg_vp.0, self.dbg_vp.1, fw, fh, self.last_follow.0, self.last_follow.1,
-                self.fit, self.dbg_zoom, self.dbg_org.0, self.dbg_org.1, self.dbg_rem.0, self.dbg_rem.1
+                "vp={}x{}  frame={}x{}  org={:.0},{:.0}  ->remote={},{}   (1:1, subtract only)",
+                self.dbg_vp.0, self.dbg_vp.1, fw, fh,
+                self.dbg_org.0, self.dbg_org.1, self.dbg_rem.0, self.dbg_rem.1
             );
             let line3 = format!("key: {}", self.dbg_key);
-            let line4 = "Ctrl+Alt: Enter=fullscreen  Space=fit/1:1  H=hud";
+            let line4 = "Ctrl+Alt: Enter=fullscreen  H=hud";
             let size = (bh as f32 * 0.028).clamp(16.0, 40.0);
             let x = size * 0.5;
             let mut y = size * 0.9;
@@ -709,7 +667,6 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
     let app = FluorViewer {
         session,
         shared,
-        fit: true,
         pan_x: 0.0,
         pan_y: 0.0,
         buttons: 0,
@@ -725,7 +682,6 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
         dbg_cur: (0.0, 0.0),
         dbg_ctx_cur: (0.0, 0.0),
         dbg_vp: (0, 0),
-        dbg_zoom: 1.0,
         dbg_org: (0.0, 0.0),
         dbg_rem: (0, 0),
         dbg_key: String::new(),
