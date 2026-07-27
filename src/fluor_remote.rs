@@ -349,6 +349,12 @@ impl FluorApp for FluorViewer {
 
     fn init(&mut self, _ctx: &mut Context) {}
 
+    /// Open at the FULL monitor, not fluor's default half. This is the visible-window size; the
+    /// default `monitor/2` was the "quarter area / mostly wallpaper" the user kept reporting.
+    fn initial_size(&self, monitor: (u32, u32)) -> (u32, u32) {
+        monitor
+    }
+
     fn on_resize(&mut self, _w: u32, _h: u32, ctx: &mut Context) {
         // Window resized → the host should follow to the new backing size.
         if self.maybe_follow(ctx) {
