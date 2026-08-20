@@ -52,7 +52,9 @@ impl Enigo {
     fn tfc_key_click(&mut self, key: Key) -> ResultType {
         if let Some(tfc) = &mut self.tfc {
             let res = match key {
-                Key::Layout(chr) => tfc.unicode_char(chr),
+                // Decline Layout so enigo falls back to xdo's direct-keysym path (Dvorak-safe);
+                // tfc.unicode_char assumes US keycodes and mangles non-US layouts.
+                Key::Layout(_) => return Err("tfc declines Key::Layout (use xdo keysym)".into()),
                 key => {
                     let tfc_key: TFC_Key = match convert_to_tfc_key(key) {
                         Some(key) => key,
@@ -77,18 +79,13 @@ impl Enigo {
         match &mut self.tfc {
             None => false,
             Some(tfc) => {
-                if let Key::Layout(chr) = key {
-                    if down {
-                        if let Err(_) = tfc.unicode_char_down(chr) {
-                            return false;
-                        }
-                    }
-                    if up {
-                        if let Err(_) = tfc.unicode_char_up(chr) {
-                            return false;
-                        }
-                    }
-                    return true;
+                if let Key::Layout(_) = key {
+                    // Dvorak fix: tfc.unicode_char assumes a US-QWERTY keycode table, so on a
+                    // Dvorak (or any non-US) X layout it presses the wrong physical key
+                    // ("the" -> "kjd"). Decline here so enigo falls back to xdo's direct-keysym
+                    // path (binds the real Unicode keysym to a spare keycode), which is
+                    // layout-independent and types exactly the character.
+                    return false;
                 }
                 let key = match convert_to_tfc_key(key) {
                     Some(key) => key,

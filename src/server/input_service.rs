@@ -1655,6 +1655,60 @@ fn process_chr(en: &mut Enigo, chr: u32, down: bool, _hotkey: bool) {
     }
 }
 
+/// True when leviathan's X keyboard layout is Dvorak. On such a host, XTEST/xdo keysym
+/// injection is read back through US-QWERTY (a deterministic us->dvorak character swap:
+/// injecting 't' yields 'k'), so we pre-invert each character before injecting. Detected once.
+#[cfg(target_os = "linux")]
+fn host_is_dvorak() -> bool {
+    use std::sync::OnceLock;
+    static IS_DVORAK: OnceLock<bool> = OnceLock::new();
+    *IS_DVORAK.get_or_init(|| {
+        std::process::Command::new("setxkbmap")
+            .arg("-query")
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .to_lowercase()
+                    .contains("dvorak")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Inverse of the us->dvorak character swap the Dvorak host applies to injected keysyms.
+/// `dvorak_to_us('t') == 'k'`: to make the mangle land on 't', we inject 'k'. Preserves case;
+/// passes through anything not on the letter/punctuation map (digits, space, unknown).
+#[cfg(target_os = "linux")]
+fn dvorak_to_us(c: char) -> char {
+    let lower = c.to_ascii_lowercase();
+    // dvorak_char -> qwerty_char at the same physical key.
+    let mapped = match lower {
+        '\'' => 'q', ',' => 'w', '.' => 'e', 'p' => 'r', 'y' => 't',
+        'f' => 'y', 'g' => 'u', 'c' => 'i', 'r' => 'o', 'l' => 'p',
+        '/' => '[', '=' => ']',
+        'a' => 'a', 'o' => 's', 'e' => 'd', 'u' => 'f', 'i' => 'g',
+        'd' => 'h', 'h' => 'j', 't' => 'k', 'n' => 'l', 's' => ';', '-' => '\'',
+        ';' => 'z', 'q' => 'x', 'j' => 'c', 'k' => 'v', 'x' => 'b',
+        'b' => 'n', 'm' => 'm', 'w' => ',', 'v' => '.', 'z' => '/',
+        other => other,
+    };
+    if c.is_ascii_uppercase() {
+        mapped.to_ascii_uppercase()
+    } else {
+        mapped
+    }
+}
+
+/// The character to actually inject so it renders as `c` on this host (Dvorak-swap inverted).
+#[cfg(target_os = "linux")]
+fn inject_char(c: char) -> char {
+    if host_is_dvorak() {
+        dvorak_to_us(c)
+    } else {
+        c
+    }
+}
+
 fn process_unicode(en: &mut Enigo, chr: u32) {
     // On Wayland with uinput mode:
     // - ASCII printable: input via key sequence (custom keyboard path)
@@ -1672,13 +1726,12 @@ fn process_unicode(en: &mut Enigo, chr: u32) {
     }
 
     if let Ok(chr) = char::try_from(chr) {
-        // X11: type the codepoint DIRECTLY as a keysym (xdo "U0074"), NOT via
-        // xdo_enter_text's physical-key lookup — that lookup re-maps through the host's
-        // layout, so a Dvorak host double-translated every char ("the" -> "kjd"). Key::Layout
-        // routes to keysequence()'s `U{:X}` path, which is layout-independent.
+        // X11: inject the codepoint as a keysym via Key::Layout ("U{:X}"). On a Dvorak host the
+        // XTEST/xdo keysym is read back as US-QWERTY, so pre-invert (inject_char) to cancel the
+        // swap and land the intended character.
         #[cfg(target_os = "linux")]
         if crate::platform::linux::is_x11() {
-            en.key_click(Key::Layout(chr));
+            en.key_click(Key::Layout(inject_char(chr)));
             return;
         }
         en.key_sequence(&chr.to_string());
@@ -1706,7 +1759,7 @@ fn process_seq(en: &mut Enigo, sequence: &str) {
     #[cfg(target_os = "linux")]
     if crate::platform::linux::is_x11() {
         for c in sequence.chars() {
-            en.key_click(Key::Layout(c));
+            en.key_click(Key::Layout(inject_char(c)));
         }
         return;
     }
@@ -1987,6 +2040,19 @@ fn legacy_keyboard_mode(evt: &KeyEvent) {
     sync_modifiers(&mut en, &evt, &mut to_release);
 
     let down = evt.down;
+    // TEMP: exact key union + value the host received — ground truth for the Dvorak mangle.
+    log::info!(
+        "rx-key: down={} mode={:?} union={}",
+        down,
+        evt.mode.enum_value_or(KeyboardMode::Legacy),
+        match &evt.union {
+            Some(key_event::Union::ControlKey(ck)) => format!("ControlKey({:?})", ck.enum_value_or(ControlKey::Unknown)),
+            Some(key_event::Union::Chr(c)) => format!("Chr({}) = keycode/vk", c),
+            Some(key_event::Union::Unicode(u)) => format!("Unicode({}='{}')", u, char::from_u32(*u).unwrap_or('?')),
+            Some(key_event::Union::Seq(s)) => format!("Seq({:?})", s),
+            other => format!("{:?}", other),
+        }
+    );
     match evt.union {
         Some(key_event::Union::ControlKey(ck)) => {
             if is_function_key(&ck) {
