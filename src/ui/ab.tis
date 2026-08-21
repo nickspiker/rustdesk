@@ -350,9 +350,15 @@ class SessionList: Reactor.Component {
         var hostname = s[2] || s.hostname || "";
         var platform = s[3] || s.platform || "";
         var alias = s[4] || s.alias || "";
+        // Fleet tiles encode reachability, not identity: a member is connectable only once it
+        // has published its RustDesk ID (empty id => connect is a no-op), so the per-device hash
+        // colour is noise here — and every unpublished device hashes to the same shade anyway.
+        var bg = this.type == "fleet"
+            ? (id ? "rgba(50, 205, 50, 1)" : "rgba(74, 74, 74, 1)")
+            : string2RGB(id + platform, 0.5);
         if (this.style == "list") {
             return <div .remote-session-link .remote-session-list id={id} platform={platform} title={alias ? "ID: " + id : ""}>
-                <div .platform style={"background:"+string2RGB(id+platform, 0.5)}>
+                <div .platform style={"background:"+bg}>
                     {platform && platformSvg(platform, "white")}
                 </div>
                 <div .name>
@@ -366,7 +372,7 @@ class SessionList: Reactor.Component {
                 </div>
             </div>;
         }
-        return <div .remote-session-link .remote-session id={id} platform={platform} title={alias ? "ID: " + id : ""} style={"background:"+string2RGB(id+platform, 0.5)}>
+        return <div .remote-session-link .remote-session id={id} platform={platform} title={alias ? "ID: " + id : ""} style={"background:"+bg}>
             <div .platform>
                 {platform && platformSvg(platform, "white")}
                 <div .username .ellipsis>{username}@{hostname}</div>
