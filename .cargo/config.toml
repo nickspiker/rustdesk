@@ -18,5 +18,11 @@ rustflags = [
 #rustflags = [
 #    "-C", "link-args=-Wl,-Bstatic -lc -Wl,-Bdynamic"
 #]
+[env]
+# webm-sys / scrap bundle old C++ (libwebm) that uses uint32_t without <cstdint>; modern GCC
+# no longer includes it transitively. Force-include it so a bare `cargo build` just works —
+# no need to prepend CXXFLAGS by hand every time.
+CXXFLAGS = "-include cstdint"
+
 [net]
 git-fetch-with-cli = true

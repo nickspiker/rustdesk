@@ -1992,19 +1992,6 @@ fn legacy_keyboard_mode(evt: &KeyEvent) {
     sync_modifiers(&mut en, &evt, &mut to_release);
 
     let down = evt.down;
-    // TEMP: exact key union + value the host received — ground truth for the Dvorak mangle.
-    log::info!(
-        "rx-key: down={} mode={:?} union={}",
-        down,
-        evt.mode.enum_value_or(KeyboardMode::Legacy),
-        match &evt.union {
-            Some(key_event::Union::ControlKey(ck)) => format!("ControlKey({:?})", ck.enum_value_or(ControlKey::Unknown)),
-            Some(key_event::Union::Chr(c)) => format!("Chr({}) = keycode/vk", c),
-            Some(key_event::Union::Unicode(u)) => format!("Unicode({}='{}')", u, char::from_u32(*u).unwrap_or('?')),
-            Some(key_event::Union::Seq(s)) => format!("Seq({:?})", s),
-            other => format!("{:?}", other),
-        }
-    );
     match evt.union {
         Some(key_event::Union::ControlKey(ck)) => {
             if is_function_key(&ck) {

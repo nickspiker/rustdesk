@@ -315,10 +315,7 @@ impl FluorViewer {
             return false;
         }
         if target != self.follow_target {
-            // Size changed — (re)start the debounce; don't send mid-drag. Chat it so we see
-            // (on the HOST log) whether the target keeps oscillating and never settles.
-            self.session
-                .send_chat(format!("HUD|follow-arm|{}x{}|was|{}x{}", target.0, target.1, self.follow_target.0, self.follow_target.1));
+            // Size changed — (re)start the debounce; don't send mid-drag.
             self.follow_target = target;
             self.follow_at = Some(Instant::now() + FOLLOW_DEBOUNCE);
             return true;
@@ -330,8 +327,6 @@ impl FluorViewer {
                 self.session.change_resolution(idx, target.0, target.1);
                 self.last_follow = target;
                 self.follow_at = None;
-                self.session
-                    .send_chat(format!("HUD|follow-sent|{}x{}|idx|{}", target.0, target.1, idx));
                 return false;
             }
             return true; // waiting for the debounce
@@ -466,26 +461,6 @@ impl FluorApp for FluorViewer {
                     }
                 }
                 self.send_key(ctx, &event.logical_key, down, event.text.as_deref());
-                // Show what we saw + what we sent, so keyboard bugs are visible on screen —
-                // and ship it to the host log too (unthrottled; key events are sparse).
-                let kd = match &event.logical_key {
-                    Key::Named(n) => format!("Named({:?})", n),
-                    Key::Character(c) => format!("Char({:?})", c),
-                    Key::Unidentified => "Unidentified".to_string(),
-                };
-                self.dbg_key = format!(
-                    "{} text={:?} mods[c{} a{} s{} m{}] {}",
-                    kd,
-                    event.text.as_deref().unwrap_or(""),
-                    m.ctrl as u8, m.alt as u8, m.shift as u8, m.meta as u8,
-                    if down { "DOWN" } else { "up" }
-                );
-                if down {
-                    self.session.send_chat(format!("HUD|key|{}", self.dbg_key));
-                }
-                if self.hud {
-                    ctx.window.request_redraw();
-                }
             }
             _ => {}
         }
@@ -685,7 +660,7 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
         last_follow: (0, 0),
         last_cursor: (0.0, 0.0),
         last_telemetry: None,
-        hud: true,
+        hud: false, // off by default; Ctrl+Alt+H toggles the on-screen diagnostic overlay
         dbg_raw: (0.0, 0.0),
         dbg_worg: (0, 0),
         dbg_cur: (0.0, 0.0),

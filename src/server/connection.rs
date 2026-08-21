@@ -3488,15 +3488,14 @@ impl Connection {
                         }
                     }
                     Some(misc::Union::ChatMessage(c)) => {
-                        // Fleet debug telemetry: the fluor viewer streams its HUD values as
-                        // HUD|-tagged chat lines; log them so the host side has the numbers on
-                        // disk (the only reliable channel back from a machine we can't reach).
-                        if c.text.starts_with("HUD|") {
-                            log::info!("peer-hud: {}", c.text);
+                        // HUD|-tagged lines are diagnostic telemetry from an older fluor viewer,
+                        // NOT real chat — swallow them so they never pop the CM chat window and
+                        // steal keyboard focus (the "one char then a nag" block).
+                        if !c.text.starts_with("HUD|") {
+                            self.send_to_cm(ipc::Data::ChatMessage { text: c.text });
+                            self.chat_unanswered = true;
+                            self.update_auto_disconnect_timer();
                         }
-                        self.send_to_cm(ipc::Data::ChatMessage { text: c.text });
-                        self.chat_unanswered = true;
-                        self.update_auto_disconnect_timer();
                     }
                     Some(misc::Union::Option(o)) => {
                         if self.authed_conn_type() == Some(AuthConnType::Remote) {
