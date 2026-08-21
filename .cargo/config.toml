@@ -5,8 +5,12 @@ rustflags = ["-C", "target-feature=+crt-static", "-C", "link-args=/NODEFAULTLIB:
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-Ctarget-feature=+crt-static"]
 [target.'cfg(target_os="macos")']
+# libaom.a from Homebrew references libvmaf, but scrap's linux-pkg-config path is gated on
+# target_os="linux", so macOS never picks up the -lvmaf that `pkg-config --libs aom` supplies.
 rustflags = [
     "-C", "link-args=-sectcreate __CGPreLoginApp __cgpreloginapp /dev/null",
+    "-L", "/opt/homebrew/opt/libvmaf/lib",
+    "-l", "vmaf",
 ]
 #[target.'cfg(target_os="linux")']
 # glibc-static required, this may fix https://github.com/rustdesk/rustdesk/issues/9103, but I do not want this big change
