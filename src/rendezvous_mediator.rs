@@ -127,9 +127,10 @@ impl RendezvousMediator {
         }
         check_zombie();
         let server = new_server();
-        if config::option2bool("stop-service", &Config::get_option("stop-service")) {
-            crate::test_rendezvous_server();
-        }
+        // fgtw fork: `stop-service` no longer gates anything. A launched server always
+        // registers and always accepts connections — see the mediator loop below. This
+        // probe only existed to poll the rendezvous server while deliberately unregistered,
+        // which is a state this fork no longer has.
         let server_cloned = server.clone();
         tokio::spawn(async move {
             direct_server(server_cloned).await;
@@ -154,9 +155,11 @@ impl RendezvousMediator {
             let timeout = Arc::new(RwLock::new(CONNECT_TIMEOUT));
             let conn_start_time = Instant::now();
             *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
-            if !config::option2bool("stop-service", &Config::get_option("stop-service"))
-                && !crate::platform::installing_service()
-            {
+            // fgtw fork: the `stop-service` gate is gone. Upstream let a running server sit
+            // unregistered — process up, tray up, NAT probed, silently unreachable, and this
+            // branch logged NOTHING when it declined. A launched server registers, period.
+            // `installing_service` stays: it's a transient in-process flag during install.
+            if !crate::platform::installing_service() {
                 let mut futs = Vec::new();
                 let servers = Config::get_rendezvous_servers();
                 SHOULD_EXIT.store(false, Ordering::SeqCst);
@@ -182,6 +185,12 @@ impl RendezvousMediator {
                 }
                 join_all(futs).await;
             } else {
+                // Never decline silently: an unregistered server looks identical to a healthy
+                // one from the outside, and peers only see "target device is offline".
+                log::warn!(
+                    "NOT registering with any rendezvous server (service install in progress) \
+                     — this machine is unreachable until that finishes"
+                );
                 server.write().unwrap().close_connections();
             }
             Config::reset_online();
@@ -851,10 +860,12 @@ async fn direct_server(server: ServerPtr) {
     let mut listener = None;
     let mut port = 0;
     loop {
+        // fgtw fork: direct-server follows its own option only; `stop-service` no longer
+        // silently disables it.
         let disabled = !option2bool(
             OPTION_DIRECT_SERVER,
             &Config::get_option(OPTION_DIRECT_SERVER),
-        ) || option2bool("stop-service", &Config::get_option("stop-service"));
+        );
         if !disabled && listener.is_none() {
             port = get_direct_port();
             match hbb_common::tcp::listen_any(port as _).await {

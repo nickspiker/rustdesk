@@ -791,7 +791,9 @@ fn force_stop_server() {
 }
 
 pub fn start_os_service() {
-    check_if_stop_service();
+    // fgtw fork: upstream called check_if_stop_service() here, which `systemctl disable` +
+    // `stop`s the unit whenever a stale `stop-service = 'Y'` is lying around — so the service
+    // tore itself down on the very launch meant to start it. A launched service stays up.
     stop_rustdesk_servers();
     stop_subprocess();
     start_uinput_service();
@@ -2210,15 +2212,6 @@ pub fn install_service() -> bool {
         Config::set_option("stop-service".into(), "Y".into());
     }
     true
-}
-
-fn check_if_stop_service() {
-    if Config::get_option("stop-service".into()) == "Y" {
-        let app_name = crate::get_app_name().to_lowercase();
-        allow_err!(run_cmds(&format!(
-            "systemctl disable {app_name}; systemctl stop {app_name}"
-        )));
-    }
 }
 
 pub fn check_autostart_config() -> ResultType<()> {
