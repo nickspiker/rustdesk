@@ -299,22 +299,24 @@ fn current_fleet(state: &EnrollState) -> Result<Vec<[u8; 32]>, String> {
 /// Settings key under which a device publishes its RustDesk ID in its own device map.
 const SETTING_RUSTDESK_ID: &str = "rustdesk.id";
 
-/// Fleet-state AEAD, wire-compatible with photon's `kete` (`random 12-byte nonce ‖
-/// ChaCha20-Poly1305 ct`) so rustdesk and photon devices share one fleet-state blob.
+/// Fleet-state AEAD, wire-compatible with photon's `kete`: `random 24-byte nonce ‖
+/// XChaCha20-Poly1305 ct` since the 2026-08-18 stack-wide migration, so rustdesk and photon
+/// devices share one fleet-state blob. `open` read-boths the legacy 12-byte ChaCha20 form,
+/// mirroring `fgtw::scoped_blob::open_content`, so pre-migration blobs still open.
 struct RdSealer;
 
 impl fgtw::client::FleetSealer for RdSealer {
     fn seal(&self, plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
         use chacha20poly1305::aead::{Aead, KeyInit};
-        use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+        use chacha20poly1305::{XChaCha20Poly1305, XNonce};
         use hbb_common::rand::RngCore;
-        let cipher = ChaCha20Poly1305::new(key.into());
-        let mut nonce_bytes = [0u8; 12];
+        let cipher = XChaCha20Poly1305::new(key.into());
+        let mut nonce_bytes = [0u8; 24];
         hbb_common::rand::thread_rng().fill_bytes(&mut nonce_bytes);
         let ct = cipher
-            .encrypt(&Nonce::from(nonce_bytes), plaintext)
+            .encrypt(&XNonce::from(nonce_bytes), plaintext)
             .map_err(|e| format!("fgtw seal: {e}"))?;
-        let mut out = Vec::with_capacity(12 + ct.len());
+        let mut out = Vec::with_capacity(24 + ct.len());
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ct);
         Ok(out)
@@ -322,7 +324,15 @@ impl fgtw::client::FleetSealer for RdSealer {
 
     fn open(&self, sealed: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
         use chacha20poly1305::aead::{Aead, KeyInit};
-        use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+        use chacha20poly1305::{ChaCha20Poly1305, Nonce, XChaCha20Poly1305, XNonce};
+        // Read-both: current XChaCha20 ([nonce:24][ct]), then legacy ChaCha20 ([nonce:12][ct]).
+        if sealed.len() >= 24 + 16 {
+            if let Ok(n) = XNonce::try_from(&sealed[..24]) {
+                if let Ok(pt) = XChaCha20Poly1305::new(key.into()).decrypt(&n, &sealed[24..]) {
+                    return Ok(pt);
+                }
+            }
+        }
         if sealed.len() < 12 + 16 {
             return Err(format!("fgtw open: blob too short ({} bytes)", sealed.len()));
         }
