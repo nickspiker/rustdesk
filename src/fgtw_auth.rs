@@ -339,7 +339,7 @@ impl fgtw::client::FleetSealer for RdSealer {
 /// hasn't been rotated in yet gets `None` — that's the two-phase gate, not an error.
 fn fleet_key(t: &RdTransport, state: &EnrollState) -> Result<[u8; 32], String> {
     let kp = device_keypair().map_err(|e| e.to_string())?;
-    fgtw::client::recover_or_establish_fleet_key(t, &state.handle_proof, &kp)?
+    fgtw::client::recover_or_establish_fleet_key(t, &state.handle_proof, &kp, &state.identity_seed)?
         .ok_or_else(|| "no fleet-key wrap for this device yet (awaiting sponsor rotation)".into())
 }
 
@@ -364,7 +364,8 @@ fn publish_own_id_inner(state: &EnrollState, device_key: &Keypair) -> Result<(),
     let now = vsf::eagle_time_oscillations();
     let entry = DeviceSetting {
         key: SETTING_RUSTDESK_ID.to_owned(),
-        value: Config::get_id().into_bytes(),
+        // fstate v7: setting values are typed VSF now. The RustDesk id is text → VsfType::x.
+        value: VsfType::x(Config::get_id()),
         updated: now,
         linked: false, // per-device by nature; never follows a fleet-global value
     };
@@ -445,7 +446,11 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
                 d.entries
                     .into_iter()
                     .find(|e| e.key == SETTING_RUSTDESK_ID)
-                    .and_then(|e| String::from_utf8(e.value).ok())
+                    .and_then(|e| match e.value {
+                        // Written as VsfType::x (text) by publish_own_id_inner above.
+                        VsfType::x(s) => Some(s),
+                        _ => None,
+                    })
                     .map(|id| (d.device_pubkey, id))
             })
             .collect())
@@ -597,7 +602,7 @@ pub fn adopt_session() -> Result<String, String> {
     let device_key = device_keypair().map_err(|e| e.to_string())?;
     let t = RdTransport::enroll();
     // The fleet-key gate: only current members hold a wrap in the fan-out.
-    fgtw::client::recover_fleet_key(&t, &s.handle_proof, &device_key)?
+    fgtw::client::recover_fleet_key(&t, &s.handle_proof, &device_key, &s.identity_seed)?
         .ok_or("this device has no fleet-key wrap yet (not a member, or awaiting sponsor rotation)")?;
     let (members, tip) = fgtw::client::current_members_with_ts(&t, &s.handle_proof)?;
     let state = EnrollState {
@@ -643,7 +648,8 @@ pub fn try_adopt_session() {
 /// for an already-enrolled device (e.g. Photon) to approve. Persists the verified member set
 /// on success. Blocking + prints progress — it's a CLI command.
 pub fn enroll(handle_input: &str) -> Result<String, String> {
-    let handle = fgtw::keys::canonical_handle(handle_input);
+    // Handles are byte-precise now (fgtw deleted the fold/canonical step) — use the input as-is.
+    let handle = handle_input.to_string();
     println!("Deriving identity for \"{handle}\" (memory-hard, ~1s)...");
     let identity_seed = *ihi::handle_to_hash(&handle).as_bytes();
     let handle_proof = *ihi::handle_to_proof(&handle).as_bytes();

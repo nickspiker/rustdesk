@@ -10329,6 +10329,7 @@ dependencies = [
  "num-traits 0.2.19",
  "rand 0.8.5",
  "spin",
+ "unicode-normalization",
  "x25519-dalek",
 ]
 
