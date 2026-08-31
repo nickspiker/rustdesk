@@ -460,7 +460,21 @@ impl FluorApp for FluorViewer {
                         _ => {}
                     }
                 }
-                self.send_key(ctx, &event.logical_key, down, event.text.as_deref());
+                // PHYSICAL PASSTHROUGH (KeyboardMode::Map): send the raw scancode, not the
+                // character. The host injects the same physical position and lets ITS layout
+                // interpret it — an identity when both ends share a layout (Dvorak↔Dvorak),
+                // correct regardless of either side's language, and immune to keymap drift. Sent
+                // on both edges (down AND up) so the host tracks real press/release + modifiers.
+                if event.physical_key != 0 {
+                    let mut e = KeyEvent::new();
+                    e.mode = KeyboardMode::Map.into();
+                    e.down = down;
+                    e.set_chr(event.physical_key as u32);
+                    self.session.send_key_event(&e);
+                } else {
+                    // Fallback for keys with no mapped position (rare): character path.
+                    self.send_key(ctx, &event.logical_key, down, event.text.as_deref());
+                }
             }
             _ => {}
         }

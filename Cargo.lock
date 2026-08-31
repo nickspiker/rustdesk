@@ -3040,7 +3040,7 @@ dependencies = [
 
 [[package]]
 name = "fgtw"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "chacha20poly1305 0.11.0",
@@ -3048,7 +3048,7 @@ dependencies = [
  "num-bigint",
  "rand 0.8.5",
  "voca",
- "vsf 0.9.2",
+ "vsf 0.9.3",
  "x25519-dalek",
 ]
 
@@ -3138,7 +3138,7 @@ dependencies = [
 
 [[package]]
 name = "fluor"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "block2 0.6.2",
  "cosmic-text",
@@ -3157,7 +3157,7 @@ dependencies = [
  "spirix",
  "swash",
  "unicode-script",
- "vsf 0.9.2",
+ "vsf 0.9.3",
  "wgpu",
  "wide",
  "windows 0.58.0",
@@ -7999,7 +7999,7 @@ dependencies = [
  "url",
  "uuid",
  "virtual_display",
- "vsf 0.9.2",
+ "vsf 0.9.3",
  "wallpaper",
  "winapi 0.3.9",
  "windows 0.61.1",
@@ -8826,7 +8826,7 @@ dependencies = [
 
 [[package]]
 name = "spirix"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "i256",
  "num-complex",
@@ -9478,7 +9478,7 @@ checksum = "c7c4ceeeca15c8384bbc3e011dbd8fccb7f068a440b752b7d9b32ceb0ca0e2e8"
 
 [[package]]
 name = "tohu"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -9486,7 +9486,7 @@ dependencies = [
  "ihi",
  "jni",
  "rand 0.8.5",
- "vsf 0.6.42",
+ "vsf 0.9.3",
 ]
 
 [[package]]
@@ -10313,7 +10313,7 @@ dependencies = [
 
 [[package]]
 name = "vsf"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "aes-gcm",
  "bitvec",
