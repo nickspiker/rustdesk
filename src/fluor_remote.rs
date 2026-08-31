@@ -56,6 +56,9 @@ struct Shared {
     display_origin: Mutex<(i32, i32)>,
     /// Which host display index we're viewing — the target of resolution-follow.
     display_idx: Mutex<i32>,
+    /// The peer's OS ("Linux"/"Windows"/"Mac"), from PeerInfo. Map-mode keys carry a
+    /// peer-platform keycode, converted from our canonical Windows scancode.
+    peer_platform: Mutex<String>,
 }
 
 impl Shared {
@@ -133,6 +136,7 @@ impl InvokeUiSession for FluorHandler {
     }
     fn set_peer_info(&self, pi: &hbb_common::message_proto::PeerInfo) {
         *self.shared.display_idx.lock().unwrap() = pi.current_display;
+        *self.shared.peer_platform.lock().unwrap() = pi.platform.clone();
     }
     fn set_displays(&self, _displays: &Vec<hbb_common::message_proto::DisplayInfo>) {}
     fn set_platform_additions(&self, _data: &str) {}
@@ -460,19 +464,21 @@ impl FluorApp for FluorViewer {
                         _ => {}
                     }
                 }
-                // PHYSICAL PASSTHROUGH (KeyboardMode::Map): send the raw scancode, not the
-                // character. The host injects the same physical position and lets ITS layout
-                // interpret it — an identity when both ends share a layout (Dvorak↔Dvorak),
-                // correct regardless of either side's language, and immune to keymap drift. Sent
-                // on both edges (down AND up) so the host tracks real press/release + modifiers.
-                if event.physical_key != 0 {
+                // PHYSICAL PASSTHROUGH (KeyboardMode::Map): send the physical position, not the
+                // character. The host injects the same physical key and lets ITS layout interpret
+                // it — an identity when both ends share a layout (Dvorak↔Dvorak), correct
+                // regardless of either side's language, immune to keymap drift. Our physical_key
+                // is a canonical Windows scancode; the host wants the PEER platform's keycode
+                // (Linux Xorg on leviathan), so convert first — exactly as keyboard.rs does. Sent
+                // on both edges so the host tracks real press/release + modifiers.
+                if let Some(code) = self.map_scancode(event.physical_key) {
                     let mut e = KeyEvent::new();
                     e.mode = KeyboardMode::Map.into();
                     e.down = down;
-                    e.set_chr(event.physical_key as u32);
+                    e.set_chr(code);
                     self.session.send_key_event(&e);
                 } else {
-                    // Fallback for keys with no mapped position (rare): character path.
+                    // No physical position or no conversion: character path.
                     self.send_key(ctx, &event.logical_key, down, event.text.as_deref());
                 }
             }
@@ -569,6 +575,51 @@ impl FluorApp for FluorViewer {
 }
 
 impl FluorViewer {
+    /// Convert our canonical Windows scancode (fluor's `physical_key`) to the PEER platform's
+    /// Map-mode keycode. `None` → caller falls back to the character path. rdev's cross-platform
+    /// converters are private/build-gated, so we do it directly: for a Windows peer the host
+    /// wants the scancode as-is; for a Linux peer it wants an Xorg keycode, and since Linux evdev
+    /// codes equal Set-1 scancodes for the main block, that's just `scancode + 8` (extended keys
+    /// carry their own evdev code). Verified on leviathan: win K=0x25(37) → Xorg 45 = Dvorak 't'.
+    fn map_scancode(&self, win_scancode: u16) -> Option<u32> {
+        if win_scancode == 0 {
+            return None;
+        }
+        let plat = self.shared.peer_platform.lock().unwrap().to_lowercase();
+        if plat.contains("windows") {
+            return Some(win_scancode as u32); // host injects RawKey::ScanCode directly
+        }
+        if plat.contains("mac") {
+            return None; // win→macOS keycode not wired yet; use the character path
+        }
+        // Linux (leviathan) and default: win scancode → Xorg keycode (evdev + 8).
+        let evdev: u32 = if win_scancode & 0xFF00 == 0xE000 {
+            match win_scancode {
+                0xE01C => 96,  // Numpad Enter
+                0xE01D => 97,  // Right Ctrl
+                0xE035 => 98,  // Numpad /
+                0xE038 => 100, // Right Alt
+                0xE047 => 102, // Home
+                0xE048 => 103, // Up
+                0xE049 => 104, // PageUp
+                0xE04B => 105, // Left
+                0xE04D => 106, // Right
+                0xE04F => 107, // End
+                0xE050 => 108, // Down
+                0xE051 => 109, // PageDown
+                0xE052 => 110, // Insert
+                0xE053 => 111, // Delete
+                0xE05B => 125, // Left Super
+                0xE05C => 126, // Right Super
+                0xE05D => 127, // Menu
+                _ => return None,
+            }
+        } else {
+            win_scancode as u32 // main block: evdev code == Set-1 scancode
+        };
+        Some(evdev + 8)
+    }
+
     fn send_key(&self, _ctx: &Context, key: &Key, down: bool, text: Option<&str>) {
         // RustDesk's `chr` field is a VIRTUAL KEYCODE, not a Unicode codepoint — stuffing a
         // char into it scrambles every key (what "keymap completely fucked" was). Two correct
