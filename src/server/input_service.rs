@@ -1483,6 +1483,10 @@ fn map_keyboard_mode(evt: &KeyEvent) {
         return;
     }
 
+    // TEMP DIAG: log the exact Xorg keycode arriving so we can compare to the physical key the
+    // user pressed (host is Dvorak; keycode 45='t', 44='h', 40='e'). Remove once keyboard fixed.
+    #[cfg(target_os = "linux")]
+    log::info!("fgtw-diag: map keycode={} down={}", evt.chr(), evt.down);
     sim_rdev_rawkey_position(evt.chr() as _, evt.down);
 }
 

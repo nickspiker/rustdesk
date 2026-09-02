@@ -3587,12 +3587,14 @@ impl Connection {
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     Some(misc::Union::ChangeResolution(r)) => {
+                        log::info!("fgtw-diag: Misc ChangeResolution arm, view_camera={}", self.view_camera);
                         if !self.view_camera {
                             self.change_resolution(None, &r);
                         }
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     Some(misc::Union::ChangeDisplayResolution(dr)) => {
+                        log::info!("fgtw-diag: Misc ChangeDisplayResolution arm, view_camera={}", self.view_camera);
                         if !self.view_camera {
                             self.change_resolution(Some(dr.display as _), &dr.resolution);
                         }
@@ -4341,6 +4343,11 @@ impl Connection {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn change_resolution(&mut self, d: Option<usize>, r: &Resolution) {
+        // TEMP DIAG: confirm the follow request arrives + whether keyboard-perm gates it.
+        log::info!(
+            "fgtw-diag: change_resolution recv {}x{} keyboard_perm={}",
+            r.width, r.height, self.keyboard
+        );
         if self.keyboard {
             if let Ok(displays) = display_service::try_get_displays() {
                 let display_idx = d.unwrap_or(self.display_idx);

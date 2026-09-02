@@ -321,6 +321,10 @@ impl FluorViewer {
             let due = self.follow_at.map_or(true, |t| Instant::now() >= t);
             if due {
                 let idx = *self.shared.display_idx.lock().unwrap();
+                log::info!(
+                    "fgtw-diag: follow SEND change_resolution display={} {}x{}",
+                    idx, target.0, target.1
+                );
                 self.session.change_resolution(idx, target.0, target.1);
                 self.last_follow = target;
                 self.follow_at = None;
