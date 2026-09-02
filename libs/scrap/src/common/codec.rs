@@ -817,31 +817,32 @@ impl Decoder {
     }
 
     fn preference(id: Option<&str>) -> (PreferCodec, Chroma) {
+        // fgtw fork: the passless fleet viewer defaults to AV1 + 4:4:4. AV1's screen-content mode
+        // (palette + IntraBC, CDEF off — tuned in aom.rs) plus full chroma keeps flat UI and
+        // text sharp; stock rustdesk's Auto/I420 default DCT-rings and chroma-bleeds every glyph.
+        // A saved per-peer override ("codec-preference"/"i444") still takes precedence below.
+        #[cfg(feature = "fgtw")]
+        let (def_codec, def_chroma) = (PreferCodec::AV1, Chroma::I444);
+        #[cfg(not(feature = "fgtw"))]
+        let (def_codec, def_chroma) = (PreferCodec::Auto, Chroma::I420);
+
         let id = id.unwrap_or_default();
         if id.is_empty() {
-            return (PreferCodec::Auto, Chroma::I420);
+            return (def_codec, def_chroma);
         }
         let options = PeerConfig::load(id).options;
-        let codec = options
-            .get("codec-preference")
-            .map_or("".to_owned(), |c| c.to_owned());
-        let codec = if codec == "vp8" {
-            PreferCodec::VP8
-        } else if codec == "vp9" {
-            PreferCodec::VP9
-        } else if codec == "av1" {
-            PreferCodec::AV1
-        } else if codec == "h264" {
-            PreferCodec::H264
-        } else if codec == "h265" {
-            PreferCodec::H265
-        } else {
-            PreferCodec::Auto
+        let codec = match options.get("codec-preference").map(|c| c.as_str()) {
+            Some("vp8") => PreferCodec::VP8,
+            Some("vp9") => PreferCodec::VP9,
+            Some("av1") => PreferCodec::AV1,
+            Some("h264") => PreferCodec::H264,
+            Some("h265") => PreferCodec::H265,
+            _ => def_codec,
         };
-        let chroma = if options.get("i444") == Some(&"Y".to_string()) {
-            Chroma::I444
-        } else {
-            Chroma::I420
+        let chroma = match options.get("i444").map(|c| c.as_str()) {
+            Some("Y") => Chroma::I444,
+            Some(_) => Chroma::I420, // explicit non-Y disable
+            None => def_chroma,
         };
         (codec, chroma)
     }

@@ -146,7 +146,11 @@ mod webrtc {
         }
 
         call_ctl!(ctx, AOME_SET_CPUUSED, get_cpu_speed(cfg.g_w, cfg.g_h));
-        call_ctl!(ctx, AV1E_SET_ENABLE_CDEF, 1);
+        // CDEF is AV1's in-loop directional *enhancement/deringing* filter — great for natural
+        // video, but on a desktop it rounds off sharp 1px text edges (the "post-process filter
+        // haze" over glyphs). Screen content has almost no ringing for it to fix, so it mostly
+        // just smears. Off for crisp text. (fgtw fork: we always run TUNE_CONTENT=SCREEN below.)
+        call_ctl!(ctx, AV1E_SET_ENABLE_CDEF, 0);
         call_ctl!(ctx, AV1E_SET_ENABLE_TPL_MODEL, 0);
         call_ctl!(ctx, AV1E_SET_DELTAQ_MODE, 0);
         call_ctl!(ctx, AV1E_SET_ENABLE_ORDER_HINT, 0);
@@ -188,7 +192,11 @@ mod webrtc {
         call_ctl!(ctx, AV1E_SET_ENABLE_INTERINTRA_COMP, 0);
         call_ctl!(ctx, AV1E_SET_ENABLE_INTERINTRA_WEDGE, 0);
         call_ctl!(ctx, AV1E_SET_ENABLE_INTRA_EDGE_FILTER, 0);
-        call_ctl!(ctx, AV1E_SET_ENABLE_INTRABC, 0);
+        // Intra Block Copy: code a block as a COPY of another block already decoded in THIS
+        // frame — i.e. the second identical glyph, or a repeated toolbar/icon, costs a vector
+        // instead of a fresh (lossy) DCT description. The core screen-content tool for text; was
+        // off purely for encode speed. On for sharp, cheap glyphs.
+        call_ctl!(ctx, AV1E_SET_ENABLE_INTRABC, 1);
         call_ctl!(ctx, AV1E_SET_ENABLE_MASKED_COMP, 0);
         call_ctl!(ctx, AV1E_SET_ENABLE_PAETH_INTRA, 0);
         call_ctl!(ctx, AV1E_SET_ENABLE_QM, 0);
