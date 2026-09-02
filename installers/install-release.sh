@@ -102,16 +102,32 @@ fi
 
 echo "Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
-# cp (not mv): mv from /tmp drags the SELinux user_tmp_t label along on Fedora-family
-# systems, and dlopen of a tmp-labeled library is denied — the app then can't find its
-# UI runtime. A fresh copy inherits the destination context.
-cp "$TMP_BINARY" "$INSTALL_DIR/$BINARY_NAME"
-# The sciter loader searches the executable's own directory.
-cp "$TMP_SCITER" "$INSTALL_DIR/$SCITER_NAME"
-rm -f "$TMP_BINARY" "$TMP_SCITER"
-command -v restorecon >/dev/null 2>&1 && restorecon "$INSTALL_DIR/$BINARY_NAME" "$INSTALL_DIR/$SCITER_NAME" 2>/dev/null || true
 if [ "$OS" = "Darwin" ]; then
-    xattr -c "$INSTALL_DIR/$BINARY_NAME" "$INSTALL_DIR/$SCITER_NAME" 2>/dev/null || true
+    # One real copy, and it lives in the bundle (below) — macOS launches the .app, and a real
+    # file there keeps bundle identity intact for TCC. $INSTALL_DIR gets symlinks so the
+    # terminal name and the Finder name can never drift onto different builds; a stale
+    # duplicate here is what silently pins the app to an old fleet-chain format.
+    MACOS_DIR="$APP_DIR/$APP_NAME/Contents/MacOS"
+    mkdir -p "$MACOS_DIR"
+    cp "$TMP_BINARY" "$MACOS_DIR/$BINARY_NAME"
+    cp "$TMP_SCITER" "$MACOS_DIR/$SCITER_NAME"
+    chmod +x "$MACOS_DIR/$BINARY_NAME"
+    # Symlink the dylib too, not just the binary: rust-sciter looks beside the executable,
+    # and whether it uses the symlink's dir or the realpath'd one differs by launch path.
+    # Linking both means either answer finds the runtime.
+    ln -sfn "$MACOS_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+    ln -sfn "$MACOS_DIR/$SCITER_NAME" "$INSTALL_DIR/$SCITER_NAME"
+    rm -f "$TMP_BINARY" "$TMP_SCITER"
+    xattr -c "$MACOS_DIR/$BINARY_NAME" "$MACOS_DIR/$SCITER_NAME" 2>/dev/null || true
+else
+    # cp (not mv): mv from /tmp drags the SELinux user_tmp_t label along on Fedora-family
+    # systems, and dlopen of a tmp-labeled library is denied — the app then can't find its
+    # UI runtime. A fresh copy inherits the destination context.
+    cp "$TMP_BINARY" "$INSTALL_DIR/$BINARY_NAME"
+    # The sciter loader searches the executable's own directory.
+    cp "$TMP_SCITER" "$INSTALL_DIR/$SCITER_NAME"
+    rm -f "$TMP_BINARY" "$TMP_SCITER"
+    command -v restorecon >/dev/null 2>&1 && restorecon "$INSTALL_DIR/$BINARY_NAME" "$INSTALL_DIR/$SCITER_NAME" 2>/dev/null || true
 fi
 echo "✓ Installed"
 echo ""
@@ -119,12 +135,12 @@ echo ""
 # macOS .app bundle for Finder/Dock/Spotlight
 if [ "$OS" = "Darwin" ]; then
     echo "Creating macOS app bundle..."
-    mkdir -p "$APP_DIR/$APP_NAME/Contents/MacOS"
     mkdir -p "$APP_DIR/$APP_NAME/Contents/Resources"
 
-    cp "$INSTALL_DIR/$BINARY_NAME" "$APP_DIR/$APP_NAME/Contents/MacOS/$BINARY_NAME"
-    cp "$INSTALL_DIR/$SCITER_NAME" "$APP_DIR/$APP_NAME/Contents/MacOS/$SCITER_NAME"
-    chmod +x "$APP_DIR/$APP_NAME/Contents/MacOS/$BINARY_NAME"
+    # Any binary from a previous install layout, left beside the real one, is a loaded gun:
+    # it is what a stray copy or restore reinstates. Clear the strays, keep exactly two files.
+    find "$APP_DIR/$APP_NAME/Contents/MacOS" -type f \
+        ! -name "$BINARY_NAME" ! -name "$SCITER_NAME" -delete 2>/dev/null || true
 
     ICON_TMP="/tmp/rustdesk-icon-$$"
     mkdir -p "$ICON_TMP.iconset"

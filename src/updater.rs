@@ -1,7 +1,14 @@
-use crate::{common::do_check_software_update, hbbs_http::create_http_client_with_url_strict};
-use hbb_common::{bail, config, log, ResultType};
+use crate::common::do_check_software_update;
+// Only the Windows download path builds an HTTP client; see `check_update`.
+#[cfg(target_os = "windows")]
+use crate::hbbs_http::create_http_client_with_url_strict;
+use hbb_common::{config, log, ResultType};
+// `bail!` and `Write` are only reached from the Windows-only download/apply path.
+#[cfg(target_os = "windows")]
+use hbb_common::bail;
+#[cfg(target_os = "windows")]
+use std::io::Write;
 use std::{
-    io::Write,
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -134,7 +141,14 @@ fn check_update(manually: bool) -> ResultType<()> {
     } else {
         let download_url = update_url.replace("tag", "download");
         let version = download_url.split('/').last().unwrap_or_default();
+        log::debug!("New version available: {}", &version);
+        // Applying an update is Windows-only — `update_new_version` below is the only code
+        // that replaces the installed build. Everywhere else the download is an installer we
+        // can never run, written to disk and then abandoned, so stop here. The version check
+        // above already ran and set SOFTWARE_UPDATE_URL, so the UI still reports the update;
+        // only the pointless fetch is skipped.
         #[cfg(target_os = "windows")]
+        {
         let download_url = if cfg!(feature = "flutter") {
             let Some(arch) = crate::platform::windows::release_arch_suffix() else {
                 bail!(
@@ -152,7 +166,6 @@ fn check_update(manually: bool) -> ResultType<()> {
         } else {
             format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
         };
-        log::debug!("New version available: {}", &version);
         let client = create_http_client_with_url_strict(&download_url)?;
         let Some(file_path) = get_download_file_from_url(&download_url) else {
             bail!("Failed to get the file path from the URL: {}", download_url);
@@ -196,8 +209,8 @@ fn check_update(manually: bool) -> ResultType<()> {
         // No need to care about the downloaded file here, because it's rare case that the `conns` are empty
         // before the download, but not empty after the download.
         if has_no_active_conns() {
-            #[cfg(target_os = "windows")]
             update_new_version(update_msi, &version, &file_path);
+        }
         }
     }
     Ok(())

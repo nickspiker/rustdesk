@@ -30,6 +30,16 @@ fi
 [ -f "$BUILT" ] || { echo "✗ no build at $BUILT"; exit 1; }
 BUILT_HASH="$(sha "$BUILT")"
 
+# Poll for an empty process table, up to <secs>. Returns 0 the moment it is clear.
+wait_gone() {
+    local n=$(( $1 * 2 ))
+    for _ in $(seq 1 "$n"); do
+        pgrep -x rustdesk >/dev/null 2>&1 || return 0
+        sleep 0.5
+    done
+    ! pgrep -x rustdesk >/dev/null 2>&1
+}
+
 echo "▶ stopping any running / supervised RustDesk…"
 if [ "$OS" = "Darwin" ]; then
     osascript -e 'tell application "RustDesk" to quit' 2>/dev/null || true
@@ -38,10 +48,22 @@ if [ "$OS" = "Darwin" ]; then
 else
     systemctl --user stop rustdesk-fgtw.service 2>/dev/null || true
 fi
-pkill -9 -x rustdesk 2>/dev/null || true
-pkill -9 -f "rustdesk --" 2>/dev/null || true
-# Wait up to ~6s for the process table to clear before we overwrite the file.
-for _ in $(seq 1 12); do pgrep -x rustdesk >/dev/null 2>&1 || break; sleep 0.5; done
+# Let the graceful stop above actually finish before escalating. RustDesk flushes
+# RustDesk.toml and fgtw_auth.vsf (enroll state, identity seed, cached member set) on exit;
+# killing it mid-write is how that state gets truncated, and a half-written fgtw_auth.vsf
+# looks exactly like the fleet failures this script exists to stop chasing. Escalate only
+# if it ignores us, and say so when we do.
+if ! wait_gone 6; then
+    echo "  …still up after the graceful stop; sending SIGTERM"
+    pkill -x rustdesk 2>/dev/null || true
+    pkill -f "rustdesk --" 2>/dev/null || true
+    if ! wait_gone 5; then
+        echo "  …still up; sending SIGKILL — on-disk state may not have flushed"
+        pkill -9 -x rustdesk 2>/dev/null || true
+        pkill -9 -f "rustdesk --" 2>/dev/null || true
+        wait_gone 3 || true
+    fi
+fi
 if pgrep -x rustdesk >/dev/null 2>&1; then
     echo "✗ rustdesk keeps respawning — a supervisor is still up. Investigate, don't install stale:"
     pgrep -alx rustdesk || true
@@ -65,6 +87,16 @@ fi
 # The run location must now be byte-identical to what we built — no silent no-op copy.
 [ "$(sha "$DEST")" = "$BUILT_HASH" ] || { echo "✗ installed hash != build hash — copy didn't take"; exit 1; }
 echo "✓ run location matches build: $BUILT_HASH"
+
+# The UI runtime is dlopen'd, not linked: a byte-perfect binary with no Sciter beside it
+# starts and then dies at the first window. Warn rather than fail — src/ui.rs also searches
+# system prefixes on Linux, so absence here is suspicious, not conclusive.
+if [ "$OS" = "Darwin" ]; then SCITER="libsciter.dylib"; else SCITER="libsciter-gtk.so"; fi
+if [ ! -e "$(dirname "$DEST")/$SCITER" ] && [ ! -e "/usr/share/rustdesk/$SCITER" ]; then
+    echo "⚠ $SCITER not found next to $DEST (nor in /usr/share/rustdesk)."
+    echo "  The binary is current, but the UI may not start. Run installers/install-release.sh"
+    echo "  once to place the Sciter runtime — dev-install.sh only swaps the binary."
+fi
 
 echo "▶ relaunching…"
 if [ "$OS" = "Darwin" ]; then
