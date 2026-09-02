@@ -617,10 +617,13 @@ pub async fn start_server(is_server: bool, no_server: bool) {
         #[cfg(feature = "fgtw")]
         crate::fgtw_auth::try_adopt_session();
         // Undo a stranded resolution: if a prior session's resolution-follow left the
-        // display parked on a minted mode (crash/hard-exit), restore native so the desktop
-        // isn't stuck "massive".
+        // display parked on a minted mode or a scale transform (crash/hard-exit), restore
+        // native so the desktop isn't stuck scaled/"massive".
         #[cfg(all(feature = "fgtw", target_os = "linux"))]
-        crate::platform::linux::reset_leftover_minted_modes();
+        {
+            crate::platform::linux::reset_leftover_minted_modes();
+            crate::platform::linux::reset_leftover_transforms();
+        }
         #[cfg(target_os = "linux")]
         {
             log::info!("DISPLAY={:?}", std::env::var("DISPLAY"));

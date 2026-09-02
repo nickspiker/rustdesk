@@ -1587,47 +1587,108 @@ pub fn current_resolution(name: &str) -> ResultType<Resolution> {
 }
 
 pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> ResultType<()> {
-    // The userspace "virtual display driver": when the requested mode doesn't exist,
-    // mint a CVT reduced-blanking modeline and add it on the fly, so the display can
-    // follow ANY window size a controlling peer asks for (VirtualBox-style follow).
-    let mode = format!("{}x{}", width, height);
-    let listed = Command::new("xrandr")
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|l| l.trim_start().split_whitespace().next() == Some(mode.as_str()))
-        })
-        .unwrap_or(false);
-    let mode_name = if listed { mode } else { mint_mode(name, width, height)? };
+    // VirtualBox-style follow WITHOUT touching the monitor's mode: `--scale-from` resizes the
+    // logical desktop (framebuffer) to exactly W×H and the panel up/down-samples it, staying on
+    // its native mode the whole time. Capture reads the framebuffer, so the peer gets exact
+    // pixels; no EDID/out-of-range risk, no mode change for the DE to react to, and restore is
+    // just scale-from at the native size (identity). `--fb` pins the framebuffer so the capture
+    // size can't drift from xrandr's transform rounding.
+    let identity = active_mode_size(name) == Some((width, height));
+    if !identity {
+        pin_ui_scale();
+    }
+    let size = format!("{}x{}", width, height);
     let out = Command::new("xrandr")
-        .args(vec!["--output", name, "--mode", &mode_name])
+        .args(["--output", name, "--scale-from", &size, "--fb", &size])
         .output()?;
     if !out.status.success() {
         bail!(
-            "xrandr --mode {mode_name} failed: {}",
+            "xrandr --scale-from {size} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    // Retire the previously minted mode (can't remove while it was active).
-    let mut last = LAST_MINTED_MODE.lock().unwrap();
-    if let Some(old) = last.take() {
-        if old != mode_name {
-            Command::new("xrandr").args(vec!["--delmode", name, &old]).output().ok();
-            Command::new("xrandr").args(vec!["--rmmode", &old]).output().ok();
-        }
-    }
-    if !listed {
-        *last = Some(mode_name);
+    if identity {
+        unpin_ui_scale();
     }
     Ok(())
 }
 
-static LAST_MINTED_MODE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// The `*`-marked (active) mode size of `output` from plain `xrandr` — the size the panel is
+/// actually driven at, independent of any scale transform.
+fn active_mode_size(output: &str) -> Option<(usize, usize)> {
+    let out = Command::new("xrandr").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut in_output = false;
+    for line in text.lines() {
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            in_output = line.split_whitespace().next() == Some(output);
+        } else if in_output && line.contains('*') {
+            let (w, h) = line.split_whitespace().next()?.split_once('x')?;
+            return Some((w.parse().ok()?, h.parse().ok()?));
+        }
+    }
+    None
+}
+
+const SAVED_UI_SCALE_OPT: &str = "fgtw-saved-ui-scale";
+const CINNAMON_SCALE_KEY: [&str; 2] = ["org.cinnamon.desktop.interface", "scaling-factor"];
+
+/// Cinnamon auto-DPI guard. With `scaling-factor = 0` (auto), Cinnamon recomputes the UI scale
+/// from the LOGICAL resolution — so a scale-from transform makes every app's text jump. Pin the
+/// scale to its CURRENT effective value (Xft.dpi/96, which auto already resolved) for the
+/// duration of the transform; visually a no-op at pin time, and layouts stop reflowing. The
+/// user's original raw value is persisted in config so a crash can't strand a pinned scale.
+fn pin_ui_scale() {
+    if !Config::get_option(SAVED_UI_SCALE_OPT).is_empty() {
+        return; // already pinned this session
+    }
+    let get = Command::new("gsettings")
+        .arg("get").args(CINNAMON_SCALE_KEY)
+        .output();
+    let Ok(get) = get else { return }; // no gsettings/Cinnamon — nothing to guard
+    let raw = String::from_utf8_lossy(&get.stdout).trim().to_owned();
+    if raw != "uint32 0" {
+        return; // fixed scale already — transforms won't reflow anything
+    }
+    // Effective scale: Cinnamon publishes its resolved auto scale as Xft.dpi (96 per step).
+    let dpi = Command::new("xrdb").arg("-query").output().ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .find_map(|l| l.strip_prefix("Xft.dpi:").map(|v| v.trim().parse::<f64>().ok()))
+                .flatten()
+        })
+        .unwrap_or(96.0);
+    let scale = ((dpi / 96.0).round() as u32).clamp(1, 4);
+    Config::set_option(SAVED_UI_SCALE_OPT.into(), raw);
+    log::info!("fgtw: pinning Cinnamon scaling-factor to {scale} (was auto) for the transform");
+    Command::new("gsettings")
+        .arg("set").args(CINNAMON_SCALE_KEY).arg(scale.to_string())
+        .output()
+        .ok();
+}
+
+/// Undo [`pin_ui_scale`] once the display is back at its native size: restore the user's
+/// original scaling-factor (auto) and clear the persisted marker.
+fn unpin_ui_scale() {
+    let saved = Config::get_option(SAVED_UI_SCALE_OPT);
+    if saved.is_empty() {
+        return;
+    }
+    let value = saved.strip_prefix("uint32").unwrap_or(&saved).trim().to_owned();
+    log::info!("fgtw: restoring Cinnamon scaling-factor to {value}");
+    Command::new("gsettings")
+        .arg("set").args(CINNAMON_SCALE_KEY).arg(&value)
+        .output()
+        .ok();
+    Config::set_option(SAVED_UI_SCALE_OPT.into(), "".into());
+}
 
 /// Safety net: if a crash or hard exit left a display parked on a minted `*_fgtw` mode
 /// (so the desktop is stuck small/"massive"), switch each such output back to its preferred
 /// mode and remove the stray mode. Called at server start; a no-op on a clean system.
+/// OBSOLETE: mode-minting was replaced by `--scale-from` transforms — keep one release to
+/// clean machines still stranded on a `_fgtw` mode from a pre-transform build, then delete.
 pub fn reset_leftover_minted_modes() {
     let Ok(out) = Command::new("xrandr").output() else { return };
     let text = String::from_utf8_lossy(&out.stdout);
@@ -1661,60 +1722,60 @@ pub fn reset_leftover_minted_modes() {
     }
 }
 
-/// Create an xrandr mode for `width`x`height` @60Hz using CVT reduced-blanking timings
-/// (the LCD-appropriate variant: fixed 160px h-blank, minimal v-blank >= 460us) and attach
-/// it to `output`. Returns the minted mode name.
-fn mint_mode(output: &str, width: usize, height: usize) -> ResultType<String> {
-    let refresh = 60.0f64;
-    let h_total = (width + 160) as f64;
-    // Lines of v-blank: enough that v-blank time >= 460us at the target refresh.
-    let h_period_est = ((1.0e6 / refresh) - 460.0) / height as f64; // us per line
-    let mut vbi = (460.0 / h_period_est).floor() as usize + 1;
-    let v_sync = 10usize; // cvt's fallback for arbitrary aspect ratios
-    if vbi < 3 + v_sync + 6 {
-        vbi = 3 + v_sync + 6;
-    }
-    let v_total = (height + vbi) as f64;
-    let pclk_mhz = (refresh * h_total * v_total / 1.0e6 / 0.25).round() * 0.25;
-    let (hss, hse) = (width + 48, width + 48 + 32);
-    let (vss, vse) = (height + 3, height + 3 + v_sync);
-    let mode_name = format!("{}x{}_fgtw", width, height);
-    let timings = vec![
-        format!("{:.2}", pclk_mhz),
-        width.to_string(),
-        hss.to_string(),
-        hse.to_string(),
-        (h_total as usize).to_string(),
-        height.to_string(),
-        vss.to_string(),
-        vse.to_string(),
-        (v_total as usize).to_string(),
-        "+HSync".to_owned(),
-        "-VSync".to_owned(),
-    ];
-    // newmode may fail if a stale mode with this name survived a crash — remove and retry.
-    let newmode = |name: &str| -> ResultType<bool> {
-        let mut args = vec!["--newmode".to_owned(), name.to_owned()];
-        args.extend(timings.iter().cloned());
-        Ok(Command::new("xrandr").args(&args).output()?.status.success())
+/// Safety net for the transform era: if a crash or hard exit left an output's LOGICAL size
+/// (a `--scale-from` transform + shrunken/grown framebuffer) different from its active mode's
+/// size — the desktop stranded scaled — reset it to identity at the mode's own size. Called
+/// at server start; a no-op on a clean system. Compares the header geometry ("WxH+X+Y", the
+/// transformed size) against the `*`-marked active mode per output.
+pub fn reset_leftover_transforms() {
+    let Ok(out) = Command::new("xrandr").output() else { return };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut current: Option<(String, (usize, usize))> = None; // (output, logical WxH)
+    let mut stranded: Vec<(String, String)> = Vec::new(); // (output, active mode "WxH")
+    let parse_wh = |s: &str| -> Option<(usize, usize)> {
+        let (w, h) = s.split_once('x')?;
+        Some((w.parse().ok()?, h.parse().ok()?))
     };
-    if !newmode(&mode_name)? {
-        Command::new("xrandr").args(vec!["--delmode", output, &mode_name]).output().ok();
-        Command::new("xrandr").args(vec!["--rmmode", &mode_name]).output().ok();
-        if !newmode(&mode_name)? {
-            bail!("xrandr --newmode {mode_name} failed");
+    for line in text.lines() {
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            current = None;
+            let mut it = line.split_whitespace();
+            let (Some(name), Some("connected")) = (it.next(), it.next()) else { continue };
+            // Geometry token "WxH+X+Y" (may follow "primary") = the TRANSFORMED size.
+            for tok in it {
+                if let Some((wh, _)) = tok.split_once('+') {
+                    if let Some(wh) = parse_wh(wh) {
+                        current = Some((name.to_owned(), wh));
+                    }
+                    break;
+                }
+            }
+        } else if let Some((name, logical)) = &current {
+            // Indented mode lines; the one whose refresh column carries '*' is active.
+            if !line.contains('*') {
+                continue;
+            }
+            if let Some(mode) = line.split_whitespace().next() {
+                if let Some(wh) = parse_wh(mode) {
+                    if wh != *logical {
+                        stranded.push((name.clone(), format!("{}x{}", wh.0, wh.1)));
+                    }
+                }
+            }
+            current = None;
         }
     }
-    let out = Command::new("xrandr")
-        .args(vec!["--addmode", output, &mode_name])
-        .output()?;
-    if !out.status.success() {
-        bail!(
-            "xrandr --addmode {mode_name} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+    for (output, size) in stranded {
+        log::warn!(
+            "fgtw: display '{output}' stranded on a leftover scale transform — restoring {size}"
         );
+        Command::new("xrandr")
+            .args(["--output", &output, "--scale-from", &size, "--fb", &size])
+            .output()
+            .ok();
     }
-    Ok(mode_name)
+    // A crash may also have stranded the pinned Cinnamon scale — restore it regardless.
+    unpin_ui_scale();
 }
 
 #[inline]
