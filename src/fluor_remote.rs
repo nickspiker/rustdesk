@@ -267,26 +267,19 @@ impl FluorViewer {
         (f.w, f.h)
     }
 
-    /// The frame's top-left corner in the window, in window pixels. ALWAYS 1:1 (no scale).
-    /// When the frame fits in the window it's centered; when it's bigger you pan, and the
-    /// origin is just `−pan` (clamped so you can't scroll past an edge). This is the ONLY view
-    /// transform — render draws at it, the mouse subtracts it. Two numbers, nothing else.
-    /// The rectangle (in window/viewport pixels) that the whole remote frame is drawn into:
-    /// the ENTIRE frame scaled to fit the window, aspect preserved, centered (letterboxed).
-    /// Returns `(ox, oy, scale)` — top-left of the drawn video + the frame→window scale.
-    /// This is the ONE source of truth: render draws the frame here, the mouse inverts it. The
-    /// whole desktop is always visible and the cursor can always reach every corner.
+    /// The frame's top-left corner in the window, in window pixels. ALWAYS 1:1 — scale is a
+    /// constant 1.0, NEVER fit/zoom. Centered: letterbox when the frame is smaller than the
+    /// window, center-crop when larger (only transiently, while the host is still catching up
+    /// to a resolution-follow — steady state is frame == viewport, origin 0,0). Returns
+    /// `(ox, oy, 1.0)`; the ONE source of truth — render draws the frame here, the mouse
+    /// inverts it by plain subtraction.
     fn view_rect(&self, vw: f32, vh: f32, fw: f32, fh: f32) -> (f32, f32, f32) {
-        let scale = (vw / fw).min(vh / fh).max(1e-4);
-        let dw = fw * scale;
-        let dh = fh * scale;
-        ((vw - dw) * 0.5, (vh - dh) * 0.5, scale)
+        ((vw - fw) * 0.5, (vh - fh) * 0.5, 1.0)
     }
 
-    /// Map a window cursor position to a remote pixel. The cursor's position WITHIN the drawn
-    /// video rectangle, as a fraction, times the frame size. Because it's a fraction of the
-    /// visible video (never a raw absolute), it is mathematically incapable of collapsing to a
-    /// column — move to the right edge of the video and you get the right edge of the frame.
+    /// Map a window cursor position to a remote pixel: subtract the frame's origin, clamp to
+    /// the frame. With scale pinned at 1.0 this is pure subtraction — no transform left to
+    /// get wrong.
     fn to_remote(&self, ctx: &Context, x: Coord, y: Coord) -> Option<(i32, i32)> {
         let (fw, fh) = self.frame_dims();
         if fw == 0 {
@@ -511,17 +504,15 @@ impl FluorApp for FluorViewer {
             }
             return;
         }
-        // The WHOLE frame, scaled to fit the window (aspect preserved). Same rect the mouse
-        // inverts — draw and input can't disagree. The entire desktop is always visible and the
-        // cursor reaches every corner.
+        // The frame drawn 1:1 at its centered origin — same rect the mouse inverts, so draw
+        // and input can't disagree. Steady state (after host follow) is frame == viewport.
         let (ox, oy, scale) = self.view_rect(vw, vh, fw as f32, fh as f32);
         let dw = fw as f32 * scale;
         let dh = fh as f32 * scale;
         if self.last_seen_gen != f.gen {
             self.last_seen_gen = f.gen;
             log::info!(
-                "fluor: blit frame {fw}x{fh} fit scale={:.3} rect=({:.0},{:.0} {:.0}x{:.0}) viewport {bw}x{bh}",
-                scale, ox, oy, dw, dh
+                "fluor: blit frame {fw}x{fh} 1:1 org=({ox:.0},{oy:.0}) viewport {bw}x{bh}"
             );
         }
         let cx = ox + dw * 0.5;
