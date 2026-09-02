@@ -817,34 +817,38 @@ impl Decoder {
     }
 
     fn preference(id: Option<&str>) -> (PreferCodec, Chroma) {
-        // fgtw fork: the passless fleet viewer defaults to AV1 + 4:4:4. AV1's screen-content mode
-        // (palette + IntraBC, CDEF off — tuned in aom.rs) plus full chroma keeps flat UI and
-        // text sharp; stock rustdesk's Auto/I420 default DCT-rings and chroma-bleeds every glyph.
-        // A saved per-peer override ("codec-preference"/"i444") still takes precedence below.
+        // fgtw fork: the passless fleet viewer ALWAYS runs AV1 + 4:4:4 — screen-content mode
+        // (palette + IntraBC, CDEF off; tuned in aom.rs) plus full chroma for sharp flat UI and
+        // text. We deliberately bypass stock's per-peer codec-preference/i444 options: a stale or
+        // empty saved "i444" kept silently forcing 4:2:0 back on and re-haloing every glyph. One
+        // rule, always on, for the fleet. (Non-fgtw builds keep stock's Auto/I420 + option logic.)
         #[cfg(feature = "fgtw")]
-        let (def_codec, def_chroma) = (PreferCodec::AV1, Chroma::I444);
-        #[cfg(not(feature = "fgtw"))]
-        let (def_codec, def_chroma) = (PreferCodec::Auto, Chroma::I420);
-
-        let id = id.unwrap_or_default();
-        if id.is_empty() {
-            return (def_codec, def_chroma);
+        {
+            let _ = id;
+            return (PreferCodec::AV1, Chroma::I444);
         }
-        let options = PeerConfig::load(id).options;
-        let codec = match options.get("codec-preference").map(|c| c.as_str()) {
-            Some("vp8") => PreferCodec::VP8,
-            Some("vp9") => PreferCodec::VP9,
-            Some("av1") => PreferCodec::AV1,
-            Some("h264") => PreferCodec::H264,
-            Some("h265") => PreferCodec::H265,
-            _ => def_codec,
-        };
-        let chroma = match options.get("i444").map(|c| c.as_str()) {
-            Some("Y") => Chroma::I444,
-            Some(_) => Chroma::I420, // explicit non-Y disable
-            None => def_chroma,
-        };
-        (codec, chroma)
+        #[cfg(not(feature = "fgtw"))]
+        {
+            let id = id.unwrap_or_default();
+            if id.is_empty() {
+                return (PreferCodec::Auto, Chroma::I420);
+            }
+            let options = PeerConfig::load(id).options;
+            let codec = match options.get("codec-preference").map(|c| c.as_str()) {
+                Some("vp8") => PreferCodec::VP8,
+                Some("vp9") => PreferCodec::VP9,
+                Some("av1") => PreferCodec::AV1,
+                Some("h264") => PreferCodec::H264,
+                Some("h265") => PreferCodec::H265,
+                _ => PreferCodec::Auto,
+            };
+            let chroma = if options.get("i444") == Some(&"Y".to_string()) {
+                Chroma::I444
+            } else {
+                Chroma::I420
+            };
+            (codec, chroma)
+        }
     }
 }
 
