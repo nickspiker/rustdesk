@@ -1634,10 +1634,11 @@ const SAVED_UI_SCALE_OPT: &str = "fgtw-saved-ui-scale";
 const CINNAMON_SCALE_KEY: [&str; 2] = ["org.cinnamon.desktop.interface", "scaling-factor"];
 
 /// Cinnamon auto-DPI guard. With `scaling-factor = 0` (auto), Cinnamon recomputes the UI scale
-/// from the LOGICAL resolution — so a scale-from transform makes every app's text jump. Pin the
-/// scale to its CURRENT effective value (Xft.dpi/96, which auto already resolved) for the
-/// duration of the transform; visually a no-op at pin time, and layouts stop reflowing. The
-/// user's original raw value is persisted in config so a crash can't strand a pinned scale.
+/// from the LOGICAL resolution — a scale-from transform then produces a MIXED mess (2x
+/// titlebars/taskbar over shrunken app text). Any fixed scale > 1 keeps that mismatch, so pin
+/// scaling-factor to a flat 1 (uniform 1:1 chrome + text — the only combination that renders
+/// consistently at arbitrary logical sizes) while a transform is active. The user's original
+/// raw value is persisted in config so a crash can't strand the pin; restored at identity.
 fn pin_ui_scale() {
     if !Config::get_option(SAVED_UI_SCALE_OPT).is_empty() {
         return; // already pinned this session
@@ -1647,23 +1648,13 @@ fn pin_ui_scale() {
         .output();
     let Ok(get) = get else { return }; // no gsettings/Cinnamon — nothing to guard
     let raw = String::from_utf8_lossy(&get.stdout).trim().to_owned();
-    if raw != "uint32 0" {
-        return; // fixed scale already — transforms won't reflow anything
+    if raw == "uint32 1" {
+        return; // already flat 1:1 — nothing to do (and nothing to restore)
     }
-    // Effective scale: Cinnamon publishes its resolved auto scale as Xft.dpi (96 per step).
-    let dpi = Command::new("xrdb").arg("-query").output().ok()
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .find_map(|l| l.strip_prefix("Xft.dpi:").map(|v| v.trim().parse::<f64>().ok()))
-                .flatten()
-        })
-        .unwrap_or(96.0);
-    let scale = ((dpi / 96.0).round() as u32).clamp(1, 4);
     Config::set_option(SAVED_UI_SCALE_OPT.into(), raw);
-    log::info!("fgtw: pinning Cinnamon scaling-factor to {scale} (was auto) for the transform");
+    log::info!("fgtw: pinning Cinnamon scaling-factor to 1 (1:1) for the transform");
     Command::new("gsettings")
-        .arg("set").args(CINNAMON_SCALE_KEY).arg(scale.to_string())
+        .arg("set").args(CINNAMON_SCALE_KEY).arg("1")
         .output()
         .ok();
 }
