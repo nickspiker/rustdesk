@@ -354,7 +354,9 @@ class SessionList: Reactor.Component {
         // has published its RustDesk ID (empty id => connect is a no-op), so the per-device hash
         // colour is noise here — and every unpublished device hashes to the same shade anyway.
         var bg = this.type == "fleet"
-            ? (id ? "rgba(50, 205, 50, 1)" : "rgba(74, 74, 74, 1)")
+            // Opaque hex, not rgba(): Sciter reads a bare integer alpha as 0..255, so the
+            // literal `1` meant ~0.4% opacity and both states washed out to the page behind.
+            ? (id ? "#32CD32" : "#4A4A4A")
             : string2RGB(id + platform, 0.5);
         if (this.style == "list") {
             return <div .remote-session-link .remote-session-list id={id} platform={platform} title={alias ? "ID: " + id : ""}>
