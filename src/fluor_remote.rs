@@ -461,23 +461,15 @@ impl FluorApp for FluorViewer {
                         _ => {}
                     }
                 }
-                // PHYSICAL PASSTHROUGH (KeyboardMode::Map): send the physical position, not the
-                // character. The host injects the same physical key and lets ITS layout interpret
-                // it — an identity when both ends share a layout (Dvorak↔Dvorak), correct
-                // regardless of either side's language, immune to keymap drift. Our physical_key
-                // is a canonical Windows scancode; the host wants the PEER platform's keycode
-                // (Linux Xorg on leviathan), so convert first — exactly as keyboard.rs does. Sent
-                // on both edges so the host tracks real press/release + modifiers.
-                if let Some(code) = self.map_physical(event.physical_key) {
-                    let mut e = KeyEvent::new();
-                    e.mode = KeyboardMode::Map.into();
-                    e.down = down;
-                    e.set_chr(code);
-                    self.session.send_key_event(&e);
-                } else {
-                    // No physical position or no conversion: character path.
-                    self.send_key(ctx, &event.logical_key, down, event.text.as_deref());
-                }
+                // CHARACTER (keysym) delivery, NOT physical-keycode passthrough. We send the
+                // character the sender's layout produced; the host types it as a literal Unicode
+                // keysym bound to a spare keycode (libxdo "U{:X}"), which is layout-INDEPENDENT on
+                // both ends. Map mode was abandoned: it injected a raw keycode that the host's
+                // per-device XTEST layout re-interpreted — and that layout comes up US or Dvorak
+                // nondeterministically across relaunches, so the same build mangled ("the"->"kjd")
+                // on one connect and not the next. Keysym delivery honors exactly what you typed,
+                // Dvorak↔Dvorak or any mix, every time. Named/control keys route via control_key.
+                self.send_key(ctx, &event.logical_key, down, event.text.as_deref());
             }
             _ => {}
         }
@@ -570,45 +562,6 @@ impl FluorApp for FluorViewer {
 }
 
 impl FluorViewer {
-    /// Convert fluor's neutral USB HID usage (`physical_key`) to the PEER platform's Map-mode
-    /// keycode. `None` → caller falls back to the character path. The wire needs the peer's own
-    /// keycode: on Linux that's an Xorg keycode = evdev + 8, where the HID→evdev map is the Linux
-    /// kernel's usage→keycode table. Verified on leviathan: HID k=0x0E → evdev 37 → Xorg 45 =
-    /// Dvorak 't'. Windows/macOS peers aren't wired yet (their HID→keycode tables) — those fall
-    /// back to the character path; leviathan (Linux) is the live target.
-    fn map_physical(&self, hid: u16) -> Option<u32> {
-        if hid == 0 {
-            return None;
-        }
-        let plat = self.shared.peer_platform.lock().unwrap().to_lowercase();
-        if plat.contains("windows") || plat.contains("mac") {
-            return None; // TODO: HID→win scancode / HID→macOS keycode; use char path for now
-        }
-        // HID usage → Linux evdev code (kernel HID usage→keycode map).
-        let evdev: u32 = match hid {
-            0x04 => 30, 0x05 => 48, 0x06 => 46, 0x07 => 32, 0x08 => 18, 0x09 => 33, 0x0A => 34,
-            0x0B => 35, 0x0C => 23, 0x0D => 36, 0x0E => 37, 0x0F => 38, 0x10 => 50, 0x11 => 49,
-            0x12 => 24, 0x13 => 25, 0x14 => 16, 0x15 => 19, 0x16 => 31, 0x17 => 20, 0x18 => 22,
-            0x19 => 47, 0x1A => 17, 0x1B => 45, 0x1C => 21, 0x1D => 44,
-            0x1E => 2, 0x1F => 3, 0x20 => 4, 0x21 => 5, 0x22 => 6, 0x23 => 7, 0x24 => 8,
-            0x25 => 9, 0x26 => 10, 0x27 => 11,
-            0x28 => 28, 0x29 => 1, 0x2A => 14, 0x2B => 15, 0x2C => 57, 0x2D => 12, 0x2E => 13,
-            0x2F => 26, 0x30 => 27, 0x31 => 43, 0x33 => 39, 0x34 => 40, 0x35 => 41, 0x36 => 51,
-            0x37 => 52, 0x38 => 53, 0x39 => 58,
-            0x3A => 59, 0x3B => 60, 0x3C => 61, 0x3D => 62, 0x3E => 63, 0x3F => 64, 0x40 => 65,
-            0x41 => 66, 0x42 => 67, 0x43 => 68, 0x44 => 87, 0x45 => 88,
-            0x49 => 110, 0x4A => 102, 0x4B => 104, 0x4C => 111, 0x4D => 107, 0x4E => 109,
-            0x4F => 106, 0x50 => 105, 0x51 => 108, 0x52 => 103, 0x53 => 69, 0x65 => 127,
-            0x54 => 98, 0x55 => 55, 0x56 => 74, 0x57 => 78, 0x58 => 96, 0x59 => 79, 0x5A => 80,
-            0x5B => 81, 0x5C => 75, 0x5D => 76, 0x5E => 77, 0x5F => 71, 0x60 => 72, 0x61 => 73,
-            0x62 => 82, 0x63 => 83,
-            0xE0 => 29, 0xE1 => 42, 0xE2 => 56, 0xE3 => 125, 0xE4 => 97, 0xE5 => 54, 0xE6 => 100,
-            0xE7 => 126,
-            _ => return None,
-        };
-        Some(evdev + 8) // Xorg keycode
-    }
-
     fn send_key(&self, _ctx: &Context, key: &Key, down: bool, text: Option<&str>) {
         // RustDesk's `chr` field is a VIRTUAL KEYCODE, not a Unicode codepoint — stuffing a
         // char into it scrambles every key (what "keymap completely fucked" was). Two correct

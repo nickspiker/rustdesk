@@ -1665,57 +1665,14 @@ fn process_chr(en: &mut Enigo, chr: u32, down: bool, _hotkey: bool) {
 // char's US-QWERTY physical position; that lands on the physical key the target reads (as QWERTY)
 // as the intended char. Verified against the live mangle: 't'->inject 'y', 'h'->'d', 'e'->'.'.
 #[cfg(target_os = "linux")]
-fn host_is_dvorak() -> bool {
-    use std::sync::atomic::{AtomicI8, Ordering};
-    // -1 unknown, 0 no, 1 yes. Only a DEFINITIVE answer is cached — a transient failure (no X
-    // yet) retries next keypress instead of locking in "not dvorak".
-    static CACHE: AtomicI8 = AtomicI8::new(-1);
-    match CACHE.load(Ordering::Relaxed) {
-        0 => return false,
-        1 => return true,
-        _ => {}
-    }
-    // FULL PATH: the systemd/sudo `--server` runs with a stripped PATH, so a bare "setxkbmap"
-    // isn't found and detection silently failed (that's why the compensator never turned on).
-    match std::process::Command::new("/usr/bin/setxkbmap").arg("-query").output() {
-        Ok(o) if o.status.success() => {
-            let d = String::from_utf8_lossy(&o.stdout).to_lowercase().contains("dvorak");
-            CACHE.store(if d { 1 } else { 0 }, Ordering::Relaxed);
-            d
-        }
-        _ => false,
-    }
-}
-
-/// The character to inject so a Dvorak host renders `c`. Letter-mapped keys carry case through;
-/// the four QWERTY letters whose Dvorak key is a symbol (q w e z) get their shifted symbol for
-/// the capital. Anything unmapped (digits, space, punctuation already matching) passes through.
-#[cfg(target_os = "linux")]
-fn dvorak_inject(c: char) -> char {
-    match c {
-        'q' => '\'', 'w' => ',', 'e' => '.', 'r' => 'p', 't' => 'y', 'y' => 'f', 'u' => 'g',
-        'i' => 'c', 'o' => 'r', 'p' => 'l',
-        'a' => 'a', 's' => 'o', 'd' => 'e', 'f' => 'u', 'g' => 'i', 'h' => 'd', 'j' => 'h',
-        'k' => 't', 'l' => 'n', ';' => 's', '\'' => '-',
-        'z' => ';', 'x' => 'q', 'c' => 'j', 'v' => 'k', 'b' => 'x', 'n' => 'b', 'm' => 'm',
-        ',' => 'w', '.' => 'v', '/' => 'z',
-        'R' => 'P', 'T' => 'Y', 'Y' => 'F', 'U' => 'G', 'I' => 'C', 'O' => 'R', 'P' => 'L',
-        'A' => 'A', 'S' => 'O', 'D' => 'E', 'F' => 'U', 'G' => 'I', 'H' => 'D', 'J' => 'H',
-        'K' => 'T', 'L' => 'N',
-        'X' => 'Q', 'C' => 'J', 'V' => 'K', 'B' => 'X', 'N' => 'B', 'M' => 'M',
-        'E' => '>', 'Q' => '"', 'W' => '<', 'Z' => ':',
-        other => other,
-    }
-}
-
-/// Inject-char for the current host: pre-inverted on Dvorak, verbatim elsewhere.
+/// Inject-char for X11: VERBATIM. `Key::Layout(c)` injects `c` as the literal Unicode keysym
+/// `U{:X}` bound to a spare keycode (libxdo), so the host's keyboard layout is irrelevant — the
+/// character the sender produced is typed exactly, on Dvorak or any layout. An earlier Dvorak
+/// "pre-inversion" here double-mangled that layout-independent path (`the` -> `kjd`); it is gone
+/// for good. The client sends the resolved character; we type it as-is.
 #[cfg(target_os = "linux")]
 fn inject_char(c: char) -> char {
-    if host_is_dvorak() {
-        dvorak_inject(c)
-    } else {
-        c
-    }
+    c
 }
 
 fn process_unicode(en: &mut Enigo, chr: u32) {
@@ -1739,6 +1696,7 @@ fn process_unicode(en: &mut Enigo, chr: u32) {
         // keysym to a spare keycode, so the host's layout is irrelevant — type it as-is.
         #[cfg(target_os = "linux")]
         if crate::platform::linux::is_x11() {
+            log::info!("fgtw-diag: unicode inject '{}' (U+{:04X})", chr, chr as u32);
             en.key_click(Key::Layout(inject_char(chr)));
             return;
         }
