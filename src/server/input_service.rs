@@ -1662,9 +1662,6 @@ fn process_chr(en: &mut Enigo, chr: u32, down: bool, _hotkey: bool) {
 // Dvorak pre-inversion. On this host an injected keysym is delivered as the keycode where that
 // keysym lives in the (Dvorak) map, but the target reads that keycode as US-QWERTY — a fixed
 // swap so "the" arrives "kjd". So we inject, for each intended char, the Dvorak character at the
-// char's US-QWERTY physical position; that lands on the physical key the target reads (as QWERTY)
-// as the intended char. Verified against the live mangle: 't'->inject 'y', 'h'->'d', 'e'->'.'.
-#[cfg(target_os = "linux")]
 /// Inject-char for X11: VERBATIM. `Key::Layout(c)` injects `c` as the literal Unicode keysym
 /// `U{:X}` bound to a spare keycode (libxdo), so the host's keyboard layout is irrelevant — the
 /// character the sender produced is typed exactly, on Dvorak or any layout. An earlier Dvorak
@@ -1673,6 +1670,45 @@ fn process_chr(en: &mut Enigo, chr: u32, down: bool, _hotkey: bool) {
 #[cfg(target_os = "linux")]
 fn inject_char(c: char) -> char {
     c
+}
+
+/// Force the X server's synthetic-input (XTEST) keyboard to share the real keyboard's XKB map.
+///
+/// The XTEST virtual device that XTestFakeKeyEvent drives can come up with a DIFFERENT layout
+/// than the user's real keyboard — plain `us` while the session is `us(dvorak)` — and it varies
+/// per session/relaunch. That split re-scrambles even layout-independent keysym injection:
+/// libxdo resolves the Unicode keysym to a keycode via the CORE (Dvorak) map, but XTEST renders
+/// that keycode through its own (US) map, so `T` comes out `K`. Re-applying the CURRENT layout
+/// triggers a full XKB reload that realigns every device. Query-then-set so we honor whatever
+/// the user actually runs (Dvorak/Colemak/…), never a hardcoded layout. Runs once per process
+/// (cheap, cached); the `--server`'s stripped PATH is why we use the full setxkbmap path.
+#[cfg(target_os = "linux")]
+fn ensure_injection_layout_synced() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Ok(q) = std::process::Command::new("/usr/bin/setxkbmap").arg("-query").output() else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&q.stdout);
+    let field = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k).map(|v| v.trim().to_string()))
+            .unwrap_or_default()
+    };
+    let (layout, variant) = (field("layout:"), field("variant:"));
+    if layout.is_empty() {
+        return;
+    }
+    let mut cmd = std::process::Command::new("/usr/bin/setxkbmap");
+    cmd.arg("-layout").arg(&layout);
+    if !variant.is_empty() {
+        cmd.arg("-variant").arg(&variant);
+    }
+    let _ = cmd.output();
+    log::info!("fgtw: resynced XKB '{layout} {variant}' to align the XTEST injection device");
 }
 
 fn process_unicode(en: &mut Enigo, chr: u32) {
@@ -2000,6 +2036,12 @@ fn release_shift_for_char_input(en: &mut Enigo) {
 fn legacy_keyboard_mode(evt: &KeyEvent) {
     #[cfg(windows)]
     crate::platform::windows::try_change_desktop();
+    // First X11 keystroke of the process: make sure the XTEST injection device shares the real
+    // keyboard's layout, so keysym injection can't be re-scrambled by a stale per-device map.
+    #[cfg(target_os = "linux")]
+    if crate::platform::linux::is_x11() {
+        ensure_injection_layout_synced();
+    }
     let mut to_release: Vec<Key> = Vec::new();
 
     let mut en = ENIGO.lock().unwrap();
