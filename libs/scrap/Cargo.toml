@@ -10,6 +10,11 @@ authors = ["Ram <quadrupleslap@gmail.com>"]
 edition = "2018"
 
 [features]
+# fgtw fork: opt scrap into the fork's screen-content codec defaults (AV1 + 4:4:4 in
+# `codec.rs::preference`). Enabled from rustdesk's `fgtw` feature via "scrap/fgtw"; empty on its
+# own. Without this, `#[cfg(feature="fgtw")]` in this crate is always false and the defaults
+# silently fall back to Auto/I420 (the "still 4:2:0 no matter how I rebuild" trap).
+fgtw = []
 wayland = ["gstreamer", "gstreamer-app", "gstreamer-video", "dbus", "tracing", "zbus"]
 mediacodec = ["ndk"]
 linux-pkg-config = ["dep:pkg-config"]

@@ -31,7 +31,7 @@ hwcodec = ["scrap/hwcodec"]
 vram = ["scrap/vram"]
 mediacodec = ["scrap/mediacodec"]
 plugin_framework = []
-fgtw = ["dep:fgtw", "dep:tohu", "dep:ihi", "dep:vsf", "dep:ed25519-dalek", "dep:blake3", "dep:chacha20poly1305"]
+fgtw = ["scrap/fgtw", "dep:fgtw", "dep:tohu", "dep:ihi", "dep:vsf", "dep:ed25519-dalek", "dep:blake3", "dep:chacha20poly1305"]
 # Passless remote viewer on fluor (true device pixels; retina-correct). Additive to fgtw.
 fluor-viewer = ["dep:fluor"]
 linux-pkg-config = ["magnum-opus/linux-pkg-config", "scrap/linux-pkg-config"]
