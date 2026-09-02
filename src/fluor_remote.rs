@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fluor::canvas::Canvas;
-use fluor::event::{ElementState, Event as FEvent, Key, MouseButton, MouseScrollDelta, NamedKey};
+use fluor::event::{
+    ElementState, Event as FEvent, Key, ModifiersState, MouseButton, MouseScrollDelta, NamedKey,
+};
 use fluor::host::app::{run_app, Context, FluorApp};
 use fluor::host::{EventResponse, WakeSender};
 use fluor::paint::draw_image;
@@ -469,7 +471,9 @@ impl FluorApp for FluorViewer {
                 // nondeterministically across relaunches, so the same build mangled ("the"->"kjd")
                 // on one connect and not the next. Keysym delivery honors exactly what you typed,
                 // Dvorak↔Dvorak or any mix, every time. Named/control keys route via control_key.
-                self.send_key(ctx, &event.logical_key, down, event.text.as_deref());
+                // Forward the live modifier state so Shift+Enter, Ctrl+arrows, Alt+…, Cmd+… reach
+                // the host (the Legacy path's sync_modifiers presses/releases these to match).
+                self.send_key(ctx, &event.logical_key, down, event.text.as_deref(), m);
             }
             _ => {}
         }
@@ -562,7 +566,27 @@ impl FluorApp for FluorViewer {
 }
 
 impl FluorViewer {
-    fn send_key(&self, _ctx: &Context, key: &Key, down: bool, text: Option<&str>) {
+    /// The held modifiers as RustDesk `ControlKey`s, for `KeyEvent::modifiers`. The host's Legacy
+    /// `sync_modifiers` presses/releases these around the key so combos (Shift+Enter, Ctrl+←,
+    /// Alt+…, Cmd/Super+…) actually land instead of arriving as the bare key.
+    fn mod_keys(m: ModifiersState) -> Vec<hbb_common::protobuf::EnumOrUnknown<ControlKey>> {
+        let mut v = Vec::new();
+        if m.shift {
+            v.push(ControlKey::Shift.into());
+        }
+        if m.ctrl {
+            v.push(ControlKey::Control.into());
+        }
+        if m.alt {
+            v.push(ControlKey::Alt.into());
+        }
+        if m.meta {
+            v.push(ControlKey::Meta.into());
+        }
+        v
+    }
+
+    fn send_key(&self, _ctx: &Context, key: &Key, down: bool, text: Option<&str>, mods: ModifiersState) {
         // RustDesk's `chr` field is a VIRTUAL KEYCODE, not a Unicode codepoint — stuffing a
         // char into it scrambles every key (what "keymap completely fucked" was). Two correct
         // paths instead: named keys go through set_control_key (down+up); printable text is
@@ -591,6 +615,7 @@ impl FluorViewer {
             let mut evt = KeyEvent::new();
             evt.mode = KeyboardMode::Legacy.into();
             evt.down = down;
+            evt.modifiers = Self::mod_keys(mods);
             evt.set_control_key(ck);
             self.session.send_key_event(&evt);
             return;
@@ -609,6 +634,7 @@ impl FluorViewer {
                 let mut evt = KeyEvent::new();
                 evt.mode = KeyboardMode::Legacy.into();
                 evt.press = true;
+                evt.modifiers = Self::mod_keys(mods);
                 evt.set_unicode(c as u32);
                 self.session.send_key_event(&evt);
             }
