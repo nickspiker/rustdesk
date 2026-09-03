@@ -379,6 +379,19 @@ impl AomEncoder {
 
     #[inline]
     fn calc_q_values(ratio: f32) -> (u32, u32) {
+        // fgtw fork: near-lossless for crisp screen text. The stock curve's q_max never drops
+        // below 25 even at max quality — a lossy ceiling that rings every hard text edge no
+        // matter the bitrate. Palette + IntraBC (aom.rs set_controls) already code flat regions
+        // and repeated glyphs exactly; pinning a very low quantizer keeps the DCT residual on the
+        // remaining edges from overshooting into halos. LAN fleet — quality over bitrate; the
+        // rate control lets bitrate float up to hold this quality. (q is aom's 0..63 config scale.)
+        #[cfg(feature = "fgtw")]
+        {
+            let _ = ratio;
+            return (0, 10);
+        }
+        #[cfg(not(feature = "fgtw"))]
+        {
         let b = (ratio * 100.0) as u32;
         let b = std::cmp::min(b, 200);
         let q_min1 = 24;
@@ -395,6 +408,7 @@ impl AomEncoder {
         q_max = q_max.clamp(q_max2, q_max1);
 
         (q_min, q_max)
+        }
     }
 
     fn get_yuvfmt(width: u32, height: u32, i444: bool) -> EncodeYuvFormat {
