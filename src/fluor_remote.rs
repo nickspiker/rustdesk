@@ -16,7 +16,7 @@ use fluor::event::{
     ElementState, Event as FEvent, Key, ModifiersState, MouseButton, MouseScrollDelta, NamedKey,
 };
 use fluor::host::app::{run_app, Context, FluorApp};
-use fluor::host::{EventResponse, WakeSender};
+use fluor::host::{EventResponse, MenuItem, WakeSender};
 use fluor::paint::draw_image;
 use fluor::pixel::Blend;
 use fluor::text::TextStyle;
@@ -207,6 +207,12 @@ impl InvokeUiSession for FluorHandler {
 
 // ── the fluor application ──
 
+/// Native-menu item ids (echoed back as `FEvent::MenuItem`). Our namespace; kept stable.
+const MENU_FULLSCREEN: u32 = 1;
+const MENU_HUD: u32 = 2;
+const MENU_HOST_NEXT: u32 = 3;
+const MENU_HOST_PREV: u32 = 4;
+
 /// Mouse button masks matching RustDesk's `send_mouse` protocol (buttons << 3 | type).
 const TYPE_MOVE: i32 = 0;
 const TYPE_DOWN: i32 = 1;
@@ -362,6 +368,22 @@ impl FluorApp for FluorViewer {
 
     fn init(&mut self, _ctx: &mut Context) {}
 
+    /// Native menu bar (always visible on macOS) carrying the viewer controls — so we don't have
+    /// to steal Ctrl+Alt combos from the guest. Static for now; clicks arrive as
+    /// `FEvent::MenuItem(id)` and are handled in `on_event`.
+    fn menu(&self) -> Vec<MenuItem> {
+        vec![MenuItem::Sub {
+            label: "Remote".into(),
+            items: vec![
+                MenuItem::Action { id: MENU_FULLSCREEN, label: "Toggle Fullscreen".into() },
+                MenuItem::Action { id: MENU_HUD, label: "Toggle Input HUD".into() },
+                MenuItem::Separator,
+                MenuItem::Action { id: MENU_HOST_NEXT, label: "Next Host Monitor".into() },
+                MenuItem::Action { id: MENU_HOST_PREV, label: "Previous Host Monitor".into() },
+            ],
+        }]
+    }
+
     /// Open at the FULL monitor, not fluor's default half. This is the visible-window size; the
     /// default `monitor/2` was the "quarter area / mostly wallpaper" the user kept reporting.
     fn initial_size(&self, monitor: (u32, u32)) -> (u32, u32) {
@@ -486,18 +508,10 @@ impl FluorApp for FluorViewer {
                             ctx.window.request_redraw();
                             return EventResponse::Handled;
                         }
-                        // Ctrl+Alt+←/→ : cycle which HOST monitor we view (wrap-around). The host
-                        // switches, sends SwitchDisplay back, and resolution-follow re-fits the new
-                        // monitor to this window automatically. No-op with a single host display.
+                        // Ctrl+Alt+←/→ : cycle which HOST monitor we view (wrap-around). Same action
+                        // the "Remote" menu offers; resolution-follow re-fits the new monitor.
                         Key::Named(k @ (NamedKey::ArrowRight | NamedKey::ArrowLeft)) => {
-                            let count = *self.shared.display_count.lock().unwrap() as i32;
-                            if count > 1 {
-                                let cur = *self.shared.display_idx.lock().unwrap();
-                                let delta = if *k == NamedKey::ArrowRight { 1 } else { -1 };
-                                let next = (cur + delta).rem_euclid(count);
-                                log::info!("fluor: switch to host display {next}/{count}");
-                                self.session.switch_display(next);
-                            }
+                            self.switch_host_display(if *k == NamedKey::ArrowRight { 1 } else { -1 });
                             return EventResponse::Handled;
                         }
                         _ => {}
@@ -524,6 +538,16 @@ impl FluorApp for FluorViewer {
                     self.send_key(ctx, &event.logical_key, down, event.text.as_deref(), m);
                 }
             }
+            FEvent::MenuItem(id) => match *id {
+                MENU_FULLSCREEN => return EventResponse::ToggleMaximized,
+                MENU_HUD => {
+                    self.hud = !self.hud;
+                    ctx.window.request_redraw();
+                }
+                MENU_HOST_NEXT => self.switch_host_display(1),
+                MENU_HOST_PREV => self.switch_host_display(-1),
+                _ => {}
+            },
             _ => {}
         }
         EventResponse::Pass
@@ -619,6 +643,19 @@ impl FluorApp for FluorViewer {
 }
 
 impl FluorViewer {
+    /// Switch which HOST monitor we view by `delta` (±1), wrapping over the host's display count.
+    /// Shared by the Ctrl+Alt+←/→ hotkey and the "Remote" menu. No-op with a single host display;
+    /// the host switches, echoes SwitchDisplay back, and resolution-follow re-fits the new monitor.
+    fn switch_host_display(&self, delta: i32) {
+        let count = *self.shared.display_count.lock().unwrap() as i32;
+        if count > 1 {
+            let cur = *self.shared.display_idx.lock().unwrap();
+            let next = (cur + delta).rem_euclid(count);
+            log::info!("fluor: switch to host display {next}/{count}");
+            self.session.switch_display(next);
+        }
+    }
+
     /// fluor's neutral USB HID usage (`physical_key`) → the PEER's Map-mode keycode. `None` →
     /// caller falls back to the keysym text path. On Linux the peer wants an Xorg keycode =
     /// evdev + 8, where HID→evdev is the kernel's usage→keycode table. The host is layout-
