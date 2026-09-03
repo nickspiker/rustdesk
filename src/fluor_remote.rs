@@ -442,18 +442,29 @@ impl FluorApp for FluorViewer {
                     .send_mouse((btn << 3) | ty, rx, ry, false, false, false, false);
             }
             FEvent::MouseWheel { delta } => {
-                // Scroll pans the 1:1 view when the frame is bigger than the window.
-                let (_dx, dy) = match delta {
-                    MouseScrollDelta::Lines(x, y) => (*x * 40.0, *y * 40.0),
-                    MouseScrollDelta::Pixels(x, y) => (*x, *y),
+                // Pass the wheel THROUGH to the host (RustDesk MOUSE_TYPE_WHEEL), not a local pan —
+                // the follow makes frame == window, so there's nothing to pan. Normalize to the
+                // dominant axis and send small signed line-counts, exactly like the stock client;
+                // the host applies its own sign/scale. Pixels (trackpad) scale down to ~lines.
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::Lines(x, y) => (*x, *y),
+                    MouseScrollDelta::Pixels(x, y) => (*x / 40.0, *y / 40.0),
                 };
-                self.pan_y -= dy;
-                let (_fw, fh) = self.frame_dims();
-                let vh = ctx.viewport.height_px as f32;
-                if fh as f32 > vh {
-                    self.pan_y = self.pan_y.clamp(0.0, fh as f32 - vh);
+                let (sx, sy) = if dx.abs() > dy.abs() { (dx, 0.0) } else { (0.0, dy) };
+                let lines = |v: f32| {
+                    if v > 0.0 {
+                        (v.round() as i32).max(1)
+                    } else if v < 0.0 {
+                        (v.round() as i32).min(-1)
+                    } else {
+                        0
+                    }
+                };
+                let (x, y) = (lines(sx), lines(sy));
+                if x != 0 || y != 0 {
+                    self.session
+                        .send_mouse(TYPE_WHEEL, x, y, false, false, false, false);
                 }
-                ctx.window.request_redraw();
             }
             FEvent::KeyboardInput { event } => {
                 let down = matches!(event.state, ElementState::Pressed);
