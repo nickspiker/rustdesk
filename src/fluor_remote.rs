@@ -61,6 +61,9 @@ struct Shared {
     /// The peer's OS ("Linux"/"Windows"/"Mac"), from PeerInfo. Map-mode keys carry a
     /// peer-platform keycode, converted from our canonical Windows scancode.
     peer_platform: Mutex<String>,
+    /// How many displays the host has — for wrap-around host-monitor switching (Ctrl+Alt+←/→).
+    /// Filled from PeerInfo/set_displays; 0 until connected (switch is a no-op until then).
+    display_count: Mutex<usize>,
 }
 
 impl Shared {
@@ -139,8 +142,11 @@ impl InvokeUiSession for FluorHandler {
     fn set_peer_info(&self, pi: &hbb_common::message_proto::PeerInfo) {
         *self.shared.display_idx.lock().unwrap() = pi.current_display;
         *self.shared.peer_platform.lock().unwrap() = pi.platform.clone();
+        *self.shared.display_count.lock().unwrap() = pi.displays.len();
     }
-    fn set_displays(&self, _displays: &Vec<hbb_common::message_proto::DisplayInfo>) {}
+    fn set_displays(&self, displays: &Vec<hbb_common::message_proto::DisplayInfo>) {
+        *self.shared.display_count.lock().unwrap() = displays.len();
+    }
     fn set_platform_additions(&self, _data: &str) {}
     fn on_connected(&self, _conn_type: ConnType) {}
     fn update_privacy_mode(&self) {}
@@ -478,6 +484,20 @@ impl FluorApp for FluorViewer {
                         Key::Character(c) if c.eq_ignore_ascii_case("h") => {
                             self.hud = !self.hud;
                             ctx.window.request_redraw();
+                            return EventResponse::Handled;
+                        }
+                        // Ctrl+Alt+←/→ : cycle which HOST monitor we view (wrap-around). The host
+                        // switches, sends SwitchDisplay back, and resolution-follow re-fits the new
+                        // monitor to this window automatically. No-op with a single host display.
+                        Key::Named(k @ (NamedKey::ArrowRight | NamedKey::ArrowLeft)) => {
+                            let count = *self.shared.display_count.lock().unwrap() as i32;
+                            if count > 1 {
+                                let cur = *self.shared.display_idx.lock().unwrap();
+                                let delta = if *k == NamedKey::ArrowRight { 1 } else { -1 };
+                                let next = (cur + delta).rem_euclid(count);
+                                log::info!("fluor: switch to host display {next}/{count}");
+                                self.session.switch_display(next);
+                            }
                             return EventResponse::Handled;
                         }
                         _ => {}
