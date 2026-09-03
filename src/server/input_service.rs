@@ -1483,6 +1483,13 @@ fn map_keyboard_mode(evt: &KeyEvent) {
         return;
     }
 
+    // Map mode injects raw XTEST keycodes, which the X server decodes through the XTEST device's
+    // XKB map — so this path is EXACTLY the one that mangles when that device drifts to US after a
+    // display reconfigure (monitor hot-plug). Keep it self-healed here too, not just in the Legacy
+    // path — the fluor viewer sends Map mode, so this is the live path.
+    #[cfg(target_os = "linux")]
+    ensure_injection_layout_synced();
+
     sim_rdev_rawkey_position(evt.chr() as _, evt.down);
 }
 
