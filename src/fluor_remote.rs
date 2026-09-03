@@ -216,6 +216,10 @@ const BACKDROP: u32 = 0xFFC0_C0C0;
 /// Quiet time after the last window-size change before we ask the host to follow — long enough
 /// that dragging the window doesn't mint an xrandr mode per pixel, short enough to feel live.
 const FOLLOW_DEBOUNCE: Duration = Duration::from_millis(300);
+/// If the host's frame still hasn't become our window size this long after a follow request,
+/// re-send it. Makes the follow self-healing against a dropped/ignored request (host restart,
+/// reconnect blip) instead of the old fire-once-and-hope that left the crop stuck forever.
+const FOLLOW_RETRY: Duration = Duration::from_millis(1200);
 
 /// Visible-RGB → fluor's α+darkness packing (same as on_rgba / opsin's `argb`). Const so HUD
 /// colours are compile-time.
@@ -242,7 +246,6 @@ struct FluorViewer {
     //    the frame fills the window 1:1 (no scaling) and the mouse maps by identity ──
     follow_target: (i32, i32), // most recent window backing size seen
     follow_at: Option<Instant>, // when the debounce elapses and we send the follow
-    last_follow: (i32, i32),   // last size actually requested (avoids resend spam)
     /// Cursor derived from the last raw CursorMoved (raw − window_origin, pass-0 px). Used by
     /// MouseInput (which carries no position) and as the send_move source.
     last_cursor: (Coord, Coord),
@@ -313,28 +316,34 @@ impl FluorViewer {
         if target.0 <= 0 || target.1 <= 0 {
             return false;
         }
+        // DONE when the host's frame is already exactly our window — the follow converged.
+        let (fw, fh) = self.frame_dims();
+        if (fw as i32, fh as i32) == target {
+            self.follow_at = None;
+            self.follow_target = target;
+            return false;
+        }
+        // Window size changed — (re)start the debounce so dragging doesn't spam requests.
         if target != self.follow_target {
-            // Size changed — (re)start the debounce; don't send mid-drag.
             self.follow_target = target;
             self.follow_at = Some(Instant::now() + FOLLOW_DEBOUNCE);
             return true;
         }
-        if target != self.last_follow {
-            let due = self.follow_at.map_or(true, |t| Instant::now() >= t);
-            if due {
-                let idx = *self.shared.display_idx.lock().unwrap();
-                log::info!(
-                    "fgtw-diag: follow SEND change_resolution display={} {}x{}",
-                    idx, target.0, target.1
-                );
-                self.session.change_resolution(idx, target.0, target.1);
-                self.last_follow = target;
-                self.follow_at = None;
-                return false;
-            }
-            return true; // waiting for the debounce
+        // Debounce elapsed and the frame still isn't our size → (re)send, then re-arm a RETRY.
+        // Self-healing: keep asking until the frame actually becomes `target`. The old code sent
+        // ONCE and marked success — so a single dropped request (host restarting mid-send, a
+        // reconnect blip) left the crop forever. Now a lost request just retries next tick.
+        let due = self.follow_at.map_or(true, |t| Instant::now() >= t);
+        if due {
+            let idx = *self.shared.display_idx.lock().unwrap();
+            log::info!(
+                "fgtw-diag: follow SEND change_resolution display={} {}x{} (frame is {fw}x{fh})",
+                idx, target.0, target.1
+            );
+            self.session.change_resolution(idx, target.0, target.1);
+            self.follow_at = Some(Instant::now() + FOLLOW_RETRY);
         }
-        false
+        true // keep ticking until frame == target
     }
 }
 
@@ -736,7 +745,6 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
         last_seen_gen: 0,
         follow_target: (0, 0),
         follow_at: None,
-        last_follow: (0, 0),
         last_cursor: (0.0, 0.0),
         last_telemetry: None,
         hud: false, // off by default; Ctrl+Alt+H toggles the on-screen diagnostic overlay

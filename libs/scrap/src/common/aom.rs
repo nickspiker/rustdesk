@@ -162,11 +162,11 @@ mod webrtc {
         }
 
         call_ctl!(ctx, AOME_SET_CPUUSED, get_cpu_speed(cfg.g_w, cfg.g_h));
-        // CDEF is AV1's in-loop directional *enhancement/deringing* filter — great for natural
-        // video, but on a desktop it rounds off sharp 1px text edges (the "post-process filter
-        // haze" over glyphs). Screen content has almost no ringing for it to fix, so it mostly
-        // just smears. Off for crisp text. (fgtw fork: we always run TUNE_CONTENT=SCREEN below.)
-        call_ctl!(ctx, AV1E_SET_ENABLE_CDEF, 0);
+        // CDEF is AV1's in-loop de-RINGING filter. I turned it off for "sharpness" — wrong call
+        // for a ringing complaint: with any residual quantization it's the thing that cleans the
+        // halos off hard text edges. Back ON. (fgtw runs genuinely near-lossless below too, so
+        // there's little for it to soften — we get crisp AND de-ringed.)
+        call_ctl!(ctx, AV1E_SET_ENABLE_CDEF, 1);
         call_ctl!(ctx, AV1E_SET_ENABLE_TPL_MODEL, 0);
         call_ctl!(ctx, AV1E_SET_DELTAQ_MODE, 0);
         call_ctl!(ctx, AV1E_SET_ENABLE_ORDER_HINT, 0);
@@ -182,7 +182,7 @@ mod webrtc {
         // 0..63 quality knob (lower = crisper); 10 is near-lossless for screen content, which
         // palette/IntraBC make cheap on flat regions and glyphs. Bitrate floats to hold this.
         #[cfg(feature = "fgtw")]
-        call_ctl!(ctx, AOME_SET_CQ_LEVEL, 10);
+        call_ctl!(ctx, AOME_SET_CQ_LEVEL, 4);
         let tile_set = if cfg.g_threads == 4 && cfg.g_w == 640 && (cfg.g_h == 360 || cfg.g_h == 480)
         {
             AV1E_SET_TILE_ROWS
@@ -413,7 +413,7 @@ impl AomEncoder {
         #[cfg(feature = "fgtw")]
         {
             let _ = ratio;
-            return (0, 10);
+            return (0, 4);
         }
         #[cfg(not(feature = "fgtw"))]
         {
