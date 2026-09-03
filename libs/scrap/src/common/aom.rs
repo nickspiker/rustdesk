@@ -118,10 +118,6 @@ mod webrtc {
         c.rc_min_quantizer = q_min;
         c.rc_max_quantizer = q_max;
         c.rc_target_bitrate = AomEncoder::bitrate(cfg.width as _, cfg.height as _, cfg.quality);
-        log::info!(
-            "fgtw-diag: AV1 initial config quality={} -> q_min={q_min} q_max={q_max} bitrate={}kbps",
-            cfg.quality, c.rc_target_bitrate
-        );
         c.rc_undershoot_pct = 50;
         c.rc_overshoot_pct = 50;
         c.rc_buf_initial_sz = 600;
@@ -162,11 +158,11 @@ mod webrtc {
         }
 
         call_ctl!(ctx, AOME_SET_CPUUSED, get_cpu_speed(cfg.g_w, cfg.g_h));
-        // CDEF is AV1's in-loop de-RINGING filter. I turned it off for "sharpness" — wrong call
-        // for a ringing complaint: with any residual quantization it's the thing that cleans the
-        // halos off hard text edges. Back ON. (fgtw runs genuinely near-lossless below too, so
-        // there's little for it to soften — we get crisp AND de-ringed.)
-        call_ctl!(ctx, AV1E_SET_ENABLE_CDEF, 1);
+        // CDEF (in-loop directional smoothing) OFF for screen content: at the near-lossless
+        // quality below there's essentially no ringing for it to remove, so it only risks
+        // softening sharp 1px text edges. (The "halo" that sent us chasing this was never CDEF —
+        // it was macOS downscaling a scaled display mode; fixed at the client's display setting.)
+        call_ctl!(ctx, AV1E_SET_ENABLE_CDEF, 0);
         call_ctl!(ctx, AV1E_SET_ENABLE_TPL_MODEL, 0);
         call_ctl!(ctx, AV1E_SET_DELTAQ_MODE, 0);
         call_ctl!(ctx, AV1E_SET_ENABLE_ORDER_HINT, 0);
@@ -181,6 +177,10 @@ mod webrtc {
         // fgtw: constant-quality target (paired with AOM_Q in the config). cq_level is aom's
         // 0..63 quality knob (lower = crisper); 10 is near-lossless for screen content, which
         // palette/IntraBC make cheap on flat regions and glyphs. Bitrate floats to hold this.
+        // fgtw: constant-quality near-lossless (paired with AOM_Q). cq 4 on aom's 0..63 scale is
+        // visually lossless for screen content, and palette/IntraBC code flat regions + repeated
+        // glyphs exactly so text is crisp; bitrate floats to hold it. Lighter than true lossless,
+        // real-time on a LAN.
         #[cfg(feature = "fgtw")]
         call_ctl!(ctx, AOME_SET_CQ_LEVEL, 4);
         let tile_set = if cfg.g_threads == 4 && cfg.g_w == 640 && (cfg.g_h == 360 || cfg.g_h == 480)
@@ -311,10 +311,6 @@ impl EncoderApi for AomEncoder {
         c.rc_min_quantizer = q_min;
         c.rc_max_quantizer = q_max;
         c.rc_target_bitrate = Self::bitrate(self.width as _, self.height as _, ratio);
-        log::info!(
-            "fgtw-diag: AV1 set_quality ratio={ratio} -> q_min={q_min} q_max={q_max} bitrate={}kbps",
-            c.rc_target_bitrate
-        );
         call_aom!(aom_codec_enc_config_set(&mut self.ctx, &c));
         Ok(())
     }

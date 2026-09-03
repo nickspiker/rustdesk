@@ -527,11 +527,15 @@ impl FluorApp for FluorViewer {
         let (ox, oy, scale) = self.view_rect(vw, vh, fw as f32, fh as f32);
         let dw = fw as f32 * scale;
         let dh = fh as f32 * scale;
+        // Only log while frame != viewport (following/transient); silent once converged to 1:1
+        // steady state so we don't spam a line per frame (that buried the follow-SEND line once).
         if self.last_seen_gen != f.gen {
             self.last_seen_gen = f.gen;
-            log::info!(
-                "fluor: blit frame {fw}x{fh} 1:1 org=({ox:.0},{oy:.0}) viewport {bw}x{bh}"
-            );
+            if fw != bw || fh != bh {
+                log::info!(
+                    "fluor: blit {fw}x{fh} into viewport {bw}x{bh} org=({ox:.0},{oy:.0}) — following"
+                );
+            }
         }
         let cx = ox + dw * 0.5;
         let cy = oy + dh * 0.5;

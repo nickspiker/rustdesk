@@ -1483,10 +1483,6 @@ fn map_keyboard_mode(evt: &KeyEvent) {
         return;
     }
 
-    // TEMP DIAG: log the exact Xorg keycode arriving so we can compare to the physical key the
-    // user pressed (host is Dvorak; keycode 45='t', 44='h', 40='e'). Remove once keyboard fixed.
-    #[cfg(target_os = "linux")]
-    log::info!("fgtw-diag: map keycode={} down={}", evt.chr(), evt.down);
     sim_rdev_rawkey_position(evt.chr() as _, evt.down);
 }
 
@@ -1732,7 +1728,6 @@ fn process_unicode(en: &mut Enigo, chr: u32) {
         // keysym to a spare keycode, so the host's layout is irrelevant — type it as-is.
         #[cfg(target_os = "linux")]
         if crate::platform::linux::is_x11() {
-            log::info!("fgtw-diag: unicode inject '{}' (U+{:04X})", chr, chr as u32);
             en.key_click(Key::Layout(inject_char(chr)));
             return;
         }
