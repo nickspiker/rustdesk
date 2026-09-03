@@ -212,6 +212,12 @@ const MENU_FULLSCREEN: u32 = 1;
 const MENU_HUD: u32 = 2;
 const MENU_HOST_NEXT: u32 = 3;
 const MENU_HOST_PREV: u32 = 4;
+const MENU_LOCAL_NEXT: u32 = 5;
+const MENU_LOCAL_PREV: u32 = 6;
+
+/// Trackpad `Pixels` scroll → "lines" divisor. A swipe is hundreds of px; this + accumulation
+/// keeps scroll speed sane (bigger = slower). Wheel `Lines` bypass this (already ±1/notch).
+const SCROLL_PX_PER_LINE: f32 = 120.0;
 
 /// Mouse button masks matching RustDesk's `send_mouse` protocol (buttons << 3 | type).
 const TYPE_MOVE: i32 = 0;
@@ -246,11 +252,11 @@ const HUD_SHADOW: u32 = argb(0x00, 0x00, 0x00, 0xFF);
 struct FluorViewer {
     session: Session<FluorHandler>,
     shared: Arc<Shared>,
-    /// Pan: the remote-pixel coordinate shown at the window's top-left. Scroll to move it.
-    /// The frame is ALWAYS drawn 1:1 (no scaling, ever); when it's bigger than the window you
-    /// pan to reach the rest. Clamped so you can't scroll past the edges.
-    pan_x: f32,
-    pan_y: f32,
+    /// Scroll accumulators: sub-line wheel/trackpad deltas pile up here and we forward whole
+    /// lines as they cross ±1, keeping the remainder. No forced ±1-per-event, so fine-grained
+    /// trackpad `Pixels` scroll proportionally instead of flooding the host with a line per micro-event.
+    scroll_acc_x: f32,
+    scroll_acc_y: f32,
     // input bookkeeping
     buttons: i32, // currently-held button mask
     last_seen_gen: u64,
@@ -372,16 +378,27 @@ impl FluorApp for FluorViewer {
     /// to steal Ctrl+Alt combos from the guest. Static for now; clicks arrive as
     /// `FEvent::MenuItem(id)` and are handled in `on_event`.
     fn menu(&self) -> Vec<MenuItem> {
-        vec![MenuItem::Sub {
-            label: "Remote".into(),
-            items: vec![
-                MenuItem::Action { id: MENU_FULLSCREEN, label: "Toggle Fullscreen".into() },
-                MenuItem::Action { id: MENU_HUD, label: "Toggle Input HUD".into() },
-                MenuItem::Separator,
-                MenuItem::Action { id: MENU_HOST_NEXT, label: "Next Host Monitor".into() },
-                MenuItem::Action { id: MENU_HOST_PREV, label: "Previous Host Monitor".into() },
-            ],
-        }]
+        vec![
+            // "Remote" = the host (leviathan): which of ITS monitors we're viewing.
+            MenuItem::Sub {
+                label: "Remote".into(),
+                items: vec![
+                    MenuItem::Action { id: MENU_HOST_NEXT, label: "Next Host Monitor".into() },
+                    MenuItem::Action { id: MENU_HOST_PREV, label: "Previous Host Monitor".into() },
+                ],
+            },
+            // "Local" = this Mac: which of OUR monitors the viewer window lives on, plus view toggles.
+            MenuItem::Sub {
+                label: "Local".into(),
+                items: vec![
+                    MenuItem::Action { id: MENU_LOCAL_NEXT, label: "Move to Next Monitor".into() },
+                    MenuItem::Action { id: MENU_LOCAL_PREV, label: "Move to Previous Monitor".into() },
+                    MenuItem::Separator,
+                    MenuItem::Action { id: MENU_FULLSCREEN, label: "Toggle Fullscreen".into() },
+                    MenuItem::Action { id: MENU_HUD, label: "Toggle Input HUD".into() },
+                ],
+            },
+        ]
     }
 
     /// Open at the FULL monitor, not fluor's default half. This is the visible-window size; the
@@ -474,21 +491,27 @@ impl FluorApp for FluorViewer {
                 // the follow makes frame == window, so there's nothing to pan. Normalize to the
                 // dominant axis and send small signed line-counts, exactly like the stock client;
                 // the host applies its own sign/scale. Pixels (trackpad) scale down to ~lines.
+                // To "lines": a wheel notch is Lines(±1); trackpad Pixels are fine-grained, so
+                // scale them WAY down (a single swipe is hundreds of px). Then ACCUMULATE and only
+                // forward whole lines as they cross ±1, carrying the remainder — no forced ±1 per
+                // micro-event, which was flooding the host (the "scroll is HUGE" bug).
                 let (dx, dy) = match delta {
                     MouseScrollDelta::Lines(x, y) => (*x, *y),
-                    MouseScrollDelta::Pixels(x, y) => (*x / 40.0, *y / 40.0),
-                };
-                let (sx, sy) = if dx.abs() > dy.abs() { (dx, 0.0) } else { (0.0, dy) };
-                let lines = |v: f32| {
-                    if v > 0.0 {
-                        (v.round() as i32).max(1)
-                    } else if v < 0.0 {
-                        (v.round() as i32).min(-1)
-                    } else {
-                        0
+                    MouseScrollDelta::Pixels(x, y) => {
+                        (*x / SCROLL_PX_PER_LINE, *y / SCROLL_PX_PER_LINE)
                     }
                 };
-                let (x, y) = (lines(sx), lines(sy));
+                self.scroll_acc_x += dx;
+                self.scroll_acc_y += dy;
+                let (mut x, mut y) = (self.scroll_acc_x.trunc() as i32, self.scroll_acc_y.trunc() as i32);
+                self.scroll_acc_x -= x as f32;
+                self.scroll_acc_y -= y as f32;
+                // Dominant axis only, like the stock client.
+                if x.abs() >= y.abs() {
+                    y = 0;
+                } else {
+                    x = 0;
+                }
                 if x != 0 || y != 0 {
                     self.session
                         .send_mouse(TYPE_WHEEL, x, y, false, false, false, false);
@@ -546,6 +569,8 @@ impl FluorApp for FluorViewer {
                 }
                 MENU_HOST_NEXT => self.switch_host_display(1),
                 MENU_HOST_PREV => self.switch_host_display(-1),
+                MENU_LOCAL_NEXT => return EventResponse::MoveToMonitor(1),
+                MENU_LOCAL_PREV => return EventResponse::MoveToMonitor(-1),
                 _ => {}
             },
             _ => {}
@@ -811,8 +836,8 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
     let app = FluorViewer {
         session,
         shared,
-        pan_x: 0.0,
-        pan_y: 0.0,
+        scroll_acc_x: 0.0,
+        scroll_acc_y: 0.0,
         buttons: 0,
         last_seen_gen: 0,
         follow_target: (0, 0),
