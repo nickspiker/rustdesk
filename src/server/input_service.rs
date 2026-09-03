@@ -1676,14 +1676,24 @@ fn inject_char(c: char) -> char {
 /// libxdo resolves the Unicode keysym to a keycode via the CORE (Dvorak) map, but XTEST renders
 /// that keycode through its own (US) map, so `T` comes out `K`. Re-applying the CURRENT layout
 /// triggers a full XKB reload that realigns every device. Query-then-set so we honor whatever
-/// the user actually runs (Dvorak/Colemak/…), never a hardcoded layout. Runs once per process
-/// (cheap, cached); the `--server`'s stripped PATH is why we use the full setxkbmap path.
+/// the user actually runs (Dvorak/Colemak/…), never a hardcoded layout; the `--server`'s
+/// stripped PATH is why we use the full setxkbmap path.
+///
+/// SELF-HEALING, not once-per-process: the XTEST split can re-appear MID-session whenever X
+/// reconfigures — a monitor hot-plug, a mode change — so a one-shot resync silently rots. We
+/// re-apply on a time throttle instead, so any fresh drift heals within a couple seconds of the
+/// next keystroke without spawning setxkbmap on every key.
 #[cfg(target_os = "linux")]
 fn ensure_injection_layout_synced() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.swap(true, Ordering::Relaxed) {
-        return;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        if last.map_or(false, |t| t.elapsed() < Duration::from_secs(3)) {
+            return;
+        }
+        *last = Some(Instant::now());
     }
     let Ok(q) = std::process::Command::new("/usr/bin/setxkbmap").arg("-query").output() else {
         return;
