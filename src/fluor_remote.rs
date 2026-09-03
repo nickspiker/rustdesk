@@ -519,27 +519,11 @@ impl FluorApp for FluorViewer {
             }
             FEvent::KeyboardInput { event } => {
                 let down = matches!(event.state, ElementState::Pressed);
-                // Local hotkeys FIRST (Ctrl+Alt+… or Cmd+Alt+…) — intercepted, never sent to the
-                // remote. Enter=fullscreen toggle, H=HUD.
+                // NO local hotkey interception — every combo (Ctrl+Alt+anything included) passes
+                // straight through to the guest. Viewer controls (Fullscreen, HUD, host/local
+                // monitor switch) live in the macOS menu bar instead, so nothing is stolen from the
+                // remote. `m` still feeds the keysym fallback below.
                 let m = ctx.modifiers;
-                let hotkey = (m.ctrl || m.meta) && m.alt;
-                if hotkey && down {
-                    match &event.logical_key {
-                        Key::Named(NamedKey::Enter) => return EventResponse::ToggleMaximized,
-                        Key::Character(c) if c.eq_ignore_ascii_case("h") => {
-                            self.hud = !self.hud;
-                            ctx.window.request_redraw();
-                            return EventResponse::Handled;
-                        }
-                        // Ctrl+Alt+←/→ : cycle which HOST monitor we view (wrap-around). Same action
-                        // the "Remote" menu offers; resolution-follow re-fits the new monitor.
-                        Key::Named(k @ (NamedKey::ArrowRight | NamedKey::ArrowLeft)) => {
-                            self.switch_host_display(if *k == NamedKey::ArrowRight { 1 } else { -1 });
-                            return EventResponse::Handled;
-                        }
-                        _ => {}
-                    }
-                }
                 // RAW KEY PASSTHROUGH — a keyboard is just key-down and key-up. Forward the
                 // PHYSICAL key position on BOTH edges (KeyboardMode::Map) so the host replays the
                 // exact press/release sequence: modifiers are ordinary held keys, and simultaneous
@@ -629,7 +613,7 @@ impl FluorApp for FluorViewer {
         for px in target.iter_mut() {
             *px = px.under(BACKDROP, BlendMode::Normal);
         }
-        // ── On-screen diagnostic HUD (Ctrl+Alt+H). Drawn last so it sits over everything. ──
+        // ── On-screen diagnostic HUD (menu bar → Local → HUD). Drawn last so it sits over everything. ──
         if self.hud {
             let line1 = format!(
                 "raw={:.0},{:.0}  worg={},{}  cur={:.0},{:.0}  fluorcur={:.0},{:.0}",
@@ -642,7 +626,7 @@ impl FluorApp for FluorViewer {
                 self.dbg_org.0, self.dbg_org.1, self.dbg_rem.0, self.dbg_rem.1
             );
             let line3 = format!("key: {}", self.dbg_key);
-            let line4 = "Ctrl+Alt: Enter=fullscreen  H=hud";
+            let line4 = "menu bar: Local/Remote monitor · Fullscreen · HUD";
             let size = (bh as f32 * 0.028).clamp(16.0, 40.0);
             let x = size * 0.5;
             let mut y = size * 0.9;
