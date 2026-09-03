@@ -118,6 +118,10 @@ mod webrtc {
         c.rc_min_quantizer = q_min;
         c.rc_max_quantizer = q_max;
         c.rc_target_bitrate = AomEncoder::bitrate(cfg.width as _, cfg.height as _, cfg.quality);
+        log::info!(
+            "fgtw-diag: AV1 initial config quality={} -> q_min={q_min} q_max={q_max} bitrate={}kbps",
+            cfg.quality, c.rc_target_bitrate
+        );
         c.rc_undershoot_pct = 50;
         c.rc_overshoot_pct = 50;
         c.rc_buf_initial_sz = 600;
@@ -126,7 +130,19 @@ mod webrtc {
         c.g_usage = kUsageProfile;
         c.g_error_resilient = 0;
         // Low-latency settings.
-        c.rc_end_usage = aom_rc_mode::AOM_CBR; // Constant Bit Rate (CBR) mode
+        // fgtw fork: CONSTANT QUALITY, not CBR. CBR forces the encoder to hit the bitrate target,
+        // so with our near-lossless q ceiling it slams every busy text frame to the q=10 ceiling
+        // to fit the bytes — and that rings. AOM_Q holds a fixed quality (cq_level, set in
+        // set_controls) and lets bitrate float: a static desktop stays tiny, scrolling text
+        // spends whatever it needs. On a LAN that's exactly the trade we want.
+        #[cfg(feature = "fgtw")]
+        {
+            c.rc_end_usage = aom_rc_mode::AOM_Q;
+        }
+        #[cfg(not(feature = "fgtw"))]
+        {
+            c.rc_end_usage = aom_rc_mode::AOM_CBR; // Constant Bit Rate (CBR) mode
+        }
         c.g_pass = aom_enc_pass::AOM_RC_ONE_PASS; // One-pass rate control
         c.g_lag_in_frames = kLagInFrames; // No look ahead when lag equals 0.
 
@@ -162,6 +178,11 @@ mod webrtc {
         // kScreensharing
         call_ctl!(ctx, AV1E_SET_TUNE_CONTENT, AOM_CONTENT_SCREEN);
         call_ctl!(ctx, AV1E_SET_ENABLE_PALETTE, 1);
+        // fgtw: constant-quality target (paired with AOM_Q in the config). cq_level is aom's
+        // 0..63 quality knob (lower = crisper); 10 is near-lossless for screen content, which
+        // palette/IntraBC make cheap on flat regions and glyphs. Bitrate floats to hold this.
+        #[cfg(feature = "fgtw")]
+        call_ctl!(ctx, AOME_SET_CQ_LEVEL, 10);
         let tile_set = if cfg.g_threads == 4 && cfg.g_w == 640 && (cfg.g_h == 360 || cfg.g_h == 480)
         {
             AV1E_SET_TILE_ROWS
@@ -290,6 +311,10 @@ impl EncoderApi for AomEncoder {
         c.rc_min_quantizer = q_min;
         c.rc_max_quantizer = q_max;
         c.rc_target_bitrate = Self::bitrate(self.width as _, self.height as _, ratio);
+        log::info!(
+            "fgtw-diag: AV1 set_quality ratio={ratio} -> q_min={q_min} q_max={q_max} bitrate={}kbps",
+            c.rc_target_bitrate
+        );
         call_aom!(aom_codec_enc_config_set(&mut self.ctx, &c));
         Ok(())
     }
