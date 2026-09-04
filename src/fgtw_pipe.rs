@@ -1,22 +1,16 @@
 //! Fleet-native transport: RustDesk's byte stream over the fgtw relay pipe.
 //!
 //! For a fleet pair that can't hole-punch (asymmetric NAT, different LANs — the common case,
-//! and the exact case rs-ny now refuses to broker), this replaces the rendezvous server AND
-//! the rustdesk relay with the fgtw seed's live WebSocket pipe. We address the peer by its
-//! fleet **device pubkey**, not an IP, so nothing has to introduce us.
+//! and the exact case rs-ny now refuses to broker), this replaces the rendezvous server AND the rustdesk relay with the fgtw seed's live WebSocket pipe. We address the peer by its fleet **device pubkey**, not an IP, so nothing has to introduce us.
 //!
 //! # Shape
 //!
 //! One [`PipeClient`] per process holds the `wss://<seed>/pipe?dev=<self>&svc=rd` socket. The
-//! `svc=rd` tag gives the fork its own hub on the seed, separate from photon's pipe on the
-//! same device key — so photon restarting (e.g. being updated *by* a rustdesk session) never
-//! drops our pipe. Each logical connection is a [`RelayStream`] keyed by a random 16-byte
+//! `svc=rd` tag gives the fork its own hub on the seed, separate from photon's pipe on the same device key — so photon restarting (e.g. being updated *by* a rustdesk session) never drops our pipe. Each logical connection is a [`RelayStream`] keyed by a random 16-byte
 //! `conn` id: it implements `AsyncRead + AsyncWrite`, so it wraps into `hbb_common::Stream`
-//! exactly like the KCP path (`kcp_stream.rs`), and every layer above — rustdesk's own
-//! encryption, the fgtw passless handshake — rides on top unchanged.
+//! exactly like the KCP path (`kcp_stream.rs`), and every layer above — rustdesk's own encryption, the fgtw passless handshake — rides on top unchanged.
 //!
-//! Outbound bytes are chunked into [`fgtw::pipe::RdFrame`]s, each sealed in a signed relay
-//! envelope addressed to the peer device, pushed up the pipe. Inbound envelopes are peeled,
+//! Outbound bytes are chunked into [`fgtw::pipe::RdFrame`]s, each sealed in a signed relay envelope addressed to the peer device, pushed up the pipe. Inbound envelopes are peeled,
 //! demuxed by `conn`, and their bytes served to the matching `RelayStream`'s reader.
 
 #![cfg(feature = "fgtw")]
@@ -43,8 +37,7 @@ use fgtw::pipe::{
     build_relay_envelope, peel_relay_envelope, RdFrame, RD_FLAG_FIN, RD_FLAG_SYN, SVC_RUSTDESK,
 };
 
-/// Max stream bytes per relay frame. Well under the worker's 1 MiB envelope cap, small enough
-/// to keep per-frame latency low on the video path.
+/// Max stream bytes per relay frame. Well under the worker's 1 MiB envelope cap, small enough to keep per-frame latency low on the video path.
 const CHUNK: usize = 60 * 1024;
 
 /// Seed host (no scheme). Derived from the same `fgtw-url` option the rest of the fork uses.
@@ -78,8 +71,7 @@ pub struct PipeClient {
 
 static CLIENT: OnceLock<ResultType<Arc<PipeClient>>> = OnceLock::new();
 
-/// The process-wide pipe client, connecting on first use. `Err` if we're not enrolled or the
-/// pipe can't be established — the caller falls back to the rendezvous path.
+/// The process-wide pipe client, connecting on first use. `Err` if we're not enrolled or the pipe can't be established — the caller falls back to the rendezvous path.
 pub fn client() -> ResultType<Arc<PipeClient>> {
     // OnceLock can't hold a retryable Result cleanly; keep it simple — one attempt per process,
     // the connection task self-heals with reconnect once it exists.
@@ -101,8 +93,7 @@ impl PipeClient {
         let self_pk = device_key.public.to_bytes();
         let host = seed_host();
         let router2 = router.clone();
-        // The pump lives on rustdesk's tokio runtime. spawn requires being inside it; the
-        // connect callers (Client::_start, fleet_server) are async, so a handle exists.
+        // The pump lives on rustdesk's tokio runtime. spawn requires being inside it; the connect callers (Client::_start, fleet_server) are async, so a handle exists.
         tokio::spawn(async move {
             pump(host, self_pk, out_rx, router2).await;
         });
@@ -148,8 +139,7 @@ impl PipeClient {
     }
 }
 
-/// A per-connection id. Random, but the socket entropy varies it by peer so two dials never
-/// collide even without an RNG dependency here (peer key + a monotonic salt).
+/// A per-connection id. Random, but the socket entropy varies it by peer so two dials never collide even without an RNG dependency here (peer key + a monotonic salt).
 fn new_conn_id(peer: &[u8; 32]) -> ConnId {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SALT: AtomicU64 = AtomicU64::new(0);
@@ -332,8 +322,7 @@ impl AsyncWrite for RelayStream {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        // Chunk the write; each chunk is one sealed frame up the pipe. Unbounded sink, so this
-        // never blocks (relay bandwidth backpressure is a later concern).
+        // Chunk the write; each chunk is one sealed frame up the pipe. Unbounded sink, so this never blocks (relay bandwidth backpressure is a later concern).
         let mut sent = 0;
         while sent < buf.len() {
             let end = (sent + CHUNK).min(buf.len());
@@ -370,5 +359,100 @@ impl AsyncWrite for RelayStream {
         let _ = self.client.send_frame(&peer, &fin);
         self.tx_seq += 1;
         Poll::Ready(Ok(()))
+    }
+}
+
+// ── connect seam (guest side) ──
+
+use hbb_common::{
+    bytes_codec::BytesCodec,
+    config::Config,
+    tcp::{DynTcpStream, FramedStream},
+    tokio_util::codec::Framed,
+    Stream,
+};
+use crate::client::Client;
+use crate::kcp_stream::KcpStream;
+
+/// True when the fleet-native path should be attempted: enrolled, and not disabled by option.
+pub fn enabled() -> bool {
+    crate::fgtw_auth::is_enrolled() && Config::get_option("enable-fgtw-native") != "N"
+}
+
+/// Debug switch: when `Y`, a fleet-native failure is fatal instead of falling back to rendezvous — so a broken native path is loud, not silently masked.
+pub fn native_only() -> bool {
+    Config::get_option("fgtw-native-only") == "Y"
+}
+
+/// Wrap a `RelayStream` (AsyncRead+AsyncWrite) into `hbb_common::Stream`, exactly the shape `kcp_stream::create_framed` produces — so the whole rustdesk protocol runs over it unchanged.
+fn wrap(relay: RelayStream) -> Stream {
+    Stream::Tcp(FramedStream(
+        Framed::new(DynTcpStream(Box::new(relay)), BytesCodec::new()),
+        Config::get_any_listen_addr(true),
+        None,
+        0,
+    ))
+}
+
+/// Connect to a fleet peer over the relay pipe and run the passless handshake.
+/// Returns `Client::start`'s tuple so the caller's contract is byte-identical: direct=true (no relay-server hop from rustdesk's point of view), the host's identity pk, no KCP guard, label "FGTW".
+/// `Err` means "not a fleet peer" or the pipe/handshake failed — the caller falls back to rendezvous.
+pub async fn connect(
+    peer_id: &str,
+    _key: &str,
+) -> ResultType<(Stream, bool, Option<Vec<u8>>, Option<KcpStream>, &'static str)> {
+    let id = peer_id.to_string();
+    let device = tokio::task::spawn_blocking(move || crate::fgtw_auth::device_for_rustdesk_id(&id))
+        .await
+        .map_err(|e| anyhow!("fleet lookup join: {e}"))?
+        .ok_or_else(|| anyhow!("{peer_id} is not a fleet peer with a published id"))?;
+    let client = client()?;
+    let relay = client.open(device);
+    let mut conn = wrap(relay);
+    let pk = Client::secure_connection_fleet(peer_id, &mut conn).await?;
+    Ok((conn, true, pk, None, "FGTW"))
+}
+
+// ── accept seam (host side) ──
+
+use crate::server::{ConnectionMeta, ServerPtr};
+
+/// Host side: accept inbound fleet connections off the relay pipe and hand each to the normal connection path with `secure=true` — which makes the host send its `SignedId`, the basis of the passless handshake.
+/// Spawned beside `direct_server`; re-acquires the accept channel if the pipe resets.
+pub async fn fleet_server(server: ServerPtr) {
+    loop {
+        if !enabled() {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            continue;
+        }
+        let client = match client() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("fgtw fleet server: pipe unavailable ({e}); retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+        let mut rx = client.accept_channel();
+        log::info!("fgtw fleet server: accepting relay connections");
+        while let Some((relay, _peer_device)) = rx.recv().await {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let addr = Config::get_any_listen_addr(true);
+                let stream = wrap(relay);
+                if let Err(e) = crate::server::create_tcp_connection(
+                    server,
+                    stream,
+                    addr,
+                    true, // secure: the host must send its SignedId for the fleet handshake
+                    ConnectionMeta::default(),
+                )
+                .await
+                {
+                    log::warn!("fgtw fleet accept failed: {e}");
+                }
+            });
+        }
+        log::warn!("fgtw fleet server: accept channel closed; re-acquiring");
     }
 }

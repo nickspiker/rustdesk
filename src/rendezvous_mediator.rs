@@ -135,6 +135,14 @@ impl RendezvousMediator {
         tokio::spawn(async move {
             direct_server(server_cloned).await;
         });
+        // fgtw fork: accept inbound fleet connections over the relay pipe, beside the direct server.
+        #[cfg(feature = "fgtw")]
+        {
+            let server_cloned = server.clone();
+            tokio::spawn(async move {
+                crate::fgtw_pipe::fleet_server(server_cloned).await;
+            });
+        }
         #[cfg(target_os = "android")]
         let start_lan_listening = true;
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
