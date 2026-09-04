@@ -124,11 +124,15 @@ impl PipeClient {
     }
 
     /// Open an outbound stream to a fleet peer device (guest side).
+    /// Fires an opening SYN immediately: the guest's first protocol act is to READ (wait for the host's SignedId), so without this the host would never learn a connection had started and never send it — an 18s deadlock.
     pub fn open(self: &Arc<Self>, peer: [u8; 32]) -> RelayStream {
         let conn = new_conn_id(&peer);
         let (in_tx, in_rx) = mpsc::unbounded_channel::<RdFrame>();
         self.register(conn, in_tx);
-        RelayStream::new(self.clone(), peer, conn, in_rx, true)
+        let syn = RdFrame { conn, seq: 0, flags: RD_FLAG_SYN, data: Vec::new() };
+        let _ = self.send_frame(&peer, &syn);
+        // tx_seq starts at 1 — the SYN above took seq 0.
+        RelayStream::new(self.clone(), peer, conn, in_rx, 1)
     }
 
     /// Host side: yield inbound connections as peers dial us. One receiver per process.
@@ -226,7 +230,7 @@ fn route_inbound(router: &Arc<Router>, data: &[u8]) {
             router.streams.lock().unwrap().insert(conn, in_tx);
             // The accepted stream needs a client handle to send replies; fetch the process one.
             if let Ok(client) = client() {
-                let stream = RelayStream::new(client, sender_device, conn, in_rx, false);
+                let stream = RelayStream::new(client, sender_device, conn, in_rx, 0);
                 let _ = accept_tx.send((stream, sender_device));
             } else {
                 router.streams.lock().unwrap().remove(&conn);
@@ -249,8 +253,6 @@ pub struct RelayStream {
     read_buf: BytesMut,
     /// Outbound sequence (monotonic per connection).
     tx_seq: u64,
-    /// Whether the next outbound frame must carry SYN (guest's first send).
-    need_syn: bool,
     /// Peer sent FIN — reads drain then EOF.
     peer_finished: bool,
 }
@@ -261,7 +263,7 @@ impl RelayStream {
         peer: [u8; 32],
         conn: ConnId,
         in_rx: mpsc::UnboundedReceiver<RdFrame>,
-        is_guest: bool,
+        start_seq: u64,
     ) -> Self {
         Self {
             client,
@@ -269,8 +271,7 @@ impl RelayStream {
             conn,
             in_rx,
             read_buf: BytesMut::new(),
-            tx_seq: 0,
-            need_syn: is_guest,
+            tx_seq: start_seq,
             peer_finished: false,
         }
     }
@@ -326,19 +327,17 @@ impl AsyncWrite for RelayStream {
         let mut sent = 0;
         while sent < buf.len() {
             let end = (sent + CHUNK).min(buf.len());
-            let flags = if self.need_syn { RD_FLAG_SYN } else { 0 };
             let seq = self.tx_seq;
             let frame = RdFrame {
                 conn: self.conn,
                 seq,
-                flags,
+                flags: 0,
                 data: buf[sent..end].to_vec(),
             };
             if let Err(e) = self.client.send_frame(&self.peer, &frame) {
                 return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string())));
             }
             self.tx_seq += 1;
-            self.need_syn = false;
             sent = end;
         }
         Poll::Ready(Ok(buf.len()))
