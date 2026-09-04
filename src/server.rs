@@ -234,6 +234,7 @@ pub async fn create_tcp_connection(
                 if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
                     if let Some(message::Union::PublicKey(pk)) = msg_in.union {
                         if pk.asymmetric_value.len() == box_::PUBLICKEYBYTES {
+                            log::info!("fgtw-trace host DH our_box={:02x?} guest_box={:02x?}", &our_pk_b.0[..4], &pk.asymmetric_value[..4]);
                             stream.set_key(tcp::Encrypt::decode(
                                 &pk.symmetric_value,
                                 &pk.asymmetric_value,

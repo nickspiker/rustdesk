@@ -115,6 +115,7 @@ impl PipeClient {
 
     /// Seal one frame to `peer` and push it up the pipe.
     fn send_frame(&self, peer: &[u8; 32], frame: &RdFrame) -> ResultType<()> {
+        log::debug!("fgtw-trace SEND conn={:02x?} seq={} flags={} len={} to={:02x?}", &frame.conn[..4], frame.seq, frame.flags, frame.data.len(), &peer[..4]);
         let env = build_relay_envelope(&self.device_key, peer, Some(SVC_RUSTDESK), &frame.encode())
             .map_err(|e| anyhow!("relay envelope: {e}"))?;
         self.out_tx
@@ -129,6 +130,7 @@ impl PipeClient {
         let conn = new_conn_id(&peer);
         let (in_tx, in_rx) = mpsc::unbounded_channel::<RdFrame>();
         self.register(conn, in_tx);
+        log::info!("fgtw-trace OPEN conn={:02x?} to={:02x?}", &conn[..4], &peer[..4]);
         let syn = RdFrame { conn, seq: 0, flags: RD_FLAG_SYN, data: Vec::new() };
         let _ = self.send_frame(&peer, &syn);
         // tx_seq starts at 1 — the SYN above took seq 0.
@@ -216,6 +218,7 @@ fn route_inbound(router: &Arc<Router>, data: &[u8]) {
         return;
     };
     let conn = frame.conn;
+    log::debug!("fgtw-trace RECV conn={:02x?} seq={} flags={} len={} from={:02x?}", &conn[..4], frame.seq, frame.flags, frame.data.len(), &sender_device[..4]);
     // Existing stream? deliver.
     if let Some(tx) = router.streams.lock().unwrap().get(&conn) {
         let _ = tx.send(frame);
@@ -230,6 +233,7 @@ fn route_inbound(router: &Arc<Router>, data: &[u8]) {
             router.streams.lock().unwrap().insert(conn, in_tx);
             // The accepted stream needs a client handle to send replies; fetch the process one.
             if let Ok(client) = client() {
+                log::info!("fgtw-trace ACCEPT conn={:02x?} from={:02x?}", &conn[..4], &sender_device[..4]);
                 let stream = RelayStream::new(client, sender_device, conn, in_rx, 0);
                 let _ = accept_tx.send((stream, sender_device));
             } else {
@@ -238,6 +242,9 @@ fn route_inbound(router: &Arc<Router>, data: &[u8]) {
         }
     }
     // Unknown conn, not SYN: a straggler for a closed stream — drop.
+    else {
+        log::info!("fgtw-trace DROP conn={:02x?} seq={} flags={} — no stream", &conn[..4], frame.seq, frame.flags);
+    }
 }
 
 // ── the stream ──
