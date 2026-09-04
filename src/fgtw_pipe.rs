@@ -34,13 +34,18 @@ use hbb_common::{
 
 use fgtw::keys::Keypair;
 use fgtw::pipe::{
-    build_relay_envelope, peel_relay_envelope, RdFrame, RD_FLAG_FIN, RD_FLAG_SYN, SVC_RUSTDESK,
+    build_relay_envelope, peel_relay_envelope, RdFrame, RD_FLAG_FIN, RD_FLAG_NACK, RD_FLAG_SYN,
+    SVC_RUSTDESK,
 };
 
 /// Max stream bytes per relay frame. Well under the worker's 1 MiB envelope cap, small enough to keep per-frame latency low on the video path.
 const CHUNK: usize = 60 * 1024;
-/// How long to wait for a missing frame before declaring the stream lost. Long enough to cover genuine cross-hub reordering, short enough that a hung video feed becomes a reconnect instead of a black screen.
+/// How long to wait for a missing frame before declaring the stream lost. Long enough for a NACK to be answered twice over, short enough that an unrecoverable feed becomes a reconnect instead of a black screen.
 const GAP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
+/// How often to re-ask for a missing frame while the gap persists.
+const NACK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+/// Frames kept for retransmission. The pipe only loses frames while a peer's socket is reconnecting, so this needs to cover that blip, not a real network backlog.
+const RESEND_WINDOW: usize = 512;
 
 /// Seed host (no scheme). Derived from the same `fgtw-url` option the rest of the fork uses.
 fn seed_host() -> String {
@@ -273,6 +278,10 @@ pub struct RelayStream {
     rx_next: u64,
     /// Inbound frames that arrived ahead of `rx_next`, held until the gap fills.
     reorder: std::collections::BTreeMap<u64, RdFrame>,
+    /// Recently sent frames, kept so a peer that missed one can ask for it again.
+    sent_window: std::collections::BTreeMap<u64, RdFrame>,
+    /// When we last asked for the frame we are stuck on.
+    last_nack: Option<std::time::Instant>,
     /// When the current gap first blocked delivery. The relay has NO retransmission — a frame lost while a pipe reconnects is gone for good — so a gap that never fills would stall this stream forever (video simply hangs). The encrypted stream cannot skip a message either, because its nonce is a strict counter, so the only honest move is to fail the connection and let rustdesk reconnect.
     gap_since: Option<std::time::Instant>,
     /// Peer sent FIN — reads drain then EOF.
@@ -296,6 +305,8 @@ impl RelayStream {
             tx_seq: start_seq,
             rx_next: 0,
             reorder: std::collections::BTreeMap::new(),
+            sent_window: std::collections::BTreeMap::new(),
+            last_nack: None,
             gap_since: None,
             peer_finished: false,
         }
@@ -311,6 +322,7 @@ impl RelayStream {
         }
         self.rx_next += 1;
         self.gap_since = None;
+        self.last_nack = None;
     }
 }
 
@@ -343,13 +355,21 @@ impl AsyncRead for RelayStream {
                 self.consume(frame);
                 continue;
             }
-            // A gap that never fills means a frame was lost for good; stall-forever is the
-            // worst outcome, so give up and let the session reconnect.
+            // Stuck behind a missing frame: ask the peer to send it again. The relay drops
+            // anything in flight while a socket reconnects, and that is the only loss we see,
+            // so a re-ask almost always fills the gap within a round trip.
             if !self.reorder.is_empty() {
                 let waited = self
                     .gap_since
                     .get_or_insert_with(std::time::Instant::now)
                     .elapsed();
+                let due = self.last_nack.map_or(true, |t| t.elapsed() >= NACK_INTERVAL);
+                if due && waited <= GAP_TIMEOUT {
+                    let (conn, peer, want) = (self.conn, self.peer, self.rx_next);
+                    let nack = RdFrame { conn, seq: want, flags: RD_FLAG_NACK, data: Vec::new() };
+                    let _ = self.client.send_frame(&peer, &nack);
+                    self.last_nack = Some(std::time::Instant::now());
+                }
                 if waited > GAP_TIMEOUT {
                     log::warn!(
                         "fgtw pipe: frame {} never arrived ({} held behind it) — dropping the connection to reconnect",
@@ -364,6 +384,20 @@ impl AsyncRead for RelayStream {
             }
             match self.in_rx.poll_recv(cx) {
                 Poll::Ready(Some(frame)) => {
+                    // A retransmit request rides the same stream; answer it and keep reading.
+                    if frame.flags & RD_FLAG_NACK != 0 {
+                        let (peer, want) = (self.peer, frame.seq);
+                        match self.sent_window.get(&want).cloned() {
+                            Some(again) => {
+                                log::info!("fgtw pipe: resending frame {want} on request");
+                                let _ = self.client.send_frame(&peer, &again);
+                            }
+                            None => log::warn!(
+                                "fgtw pipe: peer wants frame {want}, no longer in the resend window"
+                            ),
+                        }
+                        continue;
+                    }
                     use std::cmp::Ordering;
                     match frame.seq.cmp(&self.rx_next) {
                         // The frame we were waiting for — fold it, then the loop drains any
@@ -403,6 +437,12 @@ impl AsyncWrite for RelayStream {
             };
             if let Err(e) = self.client.send_frame(&self.peer, &frame) {
                 return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string())));
+            }
+            // Hold it briefly in case the peer's socket was mid-reconnect and missed it.
+            self.sent_window.insert(seq, frame);
+            while self.sent_window.len() > RESEND_WINDOW {
+                let oldest = *self.sent_window.keys().next().unwrap_or(&0);
+                self.sent_window.remove(&oldest);
             }
             self.tx_seq += 1;
             sent = end;
