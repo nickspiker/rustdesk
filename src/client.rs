@@ -1843,6 +1843,8 @@ pub struct LoginConfigHandler {
     pub save_ab_password_to_recent: bool, // true: connected with ab password
     pub other_server: Option<(String, String, String)>,
     pub custom_fps: Arc<Mutex<Option<usize>>>,
+    /// fgtw fork: the guest window size to request at login (set by the viewer before connect).
+    pub fgtw_desired_resolution: Arc<Mutex<Option<(i32, i32)>>>,
     pub last_auto_fps: Option<usize>,
     pub adapter_luid: Option<i64>,
     pub mark_unsupported: Vec<CodecFormat>,
@@ -2334,6 +2336,17 @@ impl LoginConfigHandler {
             } else {
                 return None;
             }
+        }
+        // fgtw fork: ask for our window size up front so the host is already at it when video
+        // starts — set-then-stream, instead of streaming wrong-sized frames and following after.
+        if let Some((w, h)) = *self.fgtw_desired_resolution.lock().unwrap() {
+            msg.custom_resolution = hbb_common::protobuf::MessageField::some(
+                hbb_common::message_proto::Resolution {
+                    width: w,
+                    height: h,
+                    ..Default::default()
+                },
+            );
         }
         let q = self.image_quality.clone();
         if let Some(q) = self.get_image_quality_enum(&q, ignore_default) {

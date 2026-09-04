@@ -828,6 +828,18 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
         .unwrap()
         .initialize(id, conn_type, None, force_relay, None, None, None);
 
+    // State our target size BEFORE the io_loop logs in: the window opens at the monitor size
+    // (see initial_size), so the host can reach that resolution before its video service
+    // starts. Without this the host streams at whatever size it happens to be, the guest
+    // draws those frames honestly 1:1 (tiny), and the follow only corrects it afterwards.
+    if let Ok(d) = scrap::Display::primary() {
+        let (w, h) = (d.width() as i32, d.height() as i32);
+        if w > 0 && h > 0 {
+            log::info!("fluor: requesting {w}x{h} at login (our monitor size)");
+            *session.lc.read().unwrap().fgtw_desired_resolution.lock().unwrap() = Some((w, h));
+        }
+    }
+
     let shared = session.ui_handler.shared.clone();
 
     let io = session.clone();

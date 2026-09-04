@@ -4459,6 +4459,17 @@ impl Connection {
 
     async fn update_options(&mut self, o: &OptionMessage) {
         log::info!("Option update: {:?}", o);
+        // fgtw fork: the guest states its window size at LOGIN, so reach that size here —
+        // before the video service starts — instead of streaming wrong-sized frames and
+        // letting the guest follow afterwards (which showed a tiny image, then restarted the
+        // capturer on every follow retry).
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Some(r) = o.custom_resolution.as_ref() {
+            if r.width > 0 && r.height > 0 && !self.view_camera {
+                log::info!("fgtw follow: login asked for {}x{}", r.width, r.height);
+                self.change_resolution(None, r);
+            }
+        }
         if let Ok(q) = o.image_quality.enum_value() {
             let image_quality;
             if let ImageQuality::NotSet = q {
