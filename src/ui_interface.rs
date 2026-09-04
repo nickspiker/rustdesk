@@ -850,14 +850,22 @@ pub fn refresh_fleet_peers() {
         let rows = match crate::fgtw_auth::fleet_roster() {
             Ok(devices) => devices
                 .into_iter()
-                .filter(|d| !d.is_self)
                 .map(|d| {
+                    // This machine stays in the list so the count matches photon's Fleet page
+                    // (it was silently dropped, which read as a device having gone missing).
+                    // It carries no id: connecting to yourself is meaningless, and an empty id
+                    // is already what the tile renders as unreachable.
+                    let (id, alias) = if d.is_self {
+                        (String::new(), format!("{} (this device)", d.name))
+                    } else {
+                        (d.rustdesk_id.unwrap_or_default(), d.name)
+                    };
                     HashMap::<&str, String>::from_iter([
-                        ("id", d.rustdesk_id.unwrap_or_default()),
+                        ("id", id),
                         ("username", String::new()),
                         ("hostname", String::new()),
                         ("platform", String::new()),
-                        ("alias", d.name),
+                        ("alias", alias),
                     ])
                 })
                 .collect(),

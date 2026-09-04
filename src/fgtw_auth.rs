@@ -305,6 +305,20 @@ fn current_fleet(state: &EnrollState) -> Result<Vec<[u8; 32]>, String> {
 
 /// Settings key under which a device publishes its RustDesk ID in its own device map.
 const SETTING_RUSTDESK_ID: &str = "rustdesk.id";
+/// Photon's per-device display name, keyed `fleet.name.<pubkey hex>` in the fleet-global layer.
+const SETTING_NAME_PREFIX: &str = "fleet.name.";
+
+/// 64 hex chars back to a device pubkey; `None` for anything malformed.
+fn decode_pubkey_hex(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
 
 /// Fleet-state AEAD, wire-compatible with photon's `kete`: `random 24-byte nonce ‖
 /// XChaCha20-Poly1305 ct` since the 2026-08-18 stack-wide migration, so rustdesk and photon
@@ -462,12 +476,27 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
     let members = current_fleet(&state)?;
     let me = device_keypair().map(|k| k.public.to_bytes()).ok();
     // ID map is best-effort: an unreachable slot or missing wrap degrades to names-only.
-    let ids: HashMap<[u8; 32], String> = (|| -> Result<_, String> {
+    let (ids, names): (HashMap<[u8; 32], String>, HashMap<[u8; 32], String>) = (|| -> Result<_, String> {
         let t = RdTransport::auth();
         let key = fleet_key(&t, &state)?;
         let fs = fgtw::client::pull_fstate(&t, &RdSealer, &state.handle_proof, &key)?
             .unwrap_or_default();
-        Ok(fs
+        // Names the user set in photon's Fleet page. Photon writes `fleet.name.<pkhex>` as a
+        // fleet-LINKED setting, so the value lives in the fleet-global layer, not the authoring
+        // device's own map. Same blob we already fetched for the ids — no extra round trip.
+        let names = fs
+            .global_settings
+            .iter()
+            .filter_map(|e| {
+                let hex = e.key.strip_prefix(SETTING_NAME_PREFIX)?;
+                let raw = decode_pubkey_hex(hex)?;
+                match &e.value {
+                    VsfType::x(n) if !n.trim().is_empty() => Some((raw, n.trim().to_owned())),
+                    _ => None,
+                }
+            })
+            .collect();
+        let ids = fs
             .device_settings
             .into_iter()
             .filter_map(|d| {
@@ -481,17 +510,22 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
                     })
                     .map(|id| (d.device_pubkey, id))
             })
-            .collect())
+            .collect();
+        Ok((ids, names))
     })()
     .unwrap_or_else(|e| {
         log::warn!("fgtw: fleet id map unavailable ({e}); chooser degrades to names-only");
-        HashMap::new()
+        (HashMap::new(), HashMap::new())
     });
     Ok(members
         .iter()
         .map(|m| FleetDevice {
             pubkey: *m,
-            name: fgtw::pair::device_name_default(m, &state.identity_seed),
+            // The name the user set in photon wins; the deterministic two-word default is the fallback.
+            name: names
+                .get(m)
+                .cloned()
+                .unwrap_or_else(|| fgtw::pair::device_name_default(m, &state.identity_seed)),
             rustdesk_id: ids.get(m).cloned(),
             is_self: me == Some(*m),
         })
