@@ -238,6 +238,8 @@ const FOLLOW_DEBOUNCE: Duration = Duration::from_millis(300);
 /// re-send it. Makes the follow self-healing against a dropped/ignored request (host restart,
 /// reconnect blip) instead of the old fire-once-and-hope that left the crop stuck forever.
 const FOLLOW_RETRY: Duration = Duration::from_millis(1200);
+/// Retries per target before we stop asking. Each request restarts the host's capturer, so an unreachable size must not be retried forever.
+const FOLLOW_MAX_TRIES: u32 = 5;
 
 /// Visible-RGB → fluor's α+darkness packing (same as on_rgba / opsin's `argb`). Const so HUD
 /// colours are compile-time.
@@ -264,6 +266,7 @@ struct FluorViewer {
     //    the frame fills the window 1:1 (no scaling) and the mouse maps by identity ──
     follow_target: (i32, i32), // most recent window backing size seen
     follow_at: Option<Instant>, // when the debounce elapses and we send the follow
+    follow_tries: u32,          // retries spent on the CURRENT target (reset when the target moves)
     /// Cursor derived from the last raw CursorMoved (raw − window_origin, pass-0 px). Used by
     /// MouseInput (which carries no position) and as the send_move source.
     last_cursor: (Coord, Coord),
@@ -339,11 +342,13 @@ impl FluorViewer {
         if (fw as i32, fh as i32) == target {
             self.follow_at = None;
             self.follow_target = target;
+            self.follow_tries = 0;
             return false;
         }
         // Window size changed — (re)start the debounce so dragging doesn't spam requests.
         if target != self.follow_target {
             self.follow_target = target;
+            self.follow_tries = 0;
             self.follow_at = Some(Instant::now() + FOLLOW_DEBOUNCE);
             return true;
         }
@@ -351,14 +356,28 @@ impl FluorViewer {
         // Self-healing: keep asking until the frame actually becomes `target`. The old code sent
         // ONCE and marked success — so a single dropped request (host restarting mid-send, a
         // reconnect blip) left the crop forever. Now a lost request just retries next tick.
+        // Give up after FOLLOW_MAX_TRIES on one target. Retrying forever is worse than not
+        // following: every request restarts the host's capturer, so a host that cannot reach
+        // this size gets thrashed into sending nothing at all (the black screen). Stopping
+        // leaves the last good frame drawn 1:1 and centred — small, but honest and alive.
+        if self.follow_tries >= FOLLOW_MAX_TRIES {
+            return false;
+        }
         let due = self.follow_at.map_or(true, |t| Instant::now() >= t);
         if due {
+            self.follow_tries += 1;
             let idx = *self.shared.display_idx.lock().unwrap();
             log::info!(
                 "fgtw-diag: follow SEND change_resolution display={} {}x{} (frame is {fw}x{fh})",
                 idx, target.0, target.1
             );
             self.session.change_resolution(idx, target.0, target.1);
+            if self.follow_tries == FOLLOW_MAX_TRIES {
+                log::warn!(
+                    "fluor: host did not reach {}x{} after {} tries — leaving the frame 1:1 and centred",
+                    target.0, target.1, FOLLOW_MAX_TRIES
+                );
+            }
             self.follow_at = Some(Instant::now() + FOLLOW_RETRY);
         }
         true // keep ticking until frame == target
@@ -825,6 +844,7 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
         buttons: 0,
         last_seen_gen: 0,
         follow_target: (0, 0),
+        follow_tries: 0,
         follow_at: None,
         last_cursor: (0.0, 0.0),
         last_telemetry: None,

@@ -910,7 +910,6 @@ impl Client {
                         bail!("fgtw: could not build handshake payload (not enrolled?)");
                     }
                 }
-                log::info!("fgtw-trace guest DH host_box={:02x?} our_box={:02x?}", &their_pk_b[..4], &public_key.asymmetric_value[..4.min(public_key.asymmetric_value.len())]);
                 let mut msg_out = Message::new();
                 msg_out.set_public_key(public_key);
                 timeout(CONNECT_TIMEOUT, conn.send(&msg_out)).await??;

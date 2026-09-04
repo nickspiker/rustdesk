@@ -4377,16 +4377,38 @@ impl Connection {
                             (r.width, r.height),
                         );
                     }
-                    if let Err(e) =
-                        crate::platform::change_resolution(&name, r.width as _, r.height as _)
-                    {
-                        log::error!(
+                    // Verify, don't assume: the success path used to be silent, so a host that
+                    // never converged looked identical in the log to one that did — and the
+                    // guest just kept re-asking every retry tick, restarting the capturer each
+                    // time. Log both outcomes and name the size we actually landed on.
+                    match crate::platform::change_resolution(&name, r.width as _, r.height as _) {
+                        Ok(()) => {
+                            let now = crate::platform::current_resolution(&name).ok();
+                            let got = now.as_ref().map(|c| (c.width, c.height));
+                            if got == Some((r.width, r.height)) {
+                                log::info!(
+                                    "fgtw follow: '{}' now {}x{} — matches request",
+                                    &name,
+                                    r.width,
+                                    r.height
+                                );
+                            } else {
+                                log::warn!(
+                                    "fgtw follow: '{}' asked {}x{} but reads back {:?} — guest will keep retrying",
+                                    &name,
+                                    r.width,
+                                    r.height,
+                                    got
+                                );
+                            }
+                        }
+                        Err(e) => log::error!(
                             "Failed to change resolution '{}' to ({},{}): {:?}",
                             &name,
                             r.width,
                             r.height,
                             e
-                        );
+                        ),
                     }
                 }
             }
