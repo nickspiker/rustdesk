@@ -285,6 +285,22 @@ impl Client {
             ));
         }
 
+        // Fleet-native transport: if `peer` is a device in our fgtw fleet, connect over the seed's relay pipe — no rendezvous server, no rustdesk relay.
+        // This is the last point before anything rendezvous-shaped is built.
+        // Any failure logs and falls through to the ordinary path, unless `fgtw-native-only` is set (debug: make failures loud).
+        #[cfg(feature = "fgtw")]
+        if crate::fgtw_pipe::enabled() {
+            match crate::fgtw_pipe::connect(peer, key).await {
+                Ok(t) => return Ok((t, (0, String::new()), false)),
+                Err(e) => {
+                    if crate::fgtw_pipe::native_only() {
+                        bail!("fgtw-native connect failed (fgtw-native-only set): {e}");
+                    }
+                    log::info!("fgtw-native connect to {peer} unavailable ({e}); using rendezvous");
+                }
+            }
+        }
+
         let other_server = interface.get_lch().read().unwrap().other_server.clone();
         let (peer, other_server, key, token) = if let Some((a, b, c)) = other_server.as_ref() {
             (a.as_ref(), b.as_ref(), c.as_ref(), "")
@@ -851,6 +867,57 @@ impl Client {
             }
         }
         Ok(option_pk)
+    }
+
+    /// The fleet-native secure handshake: like [`Self::secure_connection`] but the host's identity is verified against the fgtw fleet fold instead of a rendezvous-server assertion.
+    /// The host still signs its `SignedId` with its device key (rustdesk sign key == fleet device key), so we read that off the wire and check it against current membership.
+    /// **Fails closed** — a host we can't place in the fleet is refused, and the caller falls back to the rendezvous path (which does its own verification).
+    #[cfg(feature = "fgtw")]
+    pub(crate) async fn secure_connection_fleet(
+        peer_id: &str,
+        conn: &mut Stream,
+    ) -> ResultType<Option<Vec<u8>>> {
+        match timeout(READ_TIMEOUT, conn.next()).await? {
+            Some(res) => {
+                let bytes = res?;
+                let msg_in = Message::parse_from_bytes(&bytes)?;
+                let Some(message::Union::SignedId(si)) = msg_in.union else {
+                    bail!("fgtw handshake: expected SignedId from host");
+                };
+                // Verify the host's SignedId against the current fleet fold; the member key that verifies it is the host's identity key.
+                let (id, their_pk_b, host_sign_pk) =
+                    crate::fgtw_auth::verify_host_signed_id(&si.id)
+                        .ok_or_else(|| anyhow!("fgtw: host SignedId is not from a current fleet member"))?;
+                if id != peer_id {
+                    bail!("fgtw: host id {id} does not match dialed peer {peer_id}");
+                }
+                let (asymmetric_value, symmetric_value, sym_key) =
+                    create_symmetric_key_msg(their_pk_b);
+                let mut public_key = PublicKey {
+                    asymmetric_value,
+                    symmetric_value,
+                    ..Default::default()
+                };
+                // Bind our box key to the host's identity key, same as the rendezvous path — this is what authorizes us into the host without a password.
+                if public_key.asymmetric_value.len() == 32 {
+                    let mut client_box_pk = [0u8; 32];
+                    client_box_pk.copy_from_slice(&public_key.asymmetric_value);
+                    if let Some(payload) =
+                        crate::fgtw_auth::build_hs_payload(&client_box_pk, &host_sign_pk)
+                    {
+                        public_key.fgtw = payload.into();
+                    } else {
+                        bail!("fgtw: could not build handshake payload (not enrolled?)");
+                    }
+                }
+                let mut msg_out = Message::new();
+                msg_out.set_public_key(public_key);
+                timeout(CONNECT_TIMEOUT, conn.send(&msg_out)).await??;
+                conn.set_key(sym_key);
+                Ok(Some(host_sign_pk.to_vec()))
+            }
+            None => bail!("fgtw handshake: reset by the peer"),
+        }
     }
 
     /// Request a relay connection to the server.

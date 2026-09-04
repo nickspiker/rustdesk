@@ -446,6 +446,17 @@ pub struct FleetDevice {
 /// The current fleet as a chooser list: every member (fresh fold, cache fallback within
 /// bound) with its fleet-scoped name and, where published, its RustDesk ID. Liveness is the
 /// rendezvous server's job — hand `rustdesk_id` to the normal connect path.
+/// Reverse-map a peer's RustDesk id to its fleet device pubkey, for the relay-pipe transport.
+/// Blocking (folds the fleet + pulls the id map); the caller runs it off the async runtime.
+/// `None` when we're not enrolled, the peer isn't in the fleet, or hasn't published an id yet.
+pub fn device_for_rustdesk_id(id: &str) -> Option<[u8; 32]> {
+    fleet_roster()
+        .ok()?
+        .into_iter()
+        .find(|d| !d.is_self && d.rustdesk_id.as_deref() == Some(id))
+        .map(|d| d.pubkey)
+}
+
 pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
     let state = EnrollState::load().ok_or("not enrolled")?;
     let members = current_fleet(&state)?;
