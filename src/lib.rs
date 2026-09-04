@@ -39,6 +39,8 @@ use common::*;
 mod auth_2fa;
 #[cfg(feature = "fgtw")]
 pub mod fgtw_auth;
+#[cfg(feature = "fgtw")]
+pub mod fgtw_pipe;
 #[cfg(feature = "fluor-viewer")]
 pub mod fluor_remote;
 #[cfg(not(target_os = "ios"))]

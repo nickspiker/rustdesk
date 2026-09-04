@@ -1,0 +1,374 @@
+//! Fleet-native transport: RustDesk's byte stream over the fgtw relay pipe.
+//!
+//! For a fleet pair that can't hole-punch (asymmetric NAT, different LANs — the common case,
+//! and the exact case rs-ny now refuses to broker), this replaces the rendezvous server AND
+//! the rustdesk relay with the fgtw seed's live WebSocket pipe. We address the peer by its
+//! fleet **device pubkey**, not an IP, so nothing has to introduce us.
+//!
+//! # Shape
+//!
+//! One [`PipeClient`] per process holds the `wss://<seed>/pipe?dev=<self>&svc=rd` socket. The
+//! `svc=rd` tag gives the fork its own hub on the seed, separate from photon's pipe on the
+//! same device key — so photon restarting (e.g. being updated *by* a rustdesk session) never
+//! drops our pipe. Each logical connection is a [`RelayStream`] keyed by a random 16-byte
+//! `conn` id: it implements `AsyncRead + AsyncWrite`, so it wraps into `hbb_common::Stream`
+//! exactly like the KCP path (`kcp_stream.rs`), and every layer above — rustdesk's own
+//! encryption, the fgtw passless handshake — rides on top unchanged.
+//!
+//! Outbound bytes are chunked into [`fgtw::pipe::RdFrame`]s, each sealed in a signed relay
+//! envelope addressed to the peer device, pushed up the pipe. Inbound envelopes are peeled,
+//! demuxed by `conn`, and their bytes served to the matching `RelayStream`'s reader.
+
+#![cfg(feature = "fgtw")]
+
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
+
+use hbb_common::{
+    anyhow::anyhow,
+    bytes::BytesMut,
+    log,
+    tokio::{
+        self,
+        io::{AsyncRead, AsyncWrite, ReadBuf},
+        sync::mpsc,
+    },
+    ResultType,
+};
+
+use fgtw::keys::Keypair;
+use fgtw::pipe::{
+    build_relay_envelope, peel_relay_envelope, RdFrame, RD_FLAG_FIN, RD_FLAG_SYN, SVC_RUSTDESK,
+};
+
+/// Max stream bytes per relay frame. Well under the worker's 1 MiB envelope cap, small enough
+/// to keep per-frame latency low on the video path.
+const CHUNK: usize = 60 * 1024;
+
+/// Seed host (no scheme). Derived from the same `fgtw-url` option the rest of the fork uses.
+fn seed_host() -> String {
+    crate::fgtw_auth::fgtw_url()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+// ── the per-process pipe ──
+
+type ConnId = [u8; 16];
+
+/// Routes inbound frames to the right stream, and (host side) surfaces new connections.
+struct Router {
+    /// conn id → the reader half of that live stream.
+    streams: Mutex<HashMap<ConnId, mpsc::UnboundedSender<RdFrame>>>,
+    /// Host side: SYN for an unknown conn produces a freshly-accepted `RelayStream` here.
+    accept_tx: Mutex<Option<mpsc::UnboundedSender<(RelayStream, [u8; 32])>>>,
+}
+
+/// The live pipe. One per process, lazily built.
+pub struct PipeClient {
+    device_key: Arc<Keypair>,
+    /// Sink: already-built envelope bytes to push up the WebSocket.
+    out_tx: mpsc::UnboundedSender<Vec<u8>>,
+    router: Arc<Router>,
+}
+
+static CLIENT: OnceLock<ResultType<Arc<PipeClient>>> = OnceLock::new();
+
+/// The process-wide pipe client, connecting on first use. `Err` if we're not enrolled or the
+/// pipe can't be established — the caller falls back to the rendezvous path.
+pub fn client() -> ResultType<Arc<PipeClient>> {
+    // OnceLock can't hold a retryable Result cleanly; keep it simple — one attempt per process,
+    // the connection task self-heals with reconnect once it exists.
+    match CLIENT.get_or_init(PipeClient::connect) {
+        Ok(c) => Ok(c.clone()),
+        Err(e) => Err(anyhow!("fgtw pipe unavailable: {e}")),
+    }
+}
+
+impl PipeClient {
+    fn connect() -> ResultType<Arc<Self>> {
+        let kp = crate::fgtw_auth::device_keypair()?;
+        let device_key = Arc::new(kp);
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let router = Arc::new(Router {
+            streams: Mutex::new(HashMap::new()),
+            accept_tx: Mutex::new(None),
+        });
+        let self_pk = device_key.public.to_bytes();
+        let host = seed_host();
+        let router2 = router.clone();
+        // The pump lives on rustdesk's tokio runtime. spawn requires being inside it; the
+        // connect callers (Client::_start, fleet_server) are async, so a handle exists.
+        tokio::spawn(async move {
+            pump(host, self_pk, out_rx, router2).await;
+        });
+        Ok(Arc::new(Self {
+            device_key,
+            out_tx,
+            router,
+        }))
+    }
+
+    /// Register a stream's reader under `conn`.
+    fn register(&self, conn: ConnId, tx: mpsc::UnboundedSender<RdFrame>) {
+        self.router.streams.lock().unwrap().insert(conn, tx);
+    }
+
+    fn unregister(&self, conn: &ConnId) {
+        self.router.streams.lock().unwrap().remove(conn);
+    }
+
+    /// Seal one frame to `peer` and push it up the pipe.
+    fn send_frame(&self, peer: &[u8; 32], frame: &RdFrame) -> ResultType<()> {
+        let env = build_relay_envelope(&self.device_key, peer, Some(SVC_RUSTDESK), &frame.encode())
+            .map_err(|e| anyhow!("relay envelope: {e}"))?;
+        self.out_tx
+            .send(env)
+            .map_err(|_| anyhow!("pipe writer gone"))?;
+        Ok(())
+    }
+
+    /// Open an outbound stream to a fleet peer device (guest side).
+    pub fn open(self: &Arc<Self>, peer: [u8; 32]) -> RelayStream {
+        let conn = new_conn_id(&peer);
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<RdFrame>();
+        self.register(conn, in_tx);
+        RelayStream::new(self.clone(), peer, conn, in_rx, true)
+    }
+
+    /// Host side: yield inbound connections as peers dial us. One receiver per process.
+    pub fn accept_channel(&self) -> mpsc::UnboundedReceiver<(RelayStream, [u8; 32])> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.router.accept_tx.lock().unwrap() = Some(tx);
+        rx
+    }
+}
+
+/// A per-connection id. Random, but the socket entropy varies it by peer so two dials never
+/// collide even without an RNG dependency here (peer key + a monotonic salt).
+fn new_conn_id(peer: &[u8; 32]) -> ConnId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SALT: AtomicU64 = AtomicU64::new(0);
+    let salt = SALT.fetch_add(1, Ordering::Relaxed);
+    let t = vsf::eagle_time_oscillations() as u64;
+    let mut h = blake3::Hasher::new();
+    h.update(peer);
+    h.update(&salt.to_le_bytes());
+    h.update(&t.to_le_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    id
+}
+
+/// The socket pump: owns the WebSocket, reconnects with backoff, moves envelopes both ways.
+async fn pump(
+    host: String,
+    self_pk: [u8; 32],
+    mut out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    router: Arc<Router>,
+) {
+    use futures_util::{SinkExt, StreamExt};
+    use hbb_common::futures_util;
+    use tokio_tungstenite::tungstenite::Message as Ws;
+
+    let url = fgtw::pipe::pipe_url(&host, &self_pk, Some(SVC_RUSTDESK));
+    let mut backoff = 1u64;
+    loop {
+        match tokio_tungstenite::connect_async(&url).await {
+            Ok((ws, _)) => {
+                backoff = 1;
+                log::info!("fgtw pipe: connected ({url})");
+                let (mut sink, mut stream) = ws.split();
+                loop {
+                    tokio::select! {
+                        // Outbound: envelope → WS binary frame.
+                        out = out_rx.recv() => match out {
+                            Some(bytes) => {
+                                if sink.send(Ws::Binary(bytes.into())).await.is_err() {
+                                    log::warn!("fgtw pipe: send failed, reconnecting");
+                                    break;
+                                }
+                            }
+                            None => return, // client dropped; stop the pump
+                        },
+                        // Inbound: WS binary → peel → route.
+                        msg = stream.next() => match msg {
+                            Some(Ok(Ws::Binary(data))) => route_inbound(&router, &data),
+                            Some(Ok(Ws::Ping(_))) | Some(Ok(Ws::Pong(_))) => {}
+                            Some(Ok(_)) => {} // text/other: ignore
+                            Some(Err(e)) => { log::warn!("fgtw pipe: recv error {e}, reconnecting"); break; }
+                            None => { log::warn!("fgtw pipe: closed, reconnecting"); break; }
+                        },
+                    }
+                }
+            }
+            Err(e) => log::warn!("fgtw pipe: connect failed {e}, retrying in {backoff}s"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(30);
+    }
+}
+
+/// Peel one inbound envelope and hand its frame to the right stream (or accept a new one).
+fn route_inbound(router: &Arc<Router>, data: &[u8]) {
+    let Some((sender_device, inner)) = peel_relay_envelope(data) else {
+        return; // unverifiable/garbage — drop, never fault
+    };
+    let Some(frame) = RdFrame::decode(&inner) else {
+        return;
+    };
+    let conn = frame.conn;
+    // Existing stream? deliver.
+    if let Some(tx) = router.streams.lock().unwrap().get(&conn) {
+        let _ = tx.send(frame);
+        return;
+    }
+    // Unknown conn + SYN → a peer is dialing us (host side).
+    if frame.flags & RD_FLAG_SYN != 0 {
+        let accept = router.accept_tx.lock().unwrap().clone();
+        if let Some(accept_tx) = accept {
+            let (in_tx, in_rx) = mpsc::unbounded_channel::<RdFrame>();
+            let _ = in_tx.send(frame); // the SYN carries the first bytes
+            router.streams.lock().unwrap().insert(conn, in_tx);
+            // The accepted stream needs a client handle to send replies; fetch the process one.
+            if let Ok(client) = client() {
+                let stream = RelayStream::new(client, sender_device, conn, in_rx, false);
+                let _ = accept_tx.send((stream, sender_device));
+            } else {
+                router.streams.lock().unwrap().remove(&conn);
+            }
+        }
+    }
+    // Unknown conn, not SYN: a straggler for a closed stream — drop.
+}
+
+// ── the stream ──
+
+/// A logical byte stream over the pipe. `AsyncRead + AsyncWrite`, so it wraps into
+/// `hbb_common::Stream` like any socket.
+pub struct RelayStream {
+    client: Arc<PipeClient>,
+    peer: [u8; 32],
+    conn: ConnId,
+    in_rx: mpsc::UnboundedReceiver<RdFrame>,
+    /// Leftover payload from a partially-read frame.
+    read_buf: BytesMut,
+    /// Outbound sequence (monotonic per connection).
+    tx_seq: u64,
+    /// Whether the next outbound frame must carry SYN (guest's first send).
+    need_syn: bool,
+    /// Peer sent FIN — reads drain then EOF.
+    peer_finished: bool,
+}
+
+impl RelayStream {
+    fn new(
+        client: Arc<PipeClient>,
+        peer: [u8; 32],
+        conn: ConnId,
+        in_rx: mpsc::UnboundedReceiver<RdFrame>,
+        is_guest: bool,
+    ) -> Self {
+        Self {
+            client,
+            peer,
+            conn,
+            in_rx,
+            read_buf: BytesMut::new(),
+            tx_seq: 0,
+            need_syn: is_guest,
+            peer_finished: false,
+        }
+    }
+}
+
+impl Drop for RelayStream {
+    fn drop(&mut self) {
+        self.client.unregister(&self.conn);
+    }
+}
+
+impl AsyncRead for RelayStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            // Serve leftover first.
+            if !self.read_buf.is_empty() {
+                let n = self.read_buf.len().min(buf.remaining());
+                let chunk = self.read_buf.split_to(n);
+                buf.put_slice(&chunk);
+                return Poll::Ready(Ok(()));
+            }
+            if self.peer_finished {
+                return Poll::Ready(Ok(())); // EOF
+            }
+            match self.in_rx.poll_recv(cx) {
+                Poll::Ready(Some(frame)) => {
+                    if frame.flags & RD_FLAG_FIN != 0 {
+                        self.peer_finished = true;
+                    }
+                    if !frame.data.is_empty() {
+                        self.read_buf.extend_from_slice(&frame.data);
+                    }
+                    // loop to serve what we just buffered
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(())), // pipe gone → EOF
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for RelayStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        // Chunk the write; each chunk is one sealed frame up the pipe. Unbounded sink, so this
+        // never blocks (relay bandwidth backpressure is a later concern).
+        let mut sent = 0;
+        while sent < buf.len() {
+            let end = (sent + CHUNK).min(buf.len());
+            let flags = if self.need_syn { RD_FLAG_SYN } else { 0 };
+            let seq = self.tx_seq;
+            let frame = RdFrame {
+                conn: self.conn,
+                seq,
+                flags,
+                data: buf[sent..end].to_vec(),
+            };
+            if let Err(e) = self.client.send_frame(&self.peer, &frame) {
+                return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string())));
+            }
+            self.tx_seq += 1;
+            self.need_syn = false;
+            sent = end;
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(())) // frames leave immediately; nothing buffered
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let seq = self.tx_seq;
+        let conn = self.conn;
+        let peer = self.peer;
+        let fin = RdFrame { conn, seq, flags: RD_FLAG_FIN, data: Vec::new() };
+        let _ = self.client.send_frame(&peer, &fin);
+        self.tx_seq += 1;
+        Poll::Ready(Ok(()))
+    }
+}

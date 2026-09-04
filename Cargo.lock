@@ -7993,6 +7993,7 @@ dependencies = [
  "termios 0.3.3",
  "tiny-skia",
  "tohu",
+ "tokio-tungstenite",
  "totp-rs",
  "tray-icon",
  "ttf-parser 0.25.1",

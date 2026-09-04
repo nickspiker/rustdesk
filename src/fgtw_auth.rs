@@ -86,6 +86,13 @@ pub fn machine_fingerprint() -> ResultType<Vec<u8>> {
     Ok(tohu::device::machine_fingerprint()?)
 }
 
+/// The fgtw seed URL for this fork — the `fgtw-url` option, defaulting to fgtw.org. Public so
+/// the relay-pipe transport derives its WebSocket host from the same source as everything else.
+pub fn fgtw_url() -> String {
+    let u = Config::get_option("fgtw-url");
+    if u.is_empty() { FGTW_URL_DEFAULT.to_owned() } else { u }
+}
+
 /// The fleet device keypair for this machine — the same keypair photon derives, because
 /// both hash the same oracle bytes into the same Ed25519 seed.
 pub fn device_keypair() -> ResultType<Keypair> {
@@ -581,14 +588,19 @@ pub fn verify_hs_payload(
 /// fleet? Tries each member pubkey as the verifying key over the `IdPk` bytes. Returns the
 /// decoded `(id, box_pk)` on the first hit, so the caller can proceed as it does for a
 /// rendezvous-verified host. `None` when not enrolled or the host isn't a fleet member.
-pub fn verify_host_signed_id(signed_id: &[u8]) -> Option<(String, [u8; 32])> {
+/// Verify a host's `SignedId` against the current fleet fold. Returns
+/// `(rustdesk_id, host_box_pk, host_device_sign_pk)` — the third element is the member key
+/// that verified it, which is also the host's identity key (rustdesk sign key == fleet device
+/// key, `seed_rustdesk_identity`). The fleet handshake needs it to bind the client's box key
+/// to the host's identity, exactly as the rendezvous path binds to `signed_id_pk`.
+pub fn verify_host_signed_id(signed_id: &[u8]) -> Option<(String, [u8; 32], [u8; 32])> {
     use hbb_common::sodiumoxide::crypto::sign;
     let state = EnrollState::load()?;
     let members = current_fleet(&state).ok()?;
     for m in &members {
         // Reuse rustdesk's own IdPk decode (verify sig + parse) — same path secure_connection uses.
-        if let Ok(pair) = crate::common::decode_id_pk(signed_id, &sign::PublicKey(*m)) {
-            return Some(pair);
+        if let Ok((id, box_pk)) = crate::common::decode_id_pk(signed_id, &sign::PublicKey(*m)) {
+            return Some((id, box_pk, *m));
         }
     }
     None

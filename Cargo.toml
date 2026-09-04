@@ -31,7 +31,7 @@ hwcodec = ["scrap/hwcodec"]
 vram = ["scrap/vram"]
 mediacodec = ["scrap/mediacodec"]
 plugin_framework = []
-fgtw = ["scrap/fgtw", "dep:fgtw", "dep:tohu", "dep:ihi", "dep:vsf", "dep:ed25519-dalek", "dep:blake3", "dep:chacha20poly1305"]
+fgtw = ["scrap/fgtw", "dep:fgtw", "dep:tohu", "dep:ihi", "dep:vsf", "dep:ed25519-dalek", "dep:blake3", "dep:chacha20poly1305", "dep:tokio-tungstenite"]
 # Passless remote viewer on fluor (true device pixels; retina-correct). Additive to fgtw.
 fluor-viewer = ["dep:fluor"]
 linux-pkg-config = ["magnum-opus/linux-pkg-config", "scrap/linux-pkg-config"]
@@ -80,6 +80,8 @@ samplerate = { version = "0.2", optional = true }
 uuid = { version = "1.3", features = ["v4"] }
 num_cpus = "1.15"
 bytes = { version = "1.4", features = ["serde"] }
+# Raw WebSocket for the fgtw relay-pipe transport (fgtw feature). Version matches hbb_common.
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"], optional = true }
 default-net = "0.14"
 wol-rs = "1.0"
 flutter_rust_bridge = { version = "=1.80", features = ["uuid"], optional = true}
