@@ -4358,13 +4358,18 @@ impl Connection {
     async fn await_resolution(&self, width: i32, height: i32) {
         const BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
         const POLL: f32 = 0.05;
-        let Ok(displays) = display_service::try_get_displays() else {
-            return;
+        // Take just the name and drop the display list before any await: on Linux a Display
+        // holds an Rc<x11::Server>, so keeping it alive across a suspend point makes this
+        // whole future non-Send and every tokio::spawn of it fails to compile.
+        let name = {
+            let Ok(displays) = display_service::try_get_displays() else {
+                return;
+            };
+            let Some(display) = displays.get(self.display_idx) else {
+                return;
+            };
+            display.name()
         };
-        let Some(display) = displays.get(self.display_idx) else {
-            return;
-        };
-        let name = display.name();
         let start = std::time::Instant::now();
         while start.elapsed() < BUDGET {
             match crate::platform::current_resolution(&name) {
