@@ -179,6 +179,13 @@ async fn pump(
                 backoff = 1;
                 log::info!("fgtw pipe: connected ({url})");
                 let (mut sink, mut stream) = ws.split();
+                // Keepalive: Cloudflare silently closes an idle WebSocket, and a host that sits
+                // hours between connections would go dark without ever noticing — its next
+                // inbound SYN lands on a dead hub and vanishes (the 18s deadlock we hit).
+                // A ping every 20s (under the common idle window, matching photon's interval)
+                // holds the socket open, and a failed send trips the reconnect.
+                let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(20));
+                keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
                         // Outbound: envelope → WS binary frame.
@@ -198,6 +205,13 @@ async fn pump(
                             Some(Ok(_)) => {} // text/other: ignore
                             Some(Err(e)) => { log::warn!("fgtw pipe: recv error {e}, reconnecting"); break; }
                             None => { log::warn!("fgtw pipe: closed, reconnecting"); break; }
+                        },
+                        // Keepalive tick: ping to hold the socket open and detect a silent drop.
+                        _ = keepalive.tick() => {
+                            if sink.send(Ws::Ping(Vec::new().into())).await.is_err() {
+                                log::warn!("fgtw pipe: keepalive ping failed, reconnecting");
+                                break;
+                            }
                         },
                     }
                 }
