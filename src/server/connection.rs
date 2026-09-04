@@ -4352,6 +4352,44 @@ impl Connection {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    /// Block until the active display actually reads back `width`x`height`, or the budget runs out.
+    /// Bounded on purpose: a host that cannot reach the size must not hang the login forever, so we give up and stream at whatever size it is — the guest then draws that honestly rather than showing nothing.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    async fn await_resolution(&self, width: i32, height: i32) {
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+        const POLL: f32 = 0.05;
+        let Ok(displays) = display_service::try_get_displays() else {
+            return;
+        };
+        let Some(display) = displays.get(self.display_idx) else {
+            return;
+        };
+        let name = display.name();
+        let start = std::time::Instant::now();
+        while start.elapsed() < BUDGET {
+            match crate::platform::current_resolution(&name) {
+                Ok(c) if c.width == width && c.height == height => {
+                    log::info!(
+                        "fgtw follow: '{}' reached {}x{} in {}ms — starting video",
+                        &name,
+                        width,
+                        height,
+                        start.elapsed().as_millis()
+                    );
+                    return;
+                }
+                _ => sleep(POLL).await,
+            }
+        }
+        log::warn!(
+            "fgtw follow: '{}' did not reach {}x{} within {}ms — streaming at its current size",
+            &name,
+            width,
+            height,
+            BUDGET.as_millis()
+        );
+    }
+
     fn change_resolution(&mut self, d: Option<usize>, r: &Resolution) {
         if self.keyboard {
             if let Ok(displays) = display_service::try_get_displays() {
@@ -4480,6 +4518,11 @@ impl Connection {
             if r.width > 0 && r.height > 0 && !self.view_camera {
                 log::info!("fgtw follow: login asked for {}x{}", r.width, r.height);
                 self.change_resolution(None, r);
+                // Requesting is not arriving: xrandr returns before the new framebuffer is
+                // live, so the capturer would grab a frame or two at the OLD size and the
+                // guest would draw them 1:1 (the brief tiny window). Wait for the size to
+                // actually read back before letting the video service start.
+                self.await_resolution(r.width, r.height).await;
             }
         }
         if let Ok(q) = o.image_quality.enum_value() {

@@ -39,6 +39,8 @@ use fgtw::pipe::{
 
 /// Max stream bytes per relay frame. Well under the worker's 1 MiB envelope cap, small enough to keep per-frame latency low on the video path.
 const CHUNK: usize = 60 * 1024;
+/// How long to wait for a missing frame before declaring the stream lost. Long enough to cover genuine cross-hub reordering, short enough that a hung video feed becomes a reconnect instead of a black screen.
+const GAP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
 
 /// Seed host (no scheme). Derived from the same `fgtw-url` option the rest of the fork uses.
 fn seed_host() -> String {
@@ -271,6 +273,8 @@ pub struct RelayStream {
     rx_next: u64,
     /// Inbound frames that arrived ahead of `rx_next`, held until the gap fills.
     reorder: std::collections::BTreeMap<u64, RdFrame>,
+    /// When the current gap first blocked delivery. The relay has NO retransmission — a frame lost while a pipe reconnects is gone for good — so a gap that never fills would stall this stream forever (video simply hangs). The encrypted stream cannot skip a message either, because its nonce is a strict counter, so the only honest move is to fail the connection and let rustdesk reconnect.
+    gap_since: Option<std::time::Instant>,
     /// Peer sent FIN — reads drain then EOF.
     peer_finished: bool,
 }
@@ -292,6 +296,7 @@ impl RelayStream {
             tx_seq: start_seq,
             rx_next: 0,
             reorder: std::collections::BTreeMap::new(),
+            gap_since: None,
             peer_finished: false,
         }
     }
@@ -305,6 +310,7 @@ impl RelayStream {
             self.read_buf.extend_from_slice(&frame.data);
         }
         self.rx_next += 1;
+        self.gap_since = None;
     }
 }
 
@@ -336,6 +342,25 @@ impl AsyncRead for RelayStream {
             if let Some(frame) = self.reorder.remove(&next) {
                 self.consume(frame);
                 continue;
+            }
+            // A gap that never fills means a frame was lost for good; stall-forever is the
+            // worst outcome, so give up and let the session reconnect.
+            if !self.reorder.is_empty() {
+                let waited = self
+                    .gap_since
+                    .get_or_insert_with(std::time::Instant::now)
+                    .elapsed();
+                if waited > GAP_TIMEOUT {
+                    log::warn!(
+                        "fgtw pipe: frame {} never arrived ({} held behind it) — dropping the connection to reconnect",
+                        self.rx_next,
+                        self.reorder.len()
+                    );
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "relay stream lost a frame",
+                    )));
+                }
             }
             match self.in_rx.poll_recv(cx) {
                 Poll::Ready(Some(frame)) => {

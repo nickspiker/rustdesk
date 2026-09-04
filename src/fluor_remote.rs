@@ -264,6 +264,8 @@ struct FluorViewer {
     last_seen_gen: u64,
     // ── resolution-follow: ask the host to render at exactly this window's backing size, so
     //    the frame fills the window 1:1 (no scaling) and the mouse maps by identity ──
+    /// Set until the first render starts the io_loop with our real viewport size.
+    io_pending: Option<Session<FluorHandler>>,
     follow_target: (i32, i32), // most recent window backing size seen
     follow_at: Option<Instant>, // when the debounce elapses and we send the follow
     follow_tries: u32,          // retries spent on the CURRENT target (reset when the target moves)
@@ -584,6 +586,20 @@ impl FluorApp for FluorViewer {
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
         let bw = ctx.viewport.width_px as usize;
         let bh = ctx.viewport.height_px as usize;
+        // First render: we finally know the window size, so state it and connect. Everything
+        // downstream (login custom_resolution, the host reaching that size before its video
+        // service starts) keys off this one value.
+        if let Some(io) = self.io_pending.take() {
+            let (w, h) = (ctx.viewport.width_px as i32, ctx.viewport.height_px as i32);
+            if w > 0 && h > 0 {
+                log::info!("fluor: requesting {w}x{h} at login (our window size)");
+                *io.lc.read().unwrap().fgtw_desired_resolution.lock().unwrap() = Some((w, h));
+            }
+            let round = io.connection_round_state.lock().unwrap().new_round();
+            std::thread::spawn(move || {
+                io_loop(io, round);
+            });
+        }
         let vw = bw as f32;
         let vh = bh as f32;
         // Drive resolution-follow from render too, so the initial follow fires even if the user
@@ -828,25 +844,15 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
         .unwrap()
         .initialize(id, conn_type, None, force_relay, None, None, None);
 
-    // State our target size BEFORE the io_loop logs in: the window opens at the monitor size
-    // (see initial_size), so the host can reach that resolution before its video service
-    // starts. Without this the host streams at whatever size it happens to be, the guest
-    // draws those frames honestly 1:1 (tiny), and the follow only corrects it afterwards.
-    if let Ok(d) = scrap::Display::primary() {
-        let (w, h) = (d.width() as i32, d.height() as i32);
-        if w > 0 && h > 0 {
-            log::info!("fluor: requesting {w}x{h} at login (our monitor size)");
-            *session.lc.read().unwrap().fgtw_desired_resolution.lock().unwrap() = Some((w, h));
-        }
-    }
-
     let shared = session.ui_handler.shared.clone();
 
-    let io = session.clone();
-    let round = io.connection_round_state.lock().unwrap().new_round();
-    std::thread::spawn(move || {
-        io_loop(io, round);
-    });
+    // The io_loop is NOT started here. What the host must match is our WINDOW, not our
+    // monitor — they differ by the menu bar, and asking for the monitor size meant a second,
+    // corrective resolution change a moment later, with each change restarting the host's
+    // capturer (the glitching). The viewport is only known once the window exists, so the
+    // first render states it and starts the connection; login then carries the right size and
+    // the host changes resolution exactly once.
+    let io_pending = Some(session.clone());
 
     let app = FluorViewer {
         session,
@@ -855,6 +861,7 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
         scroll_acc_y: 0.0,
         buttons: 0,
         last_seen_gen: 0,
+        io_pending,
         follow_target: (0, 0),
         follow_tries: 0,
         follow_at: None,
