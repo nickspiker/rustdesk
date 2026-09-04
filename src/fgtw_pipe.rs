@@ -274,6 +274,10 @@ pub struct RelayStream {
     read_buf: BytesMut,
     /// Outbound sequence (monotonic per connection).
     tx_seq: u64,
+    /// Next inbound seq we will serve. Frames arrive out of order because a frame hops through two Durable Objects and the cross-DO deliver is an async race; the encrypted stream needs strict order, so we reassemble on seq here.
+    rx_next: u64,
+    /// Inbound frames that arrived ahead of `rx_next`, held until the gap fills.
+    reorder: std::collections::BTreeMap<u64, RdFrame>,
     /// Peer sent FIN — reads drain then EOF.
     peer_finished: bool,
 }
@@ -293,8 +297,21 @@ impl RelayStream {
             in_rx,
             read_buf: BytesMut::new(),
             tx_seq: start_seq,
+            rx_next: 0,
+            reorder: std::collections::BTreeMap::new(),
             peer_finished: false,
         }
+    }
+
+    /// Fold one in-order frame into the read buffer and advance `rx_next`.
+    fn consume(&mut self, frame: RdFrame) {
+        if frame.flags & RD_FLAG_FIN != 0 {
+            self.peer_finished = true;
+        }
+        if !frame.data.is_empty() {
+            self.read_buf.extend_from_slice(&frame.data);
+        }
+        self.rx_next += 1;
     }
 }
 
@@ -321,15 +338,26 @@ impl AsyncRead for RelayStream {
             if self.peer_finished {
                 return Poll::Ready(Ok(())); // EOF
             }
+            // An earlier-arrived frame that fills the current gap? serve it in order.
+            let next = self.rx_next;
+            if let Some(frame) = self.reorder.remove(&next) {
+                self.consume(frame);
+                continue;
+            }
             match self.in_rx.poll_recv(cx) {
                 Poll::Ready(Some(frame)) => {
-                    if frame.flags & RD_FLAG_FIN != 0 {
-                        self.peer_finished = true;
+                    use std::cmp::Ordering;
+                    match frame.seq.cmp(&self.rx_next) {
+                        // The frame we were waiting for — fold it, then the loop drains any
+                        // now-contiguous frames from the reorder buffer.
+                        Ordering::Equal => self.consume(frame),
+                        // Arrived ahead of the gap — hold it until the missing seqs land.
+                        Ordering::Greater => {
+                            self.reorder.insert(frame.seq, frame);
+                        }
+                        // Already served (a duplicate) — drop.
+                        Ordering::Less => {}
                     }
-                    if !frame.data.is_empty() {
-                        self.read_buf.extend_from_slice(&frame.data);
-                    }
-                    // loop to serve what we just buffered
                 }
                 Poll::Ready(None) => return Poll::Ready(Ok(())), // pipe gone → EOF
                 Poll::Pending => return Poll::Pending,
