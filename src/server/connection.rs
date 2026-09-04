@@ -2677,6 +2677,18 @@ impl Connection {
                 }
             }
 
+            // FLEET-ONLY (fgtw fork): reaching here means the fgtw handshake did not authorize
+            // this channel, and this fork has no other credential — passwords defeat the whole
+            // point of a passless fleet, and the fluor viewer never implemented a prompt. So
+            // refuse instead of falling through to the password / approve-mode / 2FA chain
+            // below, which is dead weight kept only for vanilla builds.
+            #[cfg(feature = "fgtw")]
+            if Config::get_option("enable-fgtw-auth") != "N" {
+                log::info!("fgtw: refusing non-fleet connection (fleet-only host)");
+                self.send_login_error("Not a member of this fleet").await;
+                return true;
+            }
+
             // https://github.com/rustdesk/rustdesk-server-pro/discussions/646
             // `is_logon` is used to check login with `OPTION_ALLOW_LOGON_SCREEN_PASSWORD` == "Y".
             // `is_logon_ui()` is a fallback for logon UI detection on Windows.
