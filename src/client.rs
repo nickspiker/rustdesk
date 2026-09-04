@@ -285,20 +285,17 @@ impl Client {
             ));
         }
 
-        // Fleet-native transport: if `peer` is a device in our fgtw fleet, connect over the seed's relay pipe — no rendezvous server, no rustdesk relay.
-        // This is the last point before anything rendezvous-shaped is built.
-        // Any failure logs and falls through to the ordinary path, unless `fgtw-native-only` is set (debug: make failures loud).
+        // Fleet-native transport, and the ONLY path past this point: a peer id resolves to a
+        // fleet device and we reach it over the seed's relay pipe — no rendezvous server, no
+        // rustdesk relay. A direct IP or host:port was already handled above and still works
+        // without any server at all; everything else is the fleet or it is nothing, because
+        // rs-ny now refuses this fleet and there is no password to fall back to anyway.
         #[cfg(feature = "fgtw")]
-        if crate::fgtw_pipe::enabled() {
-            match crate::fgtw_pipe::connect(peer, key).await {
-                Ok(t) => return Ok((t, (0, String::new()), false)),
-                Err(e) => {
-                    if crate::fgtw_pipe::native_only() {
-                        bail!("fgtw-native connect failed (fgtw-native-only set): {e}");
-                    }
-                    log::info!("fgtw-native connect to {peer} unavailable ({e}); using rendezvous");
-                }
-            }
+        {
+            return match crate::fgtw_pipe::connect(peer, key).await {
+                Ok(t) => Ok((t, (0, String::new()), false)),
+                Err(e) => bail!("cannot reach {peer}: {e}"),
+            };
         }
 
         let other_server = interface.get_lch().read().unwrap().other_server.clone();

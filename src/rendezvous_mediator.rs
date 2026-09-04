@@ -114,12 +114,17 @@ impl RendezvousMediator {
     }
 
     pub async fn start_all() {
+        // fgtw fork: the NAT probe and the hbbs heartbeat below both talk to the rustdesk
+        // servers, and the fleet-native transport needs neither — the relay pipe reaches a
+        // peer by its fleet device key, so there is nothing to probe and nobody to report to.
+        #[cfg(not(feature = "fgtw"))]
         crate::test_nat_type();
         if config::is_outgoing_only() {
             loop {
                 sleep(1.).await;
             }
         }
+        #[cfg(not(feature = "fgtw"))]
         crate::hbbs_http::sync::start();
         #[cfg(target_os = "windows")]
         if crate::platform::is_installed() && crate::is_server() {
@@ -159,6 +164,16 @@ impl RendezvousMediator {
         }
         scrap::codec::test_av1();
         *LAST_NOT_DEPLOYED_REGISTER.lock().await = None;
+
+        // fgtw fork: no rendezvous registration at all. Inbound arrives on the relay pipe
+        // (fleet_server, spawned above) or the direct server; neither needs rs-ny, which now
+        // refuses this fleet anyway. Hold the task open so the listeners keep running.
+        #[cfg(feature = "fgtw")]
+        loop {
+            sleep(3600.).await;
+        }
+
+        #[cfg(not(feature = "fgtw"))]
         loop {
             let timeout = Arc::new(RwLock::new(CONNECT_TIMEOUT));
             let conn_start_time = Instant::now();
