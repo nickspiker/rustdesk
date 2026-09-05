@@ -444,6 +444,28 @@ pub fn self_fleet_name() -> Option<String> {
     ))
 }
 
+/// Is this device's rustdesk relay pipe open right now? The seed answers with one bit.
+/// `None` when the seed can't be reached — the caller shows "unknown" rather than guessing,
+/// because calling a live device offline is worse than admitting we don't know.
+pub fn pipe_alive(device_pubkey: &[u8; 32]) -> Option<bool> {
+    let hex: String = device_pubkey.iter().map(|b| format!("{b:02x}")).collect();
+    let url = format!(
+        "{}/pipe-alive?dev={hex}&svc={}",
+        fgtw_url(),
+        fgtw::pipe::SVC_RUSTDESK
+    );
+    let client = crate::hbbs_http::create_http_client_with_url(&url);
+    let resp = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(AUTH_TIMEOUT_SECS))
+        .send()
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    Some(resp.text().ok()?.trim() == "1")
+}
+
 /// One fleet device as the chooser renders it.
 pub struct FleetDevice {
     pub pubkey: [u8; 32],
@@ -455,6 +477,8 @@ pub struct FleetDevice {
     pub rustdesk_id: Option<String>,
     /// True for this machine's own entry (the chooser greys it out).
     pub is_self: bool,
+    /// Pipe open right now? `None` = the seed didn't answer, so reachability is unknown.
+    pub online: Option<bool>,
 }
 
 /// The current fleet as a chooser list: every member (fresh fold, cache fallback within
@@ -528,6 +552,8 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
                 .unwrap_or_else(|| fgtw::pair::device_name_default(m, &state.identity_seed)),
             rustdesk_id: ids.get(m).cloned(),
             is_self: me == Some(*m),
+            // Only probe peers: our own pipe's state is not interesting and would cost a round trip per refresh.
+            online: if me == Some(*m) { None } else { pipe_alive(m) },
         })
         .collect())
 }

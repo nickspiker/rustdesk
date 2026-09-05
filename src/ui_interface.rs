@@ -858,7 +858,22 @@ pub fn refresh_fleet_peers() {
                     let (id, alias) = if d.is_self {
                         (String::new(), format!("{} (this device)", d.name))
                     } else {
-                        (d.rustdesk_id.unwrap_or_default(), d.name)
+                        (d.rustdesk_id.clone().unwrap_or_default(), d.name)
+                    };
+                    // What the tile colour means, decided here so the UI stays dumb:
+                    // self · online (pipe open) · offline (has an id, pipe shut) · none (never
+                    // published an id) · unknown (the seed didn't answer — don't call a live
+                    // device offline on a network hiccup).
+                    let status = if d.is_self {
+                        "self"
+                    } else if d.rustdesk_id.is_none() {
+                        "none"
+                    } else {
+                        match d.online {
+                            Some(true) => "online",
+                            Some(false) => "offline",
+                            None => "unknown",
+                        }
                     };
                     HashMap::<&str, String>::from_iter([
                         ("id", id),
@@ -866,6 +881,7 @@ pub fn refresh_fleet_peers() {
                         ("hostname", String::new()),
                         ("platform", String::new()),
                         ("alias", alias),
+                        ("status", status.to_string()),
                     ])
                 })
                 .collect(),

@@ -350,13 +350,13 @@ class SessionList: Reactor.Component {
         var hostname = s[2] || s.hostname || "";
         var platform = s[3] || s.platform || "";
         var alias = s[4] || s.alias || "";
-        // Fleet tiles encode reachability, not identity: a member is connectable only once it
-        // has published its RustDesk ID (empty id => connect is a no-op), so the per-device hash
-        // colour is noise here — and every unpublished device hashes to the same shade anyway.
+        // Fleet tiles show REACHABILITY, not identity: green = its relay pipe is open right
+        // now, red = it has an address but nothing is listening, grey = this machine, black =
+        // never published an id at all. Amber is "the seed didn't answer" — unknown beats
+        // calling a live device dead. Opaque hex, not rgba(): Sciter reads a bare integer
+        // alpha as 0..255, so a literal `1` means ~0.4% opacity, not full.
         var bg = this.type == "fleet"
-            // Opaque hex, not rgba(): Sciter reads a bare integer alpha as 0..255, so the
-            // literal `1` meant ~0.4% opacity and both states washed out to the page behind.
-            ? (id ? "#32CD32" : "#4A4A4A")
+            ? ({ online: "#32CD32", offline: "#C0392B", self: "#4A4A4A", none: "#111111" }[s.status || (s[5] || "")] || "#8A6D1F")
             : string2RGB(id + platform, 0.5);
         if (this.style == "list") {
             return <div .remote-session-link .remote-session-list id={id} platform={platform} title={alias ? "ID: " + id : ""}>
