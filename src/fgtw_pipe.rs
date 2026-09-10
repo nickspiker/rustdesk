@@ -534,21 +534,44 @@ pub async fn connect(
     // Same network? Dial the peer directly first. The relay is a WAN round trip through
     // Cloudflare even when both machines sit on one LAN — metres of cable turned into
     // thousands of kilometres — and it sheds frames under video load. A direct socket is
-    // local-RTT and lossless, so it is always worth one short attempt before falling back.
-    if let Some(addr) = lan {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(LAN_DIAL_TIMEOUT),
-            try_lan(&addr, peer_id),
-        )
-        .await
-        {
-            Ok(Ok(res)) => {
-                log::info!("fgtw: connected to {peer_id} directly on the LAN ({addr})");
-                return Ok(res);
-            }
-            Ok(Err(e)) => log::info!("fgtw: LAN dial to {addr} failed ({e}); using the relay"),
-            Err(_) => log::info!("fgtw: LAN dial to {addr} timed out; using the relay"),
+    // local-RTT and lossless, so it is always worth a short attempt before falling back.
+    //
+    // RACE every published address rather than trying them in order: a multi-homed peer
+    // publishes one per interface, only some are reachable from where we sit, and a dead one
+    // fails by TIMING OUT — so sequential attempts would spend the whole budget on the first
+    // black hole and never reach the address that works. Racing costs one socket each and
+    // finishes as soon as any of them completes.
+    let candidates: Vec<String> = lan
+        .iter()
+        .flat_map(|s| s.split(','))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !candidates.is_empty() {
+        log::info!("fgtw: racing {} LAN candidate(s) for {peer_id}: {candidates:?}", candidates.len());
+        let mut racers = hbb_common::futures::stream::FuturesUnordered::new();
+        for addr in candidates {
+            racers.push(async move {
+                let r = tokio::time::timeout(
+                    std::time::Duration::from_millis(LAN_DIAL_TIMEOUT),
+                    try_lan(&addr, peer_id),
+                )
+                .await;
+                (addr, r)
+            });
         }
+        use hbb_common::futures::StreamExt;
+        while let Some((addr, r)) = racers.next().await {
+            match r {
+                Ok(Ok(res)) => {
+                    log::info!("fgtw: connected to {peer_id} directly on the LAN ({addr})");
+                    return Ok(res);
+                }
+                Ok(Err(e)) => log::info!("fgtw: LAN candidate {addr} refused ({e})"),
+                Err(_) => log::info!("fgtw: LAN candidate {addr} timed out"),
+            }
+        }
+        log::info!("fgtw: no LAN candidate answered for {peer_id}; using the relay");
     }
 
     let client = client()?;

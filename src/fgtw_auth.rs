@@ -309,18 +309,32 @@ const SETTING_RUSTDESK_ID: &str = "rustdesk.id";
 /// the same network dials it directly instead of paying a WAN round trip through the relay.
 const SETTING_RUSTDESK_LAN: &str = "rustdesk.lan";
 
-/// Our own LAN address as `ip:port`, or `None` if we cannot determine it.
-/// The UDP "connect" trick: connecting a datagram socket sends nothing, it just makes the OS
-/// pick the source address it would route from — which is exactly the address a peer on our
-/// network should dial. Beats parsing interfaces and picking wrong on a multi-homed box.
-fn own_lan_addr() -> Option<String> {
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.connect("1.1.1.1:80").ok()?;
-    let ip = sock.local_addr().ok()?.ip();
-    if ip.is_loopback() || ip.is_unspecified() {
-        return None;
+/// EVERY address a peer on our network could dial us at, as `ip:port`, comma-joined.
+///
+/// Publishing one address is not enough: the routing lookup only ever names the interface that
+/// reaches the internet, so a machine wired AND wireless publishes exactly one of the two — and
+/// if a peer cannot use that one, the direct path is invisible even though a working address
+/// existed the whole time (field: a host published its wifi address while its ethernet was the
+/// reachable one, and every session fell back to the relay). Photon solved this by gathering a
+/// candidate SET and racing it; this is the same idea at the publish end.
+fn own_lan_addrs() -> Vec<String> {
+    let port = crate::rendezvous_mediator::get_direct_port();
+    let mut out = Vec::new();
+    for iface in default_net::get_interfaces() {
+        for v4 in &iface.ipv4 {
+            let ip = v4.addr;
+            // Loopback is not reachable from anywhere else; link-local 169.254 means DHCP never
+            // answered, so nothing is listening for us on it either.
+            if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
+                continue;
+            }
+            let addr = format!("{ip}:{port}");
+            if !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
     }
-    Some(format!("{ip}:{}", crate::rendezvous_mediator::get_direct_port()))
+    out
 }
 /// Photon's per-device display name, keyed `fleet.name.<pubkey hex>` in the fleet-global layer.
 const SETTING_NAME_PREFIX: &str = "fleet.name.";
@@ -418,10 +432,11 @@ fn publish_own_id_inner(state: &EnrollState, device_key: &Keypair) -> Result<(),
         updated: now,
         linked: false, // per-device by nature; never follows a fleet-global value
     }];
-    if let Some(lan) = own_lan_addr() {
+    let lan = own_lan_addrs();
+    if !lan.is_empty() {
         entries.push(DeviceSetting {
             key: SETTING_RUSTDESK_LAN.to_owned(),
-            value: VsfType::x(lan),
+            value: VsfType::x(lan.join(",")),
             updated: now,
             linked: false,
         });
