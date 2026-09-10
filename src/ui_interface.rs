@@ -589,6 +589,23 @@ pub fn check_mouse_time() {
 #[inline]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn get_connect_status() -> UiStatus {
+    // fgtw fork: status_num used to come from the rendezvous heartbeat, which this fork no
+    // longer runs — so it sat at 0 forever and the UI claimed "Connecting to RustDesk
+    // network..." while the fleet was perfectly reachable. Report what actually matters now:
+    // enrolled in a fleet, with the relay pipe up.
+    #[cfg(feature = "fgtw")]
+    {
+        let mut s = UI_STATUS.lock().unwrap().clone();
+        s.status_num = if !crate::fgtw_auth::is_enrolled() {
+            -1
+        } else if crate::fgtw_pipe::pipe_connected() {
+            1
+        } else {
+            0
+        };
+        return s;
+    }
+    #[cfg(not(feature = "fgtw"))]
     UI_STATUS.lock().unwrap().clone()
 }
 

@@ -77,15 +77,17 @@ class ConnectStatus: Reactor.Component {
     }
 
     function getConnectStatusStr() {
+        // This fork reaches peers through its own fleet, not the RustDesk network — so say so.
+        // -1 is "not enrolled" (nothing to be ready for), 0 is "enrolled, relay pipe still
+        // coming up", positive is reachable. The old strings named a network we no longer use.
         if (service_stopped) {
             return translate("Service is not running");
         } else if (connect_status == -1) {
-            return translate('not_ready_status');
+            return "Not enrolled in a fleet";
         } else if (connect_status == 0) {
-            return translate('connecting_status');
+            return "Connecting to your fleet...";
         }
-        if (!handler.using_public_server()) return translate('Ready');
-        return <span>{translate("Ready")}, <span .link #setup-server>{translate("setup_server_tip")}</span></span>;
+        return "Fleet ready";
     }
 
     event click $(#start-service) () {

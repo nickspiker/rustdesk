@@ -77,6 +77,14 @@ pub struct PipeClient {
 }
 
 static CLIENT: OnceLock<ResultType<Arc<PipeClient>>> = OnceLock::new();
+/// Is the relay pipe up right now? The pump flips this on connect and on drop, so the UI can
+/// report reachability instead of the rendezvous heartbeat this fork no longer has.
+static PIPE_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True while the seed pipe is connected.
+pub fn pipe_connected() -> bool {
+    PIPE_UP.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// The process-wide pipe client, connecting on first use. `Err` if we're not enrolled or the pipe can't be established — the caller falls back to the rendezvous path.
 pub fn client() -> ResultType<Arc<PipeClient>> {
@@ -182,6 +190,7 @@ async fn pump(
         match tokio_tungstenite::connect_async(&url).await {
             Ok((ws, _)) => {
                 backoff = 1;
+                PIPE_UP.store(true, std::sync::atomic::Ordering::Relaxed);
                 log::info!("fgtw pipe: connected ({url})");
                 let (mut sink, mut stream) = ws.split();
                 // Keepalive: Cloudflare silently closes an idle WebSocket, and a host that sits
@@ -223,6 +232,8 @@ async fn pump(
             }
             Err(e) => log::warn!("fgtw pipe: connect failed {e}, retrying in {backoff}s"),
         }
+        // Either the socket dropped out of the select loop or the connect failed — down either way.
+        PIPE_UP.store(false, std::sync::atomic::Ordering::Relaxed);
         tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
     }
