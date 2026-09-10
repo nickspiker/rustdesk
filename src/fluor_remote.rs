@@ -339,8 +339,16 @@ impl FluorViewer {
         if target.0 <= 0 || target.1 <= 0 {
             return false;
         }
-        // DONE when the host's frame is already exactly our window — the follow converged.
+        // No frame yet: there is nothing to follow, and asking now is actively harmful. We
+        // already stated this exact size at login, and every change_resolution restarts the
+        // host's capturer — so firing here starved the first frame, which kept the dims at
+        // 0x0, which fired again. That loop is the black screen; the session was healthy the
+        // whole time. Wait for a frame, then correct it if it is the wrong size.
         let (fw, fh) = self.frame_dims();
+        if fw == 0 || fh == 0 {
+            return false;
+        }
+        // DONE when the host's frame is already exactly our window — the follow converged.
         if (fw as i32, fh as i32) == target {
             self.follow_at = None;
             self.follow_target = target;
