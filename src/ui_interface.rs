@@ -877,17 +877,22 @@ pub fn refresh_fleet_peers() {
                     } else {
                         (d.rustdesk_id.clone().unwrap_or_default(), d.name)
                     };
-                    // What the tile colour means, decided here so the UI stays dumb:
-                    // self · online (pipe open) · offline (has an id, pipe shut) · none (never
-                    // published an id) · unknown (the seed didn't answer — don't call a live
-                    // device offline on a network hiccup).
+                    // What the tile colour means, decided here so the UI stays dumb. Same
+                    // language photon uses, so one glance means the same thing in both apps:
+                    // lan (same room) · relay (reachable, but every frame pays a WAN round
+                    // trip) · offline · none (never published an id) · unknown (the seed did
+                    // not answer — never call a live device offline on a network hiccup).
+                    // "reachable at all" used to render GREEN, which said nothing about how
+                    // good the path was and read as "all good" while sessions relayed.
                     let status = if d.is_self {
                         "self"
                     } else if d.rustdesk_id.is_none() {
                         "none"
+                    } else if d.on_lan {
+                        "lan"
                     } else {
                         match d.online {
-                            Some(true) => "online",
+                            Some(true) => "relay",
                             Some(false) => "offline",
                             None => "unknown",
                         }

@@ -356,7 +356,7 @@ class SessionList: Reactor.Component {
         // calling a live device dead. Opaque hex, not rgba(): Sciter reads a bare integer
         // alpha as 0..255, so a literal `1` means ~0.4% opacity, not full.
         var bg = this.type == "fleet"
-            ? ({ online: "#32CD32", offline: "#C0392B", self: "#4A4A4A", none: "#111111" }[s.status || (s[5] || "")] || "#8A6D1F")
+            ? ({ lan: "#20E0E0", relay: "#FFC020", offline: "#C0392B", self: "#4A4A4A", none: "#111111" }[s.status || (s[5] || "")] || "#8A6D1F")
             : string2RGB(id + platform, 0.5);
         if (this.style == "list") {
             return <div .remote-session-link .remote-session-list id={id} platform={platform} title={alias ? "ID: " + id : ""}>

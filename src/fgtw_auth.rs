@@ -524,6 +524,8 @@ pub struct FleetDevice {
     pub online: Option<bool>,
     /// The device's published LAN address (`ip:port`), if it published one.
     pub lan_addr: Option<String>,
+    /// A published LAN address answered a probe — the peer is on our own network.
+    pub on_lan: bool,
 }
 
 /// The current fleet as a chooser list: every member (fresh fold, cache fallback within
@@ -534,6 +536,27 @@ pub struct FleetDevice {
 /// `None` when we're not enrolled, the peer isn't in the fleet, or hasn't published an id yet.
 pub fn device_for_rustdesk_id(id: &str) -> Option<[u8; 32]> {
     device_and_lan_for_rustdesk_id(id).map(|(pk, _)| pk)
+}
+
+/// Does any of a device's published LAN addresses answer right now?
+/// A tile that only knows "the relay pipe is open" cannot tell a peer in the same room from one
+/// on another continent — both are merely reachable. One short connect per candidate is what
+/// separates them, and it is the same probe the dialler would make anyway.
+fn lan_reachable(lan: &Option<String>) -> bool {
+    let Some(list) = lan else { return false };
+    for addr in list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&addr) else { continue };
+        for sa in addrs {
+            // Short: a peer on our own network answers in single-digit ms, and a dead address
+            // must not stall the roster the fleet page is waiting on.
+            if std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(250))
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The fleet device behind a RustDesk id, plus its published LAN address if it has one.
@@ -608,6 +631,11 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
             is_self: me == Some(*m),
             // Only probe peers: our own pipe's state is not interesting and would cost a round trip per refresh.
             online: if me == Some(*m) { None } else { pipe_alive(m) },
+            on_lan: if me == Some(*m) {
+                false
+            } else {
+                lan_reachable(&lans.get(m).cloned())
+            },
             lan_addr: lans.get(m).cloned(),
         })
         .collect())
