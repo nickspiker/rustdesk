@@ -391,16 +391,14 @@ impl Server {
         }
     }
 
-    pub fn try_add_primay_video_service(&mut self) {
-        let primary_video_service_name = video_service::get_service_name(
-            VideoSource::Monitor,
-            *display_service::PRIMARY_DISPLAY_IDX,
-        );
-        if !self.contains(&primary_video_service_name) {
-            self.add_service(Box::new(video_service::new(
-                VideoSource::Monitor,
-                *display_service::PRIMARY_DISPLAY_IDX,
-            )));
+    /// Subscribe the initial video service for `display_idx`. Normally the primary display,
+    /// but a fleet session passes its virtual head so the guest sees that by default instead
+    /// of the physical panel.
+    pub fn try_add_primay_video_service(&mut self, display_idx: usize) {
+        let video_service_name =
+            video_service::get_service_name(VideoSource::Monitor, display_idx);
+        if !self.contains(&video_service_name) {
+            self.add_service(Box::new(video_service::new(VideoSource::Monitor, display_idx)));
         }
     }
 
@@ -415,11 +413,9 @@ impl Server {
         self.connections.insert(conn.id(), conn);
     }
 
-    pub fn add_connection(&mut self, conn: ConnInner, noperms: &Vec<&'static str>) {
-        let primary_video_service_name = video_service::get_service_name(
-            VideoSource::Monitor,
-            *display_service::PRIMARY_DISPLAY_IDX,
-        );
+    pub fn add_connection(&mut self, conn: ConnInner, display_idx: usize, noperms: &Vec<&'static str>) {
+        let primary_video_service_name =
+            video_service::get_service_name(VideoSource::Monitor, display_idx);
         for s in self.services.values() {
             let name = s.name();
             if Self::is_video_service_name(&name) && name != primary_video_service_name {
