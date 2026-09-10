@@ -503,20 +503,59 @@ fn wrap(relay: RelayStream) -> Stream {
 /// Connect to a fleet peer over the relay pipe and run the passless handshake.
 /// Returns `Client::start`'s tuple so the caller's contract is byte-identical: direct=true (no relay-server hop from rustdesk's point of view), the host's identity pk, no KCP guard, label "FGTW".
 /// `Err` means "not a fleet peer" or the pipe/handshake failed — the caller falls back to rendezvous.
+/// How long to wait on the peer's published LAN address before giving up and relaying.
+/// Short: on the same network this completes in single-digit milliseconds, and when the peer is
+/// elsewhere the address is simply unreachable, so a long wait would only delay the real path.
+const LAN_DIAL_TIMEOUT: u64 = 600;
+
 pub async fn connect(
     peer_id: &str,
     _key: &str,
 ) -> ResultType<(Stream, bool, Option<Vec<u8>>, Option<KcpStream>, &'static str)> {
     let id = peer_id.to_string();
-    let device = tokio::task::spawn_blocking(move || crate::fgtw_auth::device_for_rustdesk_id(&id))
+    let (device, lan) = tokio::task::spawn_blocking(move || {
+        crate::fgtw_auth::device_and_lan_for_rustdesk_id(&id)
+    })
+    .await
+    .map_err(|e| anyhow!("fleet lookup join: {e}"))?
+    .ok_or_else(|| anyhow!("{peer_id} is not a fleet peer with a published id"))?;
+
+    // Same network? Dial the peer directly first. The relay is a WAN round trip through
+    // Cloudflare even when both machines sit on one LAN — metres of cable turned into
+    // thousands of kilometres — and it sheds frames under video load. A direct socket is
+    // local-RTT and lossless, so it is always worth one short attempt before falling back.
+    if let Some(addr) = lan {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(LAN_DIAL_TIMEOUT),
+            try_lan(&addr, peer_id),
+        )
         .await
-        .map_err(|e| anyhow!("fleet lookup join: {e}"))?
-        .ok_or_else(|| anyhow!("{peer_id} is not a fleet peer with a published id"))?;
+        {
+            Ok(Ok(res)) => {
+                log::info!("fgtw: connected to {peer_id} directly on the LAN ({addr})");
+                return Ok(res);
+            }
+            Ok(Err(e)) => log::info!("fgtw: LAN dial to {addr} failed ({e}); using the relay"),
+            Err(_) => log::info!("fgtw: LAN dial to {addr} timed out; using the relay"),
+        }
+    }
+
     let client = client()?;
     let relay = client.open(device);
     let mut conn = wrap(relay);
     let pk = Client::secure_connection_fleet(Some(peer_id), &mut conn).await?;
     Ok((conn, true, pk, None, "FGTW"))
+}
+
+/// One direct dial to a peer's published LAN address, proving fleet membership exactly as the
+/// relay path does — a local socket is not a licence to skip the handshake.
+async fn try_lan(
+    addr: &str,
+    peer_id: &str,
+) -> ResultType<(Stream, bool, Option<Vec<u8>>, Option<KcpStream>, &'static str)> {
+    let mut conn = hbb_common::socket_client::connect_tcp(addr, LAN_DIAL_TIMEOUT).await?;
+    let pk = Client::secure_connection_fleet(Some(peer_id), &mut conn).await?;
+    Ok((conn, true, pk, None, "FGTW-LAN"))
 }
 
 // ── accept seam (host side) ──

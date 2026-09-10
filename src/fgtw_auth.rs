@@ -305,6 +305,23 @@ fn current_fleet(state: &EnrollState) -> Result<Vec<[u8; 32]>, String> {
 
 /// Settings key under which a device publishes its RustDesk ID in its own device map.
 const SETTING_RUSTDESK_ID: &str = "rustdesk.id";
+/// This device's LAN address (`ip:port`) for its direct server, published so a fleet peer on
+/// the same network dials it directly instead of paying a WAN round trip through the relay.
+const SETTING_RUSTDESK_LAN: &str = "rustdesk.lan";
+
+/// Our own LAN address as `ip:port`, or `None` if we cannot determine it.
+/// The UDP "connect" trick: connecting a datagram socket sends nothing, it just makes the OS
+/// pick the source address it would route from — which is exactly the address a peer on our
+/// network should dial. Beats parsing interfaces and picking wrong on a multi-homed box.
+fn own_lan_addr() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("1.1.1.1:80").ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    Some(format!("{ip}:{}", crate::rendezvous_mediator::get_direct_port()))
+}
 /// Photon's per-device display name, keyed `fleet.name.<pubkey hex>` in the fleet-global layer.
 const SETTING_NAME_PREFIX: &str = "fleet.name.";
 
@@ -393,25 +410,36 @@ fn publish_own_id_inner(state: &EnrollState, device_key: &Keypair) -> Result<(),
         .unwrap_or_default();
     let me = device_key.public.to_bytes();
     let now = vsf::eagle_time_oscillations();
-    let entry = DeviceSetting {
+    // The id, plus our LAN address when we have one — both per-device, never fleet-linked.
+    let mut entries = vec![DeviceSetting {
         key: SETTING_RUSTDESK_ID.to_owned(),
         // fstate v7: setting values are typed VSF now. The RustDesk id is text → VsfType::x.
         value: VsfType::x(Config::get_id()),
         updated: now,
         linked: false, // per-device by nature; never follows a fleet-global value
-    };
+    }];
+    if let Some(lan) = own_lan_addr() {
+        entries.push(DeviceSetting {
+            key: SETTING_RUSTDESK_LAN.to_owned(),
+            value: VsfType::x(lan),
+            updated: now,
+            linked: false,
+        });
+    }
     match fs.device_settings.iter_mut().find(|d| d.device_pubkey == me) {
         Some(map) => {
-            match map.entries.iter_mut().find(|e| e.key == SETTING_RUSTDESK_ID) {
-                Some(e) => *e = entry,
-                None => map.entries.push(entry),
+            for entry in entries {
+                match map.entries.iter_mut().find(|e| e.key == entry.key) {
+                    Some(e) => *e = entry,
+                    None => map.entries.push(entry),
+                }
             }
             map.updated = now;
         }
         None => fs.device_settings.push(DeviceSettings {
             device_pubkey: me,
             updated: now,
-            entries: vec![entry],
+            entries,
         }),
     }
     fgtw::client::push_fstate(&t, &RdSealer, &state.handle_proof, device_key, &key, &fs)
@@ -479,6 +507,8 @@ pub struct FleetDevice {
     pub is_self: bool,
     /// Pipe open right now? `None` = the seed didn't answer, so reachability is unknown.
     pub online: Option<bool>,
+    /// The device's published LAN address (`ip:port`), if it published one.
+    pub lan_addr: Option<String>,
 }
 
 /// The current fleet as a chooser list: every member (fresh fold, cache fallback within
@@ -488,11 +518,17 @@ pub struct FleetDevice {
 /// Blocking (folds the fleet + pulls the id map); the caller runs it off the async runtime.
 /// `None` when we're not enrolled, the peer isn't in the fleet, or hasn't published an id yet.
 pub fn device_for_rustdesk_id(id: &str) -> Option<[u8; 32]> {
+    device_and_lan_for_rustdesk_id(id).map(|(pk, _)| pk)
+}
+
+/// The fleet device behind a RustDesk id, plus its published LAN address if it has one.
+/// One roster pull serves both, so trying the LAN path costs no extra round trip.
+pub fn device_and_lan_for_rustdesk_id(id: &str) -> Option<([u8; 32], Option<String>)> {
     fleet_roster()
         .ok()?
         .into_iter()
         .find(|d| !d.is_self && d.rustdesk_id.as_deref() == Some(id))
-        .map(|d| d.pubkey)
+        .map(|d| (d.pubkey, d.lan_addr))
 }
 
 pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
@@ -500,7 +536,8 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
     let members = current_fleet(&state)?;
     let me = device_keypair().map(|k| k.public.to_bytes()).ok();
     // ID map is best-effort: an unreachable slot or missing wrap degrades to names-only.
-    let (ids, names): (HashMap<[u8; 32], String>, HashMap<[u8; 32], String>) = (|| -> Result<_, String> {
+    #[allow(clippy::type_complexity)]
+    let ((ids, lans), names): ((HashMap<[u8; 32], String>, HashMap<[u8; 32], String>), HashMap<[u8; 32], String>) = (|| -> Result<_, String> {
         let t = RdTransport::auth();
         let key = fleet_key(&t, &state)?;
         let fs = fgtw::client::pull_fstate(&t, &RdSealer, &state.handle_proof, &key)?
@@ -520,26 +557,28 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
                 }
             })
             .collect();
-        let ids = fs
-            .device_settings
-            .into_iter()
-            .filter_map(|d| {
-                d.entries
-                    .into_iter()
-                    .find(|e| e.key == SETTING_RUSTDESK_ID)
-                    .and_then(|e| match e.value {
-                        // Written as VsfType::x (text) by publish_own_id_inner above.
-                        VsfType::x(s) => Some(s),
-                        _ => None,
-                    })
-                    .map(|id| (d.device_pubkey, id))
-            })
-            .collect();
-        Ok((ids, names))
+        let mut ids = HashMap::new();
+        let mut lans = HashMap::new();
+        for d in fs.device_settings.into_iter() {
+            for e in d.entries.into_iter() {
+                // Both written as VsfType::x (text) by publish_own_id_inner above.
+                let VsfType::x(v) = e.value else { continue };
+                match e.key.as_str() {
+                    SETTING_RUSTDESK_ID => {
+                        ids.insert(d.device_pubkey, v);
+                    }
+                    SETTING_RUSTDESK_LAN => {
+                        lans.insert(d.device_pubkey, v);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(((ids, lans), names))
     })()
     .unwrap_or_else(|e| {
         log::warn!("fgtw: fleet id map unavailable ({e}); chooser degrades to names-only");
-        (HashMap::new(), HashMap::new())
+        ((HashMap::new(), HashMap::new()), HashMap::new())
     });
     Ok(members
         .iter()
@@ -554,6 +593,7 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
             is_self: me == Some(*m),
             // Only probe peers: our own pipe's state is not interesting and would cost a round trip per refresh.
             online: if me == Some(*m) { None } else { pipe_alive(m) },
+            lan_addr: lans.get(m).cloned(),
         })
         .collect())
 }
