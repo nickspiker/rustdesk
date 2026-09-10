@@ -4352,6 +4352,15 @@ impl Connection {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    /// The active display's current size, or `None` if it cannot be read.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn current_display_resolution(&self) -> Option<(i32, i32)> {
+        let displays = display_service::try_get_displays().ok()?;
+        let name = displays.get(self.display_idx)?.name();
+        let r = crate::platform::current_resolution(&name).ok()?;
+        Some((r.width, r.height))
+    }
+
     /// Block until the active display actually reads back `width`x`height`, or the budget runs out.
     /// Bounded on purpose: a host that cannot reach the size must not hang the login forever, so we give up and stream at whatever size it is — the guest then draws that honestly rather than showing nothing.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -4522,6 +4531,14 @@ impl Connection {
         if let Some(r) = o.custom_resolution.as_ref() {
             if r.width > 0 && r.height > 0 && !self.view_camera {
                 log::info!("fgtw follow: login asked for {}x{}", r.width, r.height);
+                // Idempotent: a request for the size we are already at must do nothing.
+                // change_resolution restarts the capturer, so re-applying the same size kills
+                // the video stream for no reason.
+                let already = self.current_display_resolution();
+                if already == Some((r.width, r.height)) {
+                    log::info!("fgtw follow: already {}x{} — leaving the capturer alone", r.width, r.height);
+                    return;
+                }
                 self.change_resolution(None, r);
                 // Requesting is not arriving: xrandr returns before the new framebuffer is
                 // live, so the capturer would grab a frame or two at the OLD size and the
