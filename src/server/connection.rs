@@ -1896,6 +1896,22 @@ impl Connection {
 
             try_activate_screen();
 
+            // Linux fleet host: stand up our own display head before enumerating displays, so
+            // it is in the list the guest receives AND is what current_display points at below.
+            // Doing this in update_options (which runs after peer_info is built) was too late —
+            // the guest saw the physical panel as current and tried to follow-resize a 4K
+            // monitor it could never shrink, looping forever.
+            #[cfg(target_os = "linux")]
+            if self.authed_conn_type() == Some(AuthConnType::Remote) {
+                if let Some((w, h)) = self.fleet_requested_size() {
+                    if let Err(e) = crate::platform::linux::ensure_virtual_monitor(w, h) {
+                        log::error!("fgtw vmon: could not create virtual monitor: {e}");
+                    } else {
+                        log::info!("fgtw vmon: virtual head up at {w}x{h} for this session");
+                    }
+                }
+            }
+
             match super::display_service::update_get_sync_displays_on_login().await {
                 Err(err) => {
                     res.set_error(format!("{}", err));
@@ -1908,6 +1924,11 @@ impl Connection {
                         self.retina.set_displays(&displays);
                     }
                     pi.displays = displays;
+                    // Default the fleet session to our virtual head, not the physical panel.
+                    #[cfg(target_os = "linux")]
+                    if let Some(idx) = self.virtual_monitor_index() {
+                        self.display_idx = idx;
+                    }
                     pi.current_display = self.display_idx as _;
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     {
@@ -4352,6 +4373,13 @@ impl Connection {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    /// The size the guest asked for in its login options, if any — the virtual head's size.
+    #[cfg(target_os = "linux")]
+    fn fleet_requested_size(&self) -> Option<(usize, usize)> {
+        let r = self.options_in_login.as_ref()?.custom_resolution.as_ref()?;
+        (r.width > 0 && r.height > 0).then_some((r.width as usize, r.height as usize))
+    }
+
     /// Index of the fleet virtual monitor in the current display list, `None` if absent.
     #[cfg(target_os = "linux")]
     fn virtual_monitor_index(&self) -> Option<usize> {
@@ -4545,29 +4573,18 @@ impl Connection {
                 // plugged in, never clones or fights the real one, and is exactly the guest's
                 // size — the "act like a second monitor" model. Point capture at it here,
                 // before the video service starts. Other platforms keep the resize path.
-                #[cfg(target_os = "linux")]
-                {
-                    if let Err(e) =
-                        crate::platform::linux::ensure_virtual_monitor(r.width as _, r.height as _)
-                    {
-                        log::error!("fgtw vmon: could not create virtual monitor: {e}");
-                    } else if let Some(idx) = self.virtual_monitor_index() {
-                        log::info!("fgtw vmon: capturing virtual monitor at display #{idx}");
-                        self.display_idx = idx;
-                    } else {
-                        log::warn!("fgtw vmon: created but not found in the display list");
-                    }
+                // The virtual head was created at login (send_logon_response). A later
+                // change_resolution is the guest resizing its window: resize the head to match
+                // (routed to the vmon on Linux), or the physical output elsewhere. Idempotent —
+                // re-applying the current size would needlessly restart the capturer.
+                let already = self.current_display_resolution();
+                if already == Some((r.width, r.height)) {
+                    log::info!("fgtw follow: already {}x{} — leaving the capturer alone", r.width, r.height);
+                    return;
                 }
+                self.change_resolution(None, r);
                 #[cfg(not(target_os = "linux"))]
-                {
-                    let already = self.current_display_resolution();
-                    if already == Some((r.width, r.height)) {
-                        log::info!("fgtw follow: already {}x{} — leaving the capturer alone", r.width, r.height);
-                        return;
-                    }
-                    self.change_resolution(None, r);
-                    self.await_resolution(r.width, r.height).await;
-                }
+                self.await_resolution(r.width, r.height).await;
             }
         }
         if let Ok(q) = o.image_quality.enum_value() {
