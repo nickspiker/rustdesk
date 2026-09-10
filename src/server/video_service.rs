@@ -61,6 +61,9 @@ use std::{
 };
 
 pub const OPTION_REFRESH: &'static str = "refresh";
+/// One-shot guard for the fleet virtual-monitor luma probe (composite-vs-black).
+#[cfg(target_os = "linux")]
+static LOGGED_FIRST_LUMA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 type FrameFetchedNotifierSender = UnboundedSender<(i32, Option<Instant>)>;
 type FrameFetchedNotifierReceiver = Arc<TokioMutex<UnboundedReceiver<(i32, Option<Instant>)>>>;
@@ -725,6 +728,21 @@ fn run(vs: VideoService) -> ResultType<()> {
             Ok(frame) => {
                 repeat_encode_counter = 0;
                 if frame.valid() {
+                    // One-shot: mean luma of the first valid frame. A virtual monitor with no
+                    // crtc behind it would capture as pure black (~0); real content is well
+                    // above that. This is how we learn composite-vs-black without a probe.
+                    #[cfg(target_os = "linux")]
+                    if !LOGGED_FIRST_LUMA.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        if let scrap::Frame::PixelBuffer(pf) = &frame {
+                            let d = pf.data();
+                            let step = (d.len() / 4096).max(1);
+                            let (mut sum, mut n) = (0u64, 0u64);
+                            let mut i = 0;
+                            while i < d.len() { sum += d[i] as u64; n += 1; i += step; }
+                            let mean = if n > 0 { sum / n } else { 0 };
+                            log::info!("fgtw vmon: first-frame mean byte = {mean} ({}x{}) — >2 composites, ~0 is black", pf.width(), pf.height());
+                        }
+                    }
                     let screenshot_key = (vs.source, display_idx);
                     let screenshot = SCREENSHOTS.lock().unwrap().remove(&screenshot_key);
                     if let Some(mut screenshot) = screenshot {

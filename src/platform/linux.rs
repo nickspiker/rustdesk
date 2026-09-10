@@ -1572,6 +1572,13 @@ pub fn resolutions(name: &str) -> Vec<Resolution> {
 }
 
 pub fn current_resolution(name: &str) -> ResultType<Resolution> {
+    // The virtual head is a monitor, not an output — xrandr --query never lists it.
+    if name == VIRTUAL_MONITOR {
+        return match virtual_monitor_geometry() {
+            Some((_, _, w, h)) => Ok(Resolution { width: w as _, height: h as _, ..Default::default() }),
+            None => Err(hbb_common::anyhow::anyhow!("virtual monitor '{VIRTUAL_MONITOR}' not present")),
+        };
+    }
     let xrandr_output = run_cmds("xrandr --query | tr -s ' '")?;
     let re = Regex::new(&get_xrandr_conn_pat(name))?;
     if let Some(caps) = re.captures(&xrandr_output) {
@@ -1586,7 +1593,125 @@ pub fn current_resolution(name: &str) -> ResultType<Resolution> {
     bail!("Failed to find current resolution for {}", name);
 }
 
+// ── the fleet virtual monitor ──
+
+/// The session's own display head: a RandR virtual monitor in a grown framebuffer region.
+/// The physical output is never resized, cloned, or fought over; a host with no monitor plugged in still has a real display to capture.
+pub const VIRTUAL_MONITOR: &str = "RustDesk-Fleet";
+
+/// `(right edge, bottom edge)` over every monitor except `exclude` — the framebuffer space real screens occupy, i.e. where the virtual head goes and what to shrink back to.
+fn extent_excluding(exclude: &str) -> (usize, usize) {
+    let Ok(out) = Command::new("xrandr").arg("--listmonitors").output() else {
+        return (0, 0);
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (mut w, mut h) = (0usize, 0usize);
+    // Lines look like: ` 0: +*HDMI-A-0 2560/344x1570/193+0+0  HDMI-A-0` (first line is a count).
+    for line in text.lines().skip(1) {
+        let mut parts = line.split_whitespace();
+        let _idx = parts.next();
+        let name = parts.next().unwrap_or("").trim_start_matches(['+', '*']);
+        if name == exclude {
+            continue;
+        }
+        if let Some((r, b)) = parts.next().and_then(parse_monitor_geometry) {
+            w = w.max(r);
+            h = h.max(b);
+        }
+    }
+    (w, h)
+}
+
+/// `"2560/344x1570/193+0+0"` → `(right, bottom)` = `(w+x, h+y)`.
+fn parse_monitor_geometry(geo: &str) -> Option<(usize, usize)> {
+    let mut it = geo.split('+');
+    let size = it.next()?;
+    let x: usize = it.next()?.parse().ok()?;
+    let y: usize = it.next()?.parse().ok()?;
+    let (wp, hp) = size.split_once('x')?;
+    let w: usize = wp.split('/').next()?.parse().ok()?;
+    let h: usize = hp.split('/').next()?.parse().ok()?;
+    Some((w + x, h + y))
+}
+
+/// Create (or resize) the virtual monitor at `width`x`height`, placed to the right of every physical screen. Idempotent when already that size.
+pub fn ensure_virtual_monitor(width: usize, height: usize) -> ResultType<()> {
+    if virtual_monitor_geometry().map(|g| (g.2, g.3)) == Some((width, height)) {
+        return Ok(());
+    }
+    // Recreate from scratch on any size change or stale leftover — delmonitor on a missing name just errors quietly.
+    Command::new("xrandr").args(["--delmonitor", VIRTUAL_MONITOR]).output().ok();
+    let (px, ph) = extent_excluding(VIRTUAL_MONITOR);
+    let fb = format!("{}x{}", px + width, ph.max(height));
+    let out = Command::new("xrandr").args(["--fb", &fb]).output()?;
+    if !out.status.success() {
+        bail!("xrandr --fb {fb}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    // Physical mm at ~96dpi so the DE derives a sane DPI for the head instead of inventing one.
+    let geo = format!(
+        "{width}/{}x{height}/{}+{px}+0",
+        width * 254 / 960,
+        height * 254 / 960
+    );
+    let out = Command::new("xrandr")
+        .args(["--setmonitor", VIRTUAL_MONITOR, &geo, "none"])
+        .output()?;
+    if !out.status.success() {
+        // Roll the framebuffer back so a failed head does not leave dead desktop space.
+        if px > 0 && ph > 0 {
+            let back = format!("{px}x{ph}");
+            Command::new("xrandr").args(["--fb", &back]).output().ok();
+        }
+        bail!("xrandr --setmonitor {geo}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    log::info!("fgtw vmon: '{VIRTUAL_MONITOR}' up at {width}x{height}+{px}+0 (fb {fb})");
+    Ok(())
+}
+
+/// Full geometry `(x, y, w, h)` of the virtual monitor, `None` if absent.
+pub fn virtual_monitor_geometry() -> Option<(usize, usize, usize, usize)> {
+    let out = Command::new("xrandr").arg("--listmonitors").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines().skip(1) {
+        let mut parts = line.split_whitespace();
+        let _idx = parts.next();
+        let name = parts.next().unwrap_or("").trim_start_matches(['+', '*']);
+        if name != VIRTUAL_MONITOR {
+            continue;
+        }
+        // "W/mmxH/mm+X+Y"
+        let geo = parts.next()?;
+        let mut it = geo.split('+');
+        let size = it.next()?;
+        let x: usize = it.next()?.parse().ok()?;
+        let y: usize = it.next()?.parse().ok()?;
+        let (wp, hp) = size.split_once('x')?;
+        let w: usize = wp.split('/').next()?.parse().ok()?;
+        let h: usize = hp.split('/').next()?.parse().ok()?;
+        return Some((x, y, w, h));
+    }
+    None
+}
+
+/// Tear the virtual monitor down and shrink the framebuffer back to the physical screens.
+pub fn remove_virtual_monitor() {
+    if virtual_monitor_geometry().is_none() {
+        return;
+    }
+    Command::new("xrandr").args(["--delmonitor", VIRTUAL_MONITOR]).output().ok();
+    let (w, h) = extent_excluding(VIRTUAL_MONITOR);
+    if w > 0 && h > 0 {
+        let fb = format!("{w}x{h}");
+        Command::new("xrandr").args(["--fb", &fb]).output().ok();
+    }
+    log::info!("fgtw vmon: '{VIRTUAL_MONITOR}' removed, framebuffer back to physical extent");
+}
+
 pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> ResultType<()> {
+    // The virtual head resizes by recreation, never by transform — it has no mode to scale.
+    if name == VIRTUAL_MONITOR {
+        return ensure_virtual_monitor(width, height);
+    }
     // VirtualBox-style follow WITHOUT touching the monitor's mode: `--scale-from` resizes the
     // logical desktop (framebuffer) to exactly W×H and the panel up/down-samples it, staying on
     // its native mode the whole time. Capture reads the framebuffer, so the peer gets exact

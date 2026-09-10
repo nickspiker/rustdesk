@@ -4352,6 +4352,15 @@ impl Connection {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    /// Index of the fleet virtual monitor in the current display list, `None` if absent.
+    #[cfg(target_os = "linux")]
+    fn virtual_monitor_index(&self) -> Option<usize> {
+        let displays = display_service::try_get_displays().ok()?;
+        displays
+            .iter()
+            .position(|d| d.name() == crate::platform::linux::VIRTUAL_MONITOR)
+    }
+
     /// The active display's current size, or `None` if it cannot be read.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn current_display_resolution(&self) -> Option<(i32, i32)> {
@@ -4531,20 +4540,34 @@ impl Connection {
         if let Some(r) = o.custom_resolution.as_ref() {
             if r.width > 0 && r.height > 0 && !self.view_camera {
                 log::info!("fgtw follow: login asked for {}x{}", r.width, r.height);
-                // Idempotent: a request for the size we are already at must do nothing.
-                // change_resolution restarts the capturer, so re-applying the same size kills
-                // the video stream for no reason.
-                let already = self.current_display_resolution();
-                if already == Some((r.width, r.height)) {
-                    log::info!("fgtw follow: already {}x{} — leaving the capturer alone", r.width, r.height);
-                    return;
+                // Linux fleet host: give the session its OWN display head instead of resizing
+                // the physical monitor. The virtual monitor exists whether or not a screen is
+                // plugged in, never clones or fights the real one, and is exactly the guest's
+                // size — the "act like a second monitor" model. Point capture at it here,
+                // before the video service starts. Other platforms keep the resize path.
+                #[cfg(target_os = "linux")]
+                {
+                    if let Err(e) =
+                        crate::platform::linux::ensure_virtual_monitor(r.width as _, r.height as _)
+                    {
+                        log::error!("fgtw vmon: could not create virtual monitor: {e}");
+                    } else if let Some(idx) = self.virtual_monitor_index() {
+                        log::info!("fgtw vmon: capturing virtual monitor at display #{idx}");
+                        self.display_idx = idx;
+                    } else {
+                        log::warn!("fgtw vmon: created but not found in the display list");
+                    }
                 }
-                self.change_resolution(None, r);
-                // Requesting is not arriving: xrandr returns before the new framebuffer is
-                // live, so the capturer would grab a frame or two at the OLD size and the
-                // guest would draw them 1:1 (the brief tiny window). Wait for the size to
-                // actually read back before letting the video service start.
-                self.await_resolution(r.width, r.height).await;
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let already = self.current_display_resolution();
+                    if already == Some((r.width, r.height)) {
+                        log::info!("fgtw follow: already {}x{} — leaving the capturer alone", r.width, r.height);
+                        return;
+                    }
+                    self.change_resolution(None, r);
+                    self.await_resolution(r.width, r.height).await;
+                }
             }
         }
         if let Ok(q) = o.image_quality.enum_value() {
@@ -6777,6 +6800,9 @@ mod raii {
                 }
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 display_service::restore_resolutions();
+                // Fleet virtual head goes away with the session, framebuffer back to physical.
+                #[cfg(target_os = "linux")]
+                crate::platform::linux::remove_virtual_monitor();
                 #[cfg(windows)]
                 let _ = virtual_display_manager::reset_all();
                 #[cfg(target_os = "linux")]
