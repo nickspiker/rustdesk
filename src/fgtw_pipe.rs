@@ -589,7 +589,17 @@ async fn try_lan(
 ) -> ResultType<(Stream, bool, Option<Vec<u8>>, Option<KcpStream>, &'static str)> {
     let mut conn = hbb_common::socket_client::connect_tcp(addr, LAN_DIAL_TIMEOUT).await?;
     let pk = Client::secure_connection_fleet(Some(peer_id), &mut conn).await?;
-    Ok((conn, true, pk, None, "FGTW-LAN"))
+    // Name the tier from the address that actually answered, on the shared fgtw ladder — so
+    // the strip and the fleet tile can never disagree about how we got here.
+    let tag = match addr.parse::<std::net::SocketAddr>() {
+        Ok(sa) => match fgtw::traverse::gather::classify_path(&sa, crate::fgtw_auth::our_lan_v4()) {
+            fgtw::traverse::gather::PathTier::NoRouter => "FGTW-P2P",
+            fgtw::traverse::gather::PathTier::Lan => "FGTW-LAN",
+            _ => "FGTW-WAN",
+        },
+        Err(_) => "FGTW-LAN",
+    };
+    Ok((conn, true, pk, None, tag))
 }
 
 // ── accept seam (host side) ──

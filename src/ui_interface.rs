@@ -888,8 +888,15 @@ pub fn refresh_fleet_peers() {
                         "self"
                     } else if d.rustdesk_id.is_none() {
                         "none"
-                    } else if d.on_lan {
-                        "lan"
+                    } else if let Some(t) = d.direct_tier {
+                        // Shared ladder (fgtw::traverse::gather::PathTier) — same colours mean
+                        // the same thing here as in photon's presence ring.
+                        match t {
+                            fgtw::traverse::gather::PathTier::NoRouter => "norouter",
+                            fgtw::traverse::gather::PathTier::Lan => "lan",
+                            fgtw::traverse::gather::PathTier::Wan => "wan",
+                            fgtw::traverse::gather::PathTier::Relay => "relay",
+                        }
                     } else {
                         match d.online {
                             Some(true) => "relay",

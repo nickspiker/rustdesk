@@ -524,8 +524,8 @@ pub struct FleetDevice {
     pub online: Option<bool>,
     /// The device's published LAN address (`ip:port`), if it published one.
     pub lan_addr: Option<String>,
-    /// A published LAN address answered a probe — the peer is on our own network.
-    pub on_lan: bool,
+    /// The best direct path that answered a probe, if any — what the tile colours by.
+    pub direct_tier: Option<fgtw::traverse::gather::PathTier>,
 }
 
 /// The current fleet as a chooser list: every member (fresh fold, cache fallback within
@@ -538,12 +538,25 @@ pub fn device_for_rustdesk_id(id: &str) -> Option<[u8; 32]> {
     device_and_lan_for_rustdesk_id(id).map(|(pk, _)| pk)
 }
 
+/// Our own LAN v4, for the same-subnet judgment the tier classifier needs.
+pub fn our_lan_v4() -> Option<std::net::Ipv4Addr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("1.1.1.1:80").ok()?; // routing lookup only, sends nothing
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) => Some(ip),
+        _ => None,
+    }
+}
+
 /// Does any of a device's published LAN addresses answer right now?
 /// A tile that only knows "the relay pipe is open" cannot tell a peer in the same room from one
 /// on another continent — both are merely reachable. One short connect per candidate is what
 /// separates them, and it is the same probe the dialler would make anyway.
-fn lan_reachable(lan: &Option<String>) -> bool {
-    let Some(list) = lan else { return false };
+fn lan_reachable(lan: &Option<String>) -> Option<fgtw::traverse::gather::PathTier> {
+    use fgtw::traverse::gather::PathTier;
+    let list = lan.as_ref()?;
+    let ours = our_lan_v4();
+    let mut best: Option<PathTier> = None;
     for addr in list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&addr) else { continue };
         for sa in addrs {
@@ -552,11 +565,18 @@ fn lan_reachable(lan: &Option<String>) -> bool {
             if std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(250))
                 .is_ok()
             {
-                return true;
+                let tier = fgtw::traverse::gather::classify_path(&sa, ours);
+                // Tiers sort best-first, so keep the best any candidate achieved.
+                if best.map_or(true, |b| tier < b) {
+                    best = Some(tier);
+                }
+                if tier == PathTier::NoRouter {
+                    return best; // nothing beats a router-free link
+                }
             }
         }
     }
-    false
+    best
 }
 
 /// The fleet device behind a RustDesk id, plus its published LAN address if it has one.
@@ -631,8 +651,8 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
             is_self: me == Some(*m),
             // Only probe peers: our own pipe's state is not interesting and would cost a round trip per refresh.
             online: if me == Some(*m) { None } else { pipe_alive(m) },
-            on_lan: if me == Some(*m) {
-                false
+            direct_tier: if me == Some(*m) {
+                None
             } else {
                 lan_reachable(&lans.get(m).cloned())
             },

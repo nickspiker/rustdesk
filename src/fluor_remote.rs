@@ -268,37 +268,38 @@ const HUD_SHADOW: u32 = argb(0x00, 0x00, 0x00, 0xFF);
 /// How the session reaches the host — drawn as a strip along the top edge so the path is
 /// visible at a glance, because the difference between them is milliseconds versus a WAN
 /// round trip and you cannot feel which one you got until something is slow.
+/// Mirrors `fgtw::traverse::gather::PathTier`, the ladder photon rings by.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum TransportKind {
     /// Relayed through the fgtw seed — works anywhere, costs a WAN round trip.
     #[default]
     Relay,
-    /// Punched straight through to a peer across the internet.
-    WanDirect,
-    /// A peer on our own network, dialled at its published LAN address.
+    /// Direct across the internet.
+    Wan,
+    /// A local network: no internet needed, just the building's own wiring.
     Lan,
-    /// A raw address we were given, no discovery involved.
-    Direct,
+    /// No router at all — a hotspot or peer-to-peer link, nothing in the middle.
+    NoRouter,
 }
 
 impl TransportKind {
     /// Map the transport tag `Client::start` reports into a kind.
     fn from_tag(tag: &str) -> Self {
         match tag {
+            "FGTW-P2P" => Self::NoRouter,
             "FGTW-LAN" => Self::Lan,
-            "FGTW" => Self::Relay,
-            "FGTW-PUNCH" => Self::WanDirect,
-            _ => Self::Direct, // plain TCP/UDP: an address we were handed
+            "FGTW-WAN" => Self::Wan,
+            _ => Self::Relay, // "FGTW" and anything unrecognised rides the seed's pipe
         }
     }
 
-    /// Strip colour: amber relay, green punched WAN, cyan LAN, blue direct.
+    /// Strip colour: blue no-router, cyan LAN, green WAN, amber relay.
     fn colour(self) -> u32 {
         match self {
-            Self::Relay => argb(0xFF, 0xC0, 0x20, 0xFF),
-            Self::WanDirect => argb(0x30, 0xFF, 0x50, 0xFF),
+            Self::NoRouter => argb(0x40, 0x90, 0xFF, 0xFF),
             Self::Lan => argb(0x20, 0xE0, 0xE0, 0xFF),
-            Self::Direct => argb(0x40, 0x90, 0xFF, 0xFF),
+            Self::Wan => argb(0x32, 0xCD, 0x32, 0xFF),
+            Self::Relay => argb(0xFF, 0xC0, 0x20, 0xFF),
         }
     }
 }
