@@ -1670,25 +1670,20 @@ fn primary_output() -> Option<String> {
         .map(|(name, _, _, _)| name)
 }
 
-/// Choose an output to drive as the virtual head: prefer a connected-but-idle connector (a
-/// real crtc with nothing showing on it, e.g. HDMI-A-0 while the monitor is on DisplayPort-0),
-/// then any disconnected output. Never the primary or an already-active output.
+/// Choose an output to drive as the virtual head — ONLY a disconnected connector (a real crtc
+/// with no monitor physically attached). A `connected` output is never a candidate, even if it
+/// has no active mode: a real monitor that is merely asleep or momentarily idle reads exactly
+/// the same, and driving our mode onto it hijacks a screen the user is actually using (it once
+/// shrank their 4K OLED to a macbook-sized desktop). A disconnected connector cannot be a
+/// screen anyone is looking at, so it is the only safe target. `None` if there is none — the
+/// caller then refuses rather than grabbing a physical display.
 fn pick_virtual_output() -> Option<String> {
     let out = Command::new("xrandr").arg("--query").output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let (mut connected_idle, mut disconnected) = (None, None);
-    for line in text.lines() {
-        let Some((name, state, is_primary, has_mode)) = parse_output_line(line) else { continue };
-        if is_primary || has_mode {
-            continue; // in use — leave it alone
-        }
-        if state == "connected" && connected_idle.is_none() {
-            connected_idle = Some(name);
-        } else if state == "disconnected" && disconnected.is_none() {
-            disconnected = Some(name);
-        }
-    }
-    connected_idle.or(disconnected)
+    text.lines()
+        .filter_map(parse_output_line)
+        .find(|(_, state, is_primary, _)| state == "disconnected" && !is_primary)
+        .map(|(name, _, _, _)| name)
 }
 
 /// A CVT **reduced-blanking v1** modeline for `width`x`height`@60, computed here so we do not
