@@ -61,9 +61,6 @@ use std::{
 };
 
 pub const OPTION_REFRESH: &'static str = "refresh";
-/// One-shot guard for the fleet virtual-monitor luma probe (composite-vs-black).
-#[cfg(target_os = "linux")]
-static LOGGED_FIRST_LUMA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 type FrameFetchedNotifierSender = UnboundedSender<(i32, Option<Instant>)>;
 type FrameFetchedNotifierReceiver = Arc<TokioMutex<UnboundedReceiver<(i32, Option<Instant>)>>>;
@@ -649,6 +646,8 @@ fn run(vs: VideoService) -> ResultType<()> {
 
     #[cfg(target_os = "linux")]
     let mut would_block_count = 0u32;
+    #[cfg(target_os = "linux")]
+    let mut logged_first_frame = false;
     let mut yuv = Vec::new();
     let mut mid_data = Vec::new();
     let mut repeat_encode_counter = 0;
@@ -728,19 +727,16 @@ fn run(vs: VideoService) -> ResultType<()> {
             Ok(frame) => {
                 repeat_encode_counter = 0;
                 if frame.valid() {
-                    // One-shot: mean luma of the first valid frame. A virtual monitor with no
-                    // crtc behind it would capture as pure black (~0); real content is well
-                    // above that. This is how we learn composite-vs-black without a probe.
                     #[cfg(target_os = "linux")]
-                    if !LOGGED_FIRST_LUMA.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    if !logged_first_frame {
                         if let scrap::Frame::PixelBuffer(pf) = &frame {
                             let d = pf.data();
-                            let step = (d.len() / 4096).max(1);
-                            let (mut sum, mut n) = (0u64, 0u64);
-                            let mut i = 0;
-                            while i < d.len() { sum += d[i] as u64; n += 1; i += step; }
-                            let mean = if n > 0 { sum / n } else { 0 };
-                            log::info!("fgtw vmon: first-frame mean byte = {mean} ({}x{}) — >2 composites, ~0 is black", pf.width(), pf.height());
+                            let stepn = (d.len() / 4096).max(1);
+                            let (mut sum, mut cnt, mut i) = (0u64, 0u64, 0usize);
+                            while i < d.len() { sum += d[i] as u64; cnt += 1; i += stepn; }
+                            let mean = if cnt > 0 { sum / cnt } else { 0 };
+                            log::info!("fgtw vmon: display #{display_idx} first frame {}x{} mean {mean} (>2 composites, ~0 black)", pf.width(), pf.height());
+                            logged_first_frame = true;
                         }
                     }
                     let screenshot_key = (vs.source, display_idx);
