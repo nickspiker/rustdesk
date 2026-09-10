@@ -515,7 +515,7 @@ pub async fn connect(
     let client = client()?;
     let relay = client.open(device);
     let mut conn = wrap(relay);
-    let pk = Client::secure_connection_fleet(peer_id, &mut conn).await?;
+    let pk = Client::secure_connection_fleet(Some(peer_id), &mut conn).await?;
     Ok((conn, true, pk, None, "FGTW"))
 }
 

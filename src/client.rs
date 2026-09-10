@@ -257,18 +257,17 @@ impl Client {
         }
         // to-do: remember the port for each peer, so that we can retry easier
         if hbb_common::is_ip_str(peer) {
-            return Ok((
-                (
-                    connect_tcp_local(check_port(peer, RELAY_PORT + 1), None, CONNECT_TIMEOUT)
-                        .await?,
-                    true,
-                    None,
-                    None,
-                    "TCP",
-                ),
-                (0, "".to_owned()),
-                false,
-            ));
+            #[allow(unused_mut)]
+            let mut conn =
+                connect_tcp_local(check_port(peer, RELAY_PORT + 1), None, CONNECT_TIMEOUT).await?;
+            // A direct dial still proves fleet membership: the host sends its SignedId and we
+            // check it against the fold, exactly as over the relay. That keeps a LAN session
+            // encrypted and passless — without it the host (fleet-only) would refuse us.
+            #[cfg(feature = "fgtw")]
+            let pk = Client::secure_connection_fleet(None, &mut conn).await?;
+            #[cfg(not(feature = "fgtw"))]
+            let pk = None;
+            return Ok(((conn, true, pk, None, "TCP"), (0, "".to_owned()), false));
         }
         // Allow connect to {domain}:{port}
         if hbb_common::is_domain_port_str(peer) {
@@ -870,8 +869,11 @@ impl Client {
     /// The host still signs its `SignedId` with its device key (rustdesk sign key == fleet device key), so we read that off the wire and check it against current membership.
     /// **Fails closed** — a host we can't place in the fleet is refused, and the caller falls back to the rendezvous path (which does its own verification).
     #[cfg(feature = "fgtw")]
+    /// `expect_id` is `Some` when we dialed a peer id and the host must prove it is that one.
+    /// It is `None` for a direct IP dial: we do not know which fleet member lives at that
+    /// address, so any current member is acceptable — membership is the credential either way.
     pub(crate) async fn secure_connection_fleet(
-        peer_id: &str,
+        expect_id: Option<&str>,
         conn: &mut Stream,
     ) -> ResultType<Option<Vec<u8>>> {
         match timeout(READ_TIMEOUT, conn.next()).await? {
@@ -885,8 +887,10 @@ impl Client {
                 let (id, their_pk_b, host_sign_pk) =
                     crate::fgtw_auth::verify_host_signed_id(&si.id)
                         .ok_or_else(|| anyhow!("fgtw: host SignedId is not from a current fleet member"))?;
-                if id != peer_id {
-                    bail!("fgtw: host id {id} does not match dialed peer {peer_id}");
+                if let Some(want) = expect_id {
+                    if id != want {
+                        bail!("fgtw: host id {id} does not match dialed peer {want}");
+                    }
                 }
                 let (asymmetric_value, symmetric_value, sym_key) =
                     create_symmetric_key_msg(their_pk_b);

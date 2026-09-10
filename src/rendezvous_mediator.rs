@@ -934,7 +934,10 @@ async fn direct_server(server: ServerPtr) {
                             server,
                             hbb_common::Stream::from(stream, local_addr),
                             addr,
-                            false,
+                            // secure=true: send our SignedId so a direct dial can complete the
+                            // fgtw handshake. This host authorizes fleet membership and nothing
+                            // else, so an unauthenticated direct connection would just be refused.
+                            true,
                             ConnectionMeta::default(), // Direct connections don't have server-side user context.
                         )
                         .await
