@@ -198,6 +198,21 @@ if [ "$OS" = "Darwin" ]; then
 PLIST
 
     xattr -cr "$APP_DIR/$APP_NAME" 2>/dev/null || true
+
+    # Sign with a STABLE identifier. macOS keys privacy grants (Local Network especially) to the
+    # code-signature identifier, and a plain ad-hoc signature derives that identifier from the
+    # binary hash — so every rebuild looked like a different app and silently lost its Local
+    # Network permission, which made every LAN connection fail instantly while the relay kept
+    # working. Pinning -i to the bundle id keeps one identity across rebuilds, so the grant
+    # sticks and you approve it once.
+    if command -v codesign >/dev/null 2>&1; then
+        codesign --force --sign - \
+            --identifier com.nickspiker.rustdesk \
+            --options runtime \
+            "$APP_DIR/$APP_NAME" >/dev/null 2>&1 \
+            && echo "✓ Signed with stable identity (com.nickspiker.rustdesk)" \
+            || echo "⚠ Could not sign — Local Network permission may reset on each build"
+    fi
     echo "✓ App bundle created at $APP_DIR/$APP_NAME"
     echo ""
 fi
