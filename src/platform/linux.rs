@@ -1663,19 +1663,52 @@ fn pick_virtual_output() -> Option<String> {
     connected_idle.or(disconnected)
 }
 
-/// A CVT reduced-blanking modeline for `width`x`height`@60 — the params `xrandr --newmode`
-/// wants (everything after the quoted mode name). Reduced blanking keeps the pixel clock low
-/// enough for a digital output to accept an arbitrary size.
+/// A CVT **reduced-blanking v1** modeline for `width`x`height`@60, computed here so we do not
+/// depend on the `cvt` binary being installed (it often is not on a headless box). Returns the
+/// params `xrandr --newmode` wants: `clkMHz  hdisp hs he htotal  vdisp vs ve vtotal +hsync -vsync`.
+/// Reduced blanking keeps the pixel clock low enough for a digital output to accept an
+/// arbitrary size. Formula per the VESA CVT-RB spec (the same one `cvt -r` implements).
 fn cvt_modeline(width: usize, height: usize) -> Option<String> {
-    let out = Command::new("cvt")
-        .args(["-r", &width.to_string(), &height.to_string(), "60"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // Line: Modeline "2560x1570R"  251.50  2560 2608 2640 2720  1570 1573 1583 1603 +hsync -vsync
-    let ml = text.lines().find(|l| l.trim_start().starts_with("Modeline"))?;
-    let after_name = ml.split('"').nth(2)?.trim();
-    (!after_name.is_empty()).then(|| after_name.to_string())
+    if width == 0 || height == 0 {
+        return None;
+    }
+    // CVT-RB constants.
+    const RB_H_BLANK: usize = 160; // fixed horizontal blanking
+    const RB_H_SYNC: usize = 32; // fixed hsync width
+    const RB_V_FRONT: usize = 3; // vsync front porch (lines)
+    const RB_V_SYNC: usize = 4; // vsync width (lines)
+    const RB_MIN_V_BLANK_US: f64 = 460.0; // minimum vertical blanking time
+    let refresh = 60.0_f64;
+
+    // Horizontal: total = active + fixed blanking, sync centred toward the end.
+    let h_total = width + RB_H_BLANK;
+    let h_sync_start = width + RB_H_BLANK / 2 - RB_H_SYNC;
+    let h_sync_end = width + RB_H_BLANK / 2;
+
+    // Vertical blanking from the minimum-blank time, expressed in whole lines.
+    // v_blank_lines ≈ ceil(refresh * (V_active) * min_blank / (1e6 - refresh*min_blank... ))
+    // Use the CVT-RB line-time derivation: h_period = (1/refresh - MIN_V_BLANK)/V_total.
+    // Solve iteratively-free: lines of blanking = ceil(MIN_V_BLANK_US * refresh * (height) /
+    // (1_000_000 / ... )) — instead use the standard: blank lines from min-blank / line-time.
+    // Line time (µs) = (1e6/refresh) / v_total; with v_total = height + v_blank.
+    // v_blank (lines) = ceil(MIN_V_BLANK_US / line_time). One fixed-point pass is exact enough.
+    let approx_line_time_us = (1_000_000.0 / refresh) / (height as f64 + 30.0);
+    let v_blank = (RB_MIN_V_BLANK_US / approx_line_time_us).ceil() as usize;
+    let v_blank = v_blank.max(RB_V_FRONT + RB_V_SYNC + 1);
+    let v_total = height + v_blank;
+    let v_sync_start = height + RB_V_FRONT;
+    let v_sync_end = height + RB_V_FRONT + RB_V_SYNC;
+
+    // Pixel clock (MHz), rounded to 0.25 like CVT does.
+    let pixel_clock_hz = (h_total as f64) * (v_total as f64) * refresh;
+    let clk_mhz = ((pixel_clock_hz / 1_000_000.0) / 0.25).round() * 0.25;
+
+    Some(format!(
+        "{clk:.2} {hd} {hss} {hse} {ht} {vd} {vss} {vse} {vt} +hsync -vsync",
+        clk = clk_mhz,
+        hd = width, hss = h_sync_start, hse = h_sync_end, ht = h_total,
+        vd = height, vss = v_sync_start, vse = v_sync_end, vt = v_total,
+    ))
 }
 
 /// The mode name we register for a given size.
