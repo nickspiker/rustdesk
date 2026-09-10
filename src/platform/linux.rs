@@ -1680,9 +1680,11 @@ fn primary_output() -> Option<String> {
 fn pick_virtual_output() -> Option<String> {
     let out = Command::new("xrandr").arg("--query").output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
+    // Any disconnected connector — the primary flag is irrelevant here, since a disconnected
+    // output has no monitor regardless (headless boxes often leave the flag on a dead output).
     text.lines()
         .filter_map(parse_output_line)
-        .find(|(_, state, is_primary, _)| state == "disconnected" && !is_primary)
+        .find(|(_, state, _, _)| state == "disconnected")
         .map(|(name, _, _, _)| name)
 }
 
