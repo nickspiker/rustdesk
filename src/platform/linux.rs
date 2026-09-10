@@ -1607,6 +1607,34 @@ use std::sync::Mutex;
 
 /// The output we have commandeered as the virtual head this session, if any.
 static VIRTUAL_OUTPUT: Mutex<Option<String>> = Mutex::new(None);
+/// The guest tag whose head this is — names the config key its position is saved under.
+static VMON_GUEST_TAG: Mutex<Option<String>> = Mutex::new(None);
+/// Config key prefix for a guest's remembered head position ("x,y").
+const VMON_POS_OPT_PREFIX: &str = "fgtw-vmon-pos-";
+
+/// The position this guest's head was last left at, from config.
+fn saved_position(tag: &str) -> Option<(usize, usize)> {
+    let v = Config::get_option(&format!("{VMON_POS_OPT_PREFIX}{tag}"));
+    let (x, y) = v.split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+/// The head's CURRENT position `(x, y)` from xrandr — wherever the user arranged it.
+pub fn virtual_monitor_position() -> Option<(usize, usize)> {
+    let output = virtual_output_name()?;
+    let out = Command::new("xrandr").arg("--query").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| l.split_whitespace().next() == Some(output.as_str()))?;
+    // The geometry token looks like "2560x1570+3840+0".
+    let geo = line
+        .split_whitespace()
+        .find(|t| t.contains('x') && t.contains('+') && t.chars().next().map_or(false, |c| c.is_ascii_digit()))?;
+    let mut it = geo.split('+');
+    let _size = it.next()?;
+    let x: usize = it.next()?.parse().ok()?;
+    let y: usize = it.next()?.parse().ok()?;
+    Some((x, y))
+}
 
 /// The output currently serving as the fleet virtual head, `None` if not up.
 pub fn virtual_output_name() -> Option<String> {
@@ -1716,18 +1744,23 @@ fn fleet_mode_name(width: usize, height: usize) -> String {
     format!("fleet-{width}x{height}")
 }
 
-/// Bring the virtual head up (or resize it) at `width`x`height` on an idle output, placed
-/// right of the primary. Idempotent when already that size.
-pub fn ensure_virtual_monitor(width: usize, height: usize) -> ResultType<()> {
+/// Bring the virtual head up (or resize it) at `width`x`height` on an idle output.
+/// Placement is deterministic per guest: a fresh bring-up restores where `guest_tag` last left
+/// it (falling back to right-of-primary), and a live resize keeps the current arrangement.
+/// Idempotent when already that size.
+pub fn ensure_virtual_monitor(width: usize, height: usize, guest_tag: Option<&str>) -> ResultType<()> {
     if let Some(name) = virtual_output_name() {
         if active_mode_size(&name) == Some((width, height)) {
             return Ok(());
         }
     }
-    let output = match virtual_output_name() {
-        Some(n) => n,
-        None => pick_virtual_output()
-            .ok_or_else(|| hbb_common::anyhow::anyhow!("no idle output to use as a virtual head"))?,
+    let (output, fresh) = match virtual_output_name() {
+        Some(n) => (n, false),
+        None => (
+            pick_virtual_output()
+                .ok_or_else(|| hbb_common::anyhow::anyhow!("no idle output to use as a virtual head"))?,
+            true,
+        ),
     };
     let mode = fleet_mode_name(width, height);
     let params = cvt_modeline(width, height)
@@ -1741,14 +1774,25 @@ pub fn ensure_virtual_monitor(width: usize, height: usize) -> ResultType<()> {
         .ok();
     Command::new("xrandr").args(["--addmode", &output, &mode]).output().ok();
     let mut args = vec!["--output".to_string(), output.clone(), "--mode".to_string(), mode.clone()];
-    match primary_output() {
-        Some(primary) if primary != output => {
-            args.push("--right-of".to_string());
-            args.push(primary);
-        }
-        _ => {
-            args.push("--pos".to_string());
-            args.push("0x0".to_string());
+    // Only a FRESH head gets positioned. A live resize passes no position args, so the head
+    // stays exactly where the user arranged it in the OS display settings.
+    if fresh {
+        *VMON_GUEST_TAG.lock().unwrap() = guest_tag.map(|t| t.to_string());
+        match guest_tag.and_then(saved_position) {
+            Some((x, y)) => {
+                args.push("--pos".to_string());
+                args.push(format!("{x}x{y}"));
+            }
+            None => match primary_output() {
+                Some(primary) if primary != output => {
+                    args.push("--right-of".to_string());
+                    args.push(primary);
+                }
+                _ => {
+                    args.push("--pos".to_string());
+                    args.push("0x0".to_string());
+                }
+            },
         }
     }
     let out = Command::new("xrandr").args(&args).output()?;
@@ -1760,18 +1804,25 @@ pub fn ensure_virtual_monitor(width: usize, height: usize) -> ResultType<()> {
     Ok(())
 }
 
-/// Turn the virtual head's output back off and forget it.
+/// Turn the virtual head's output back off and forget it, remembering where the user left it
+/// so the same guest's next session brings it back in the same place.
 pub fn remove_virtual_monitor() {
     let Some(output) = virtual_output_name() else { return };
+    let tag = VMON_GUEST_TAG.lock().unwrap().clone();
+    if let (Some(tag), Some((x, y))) = (tag, virtual_monitor_position()) {
+        Config::set_option(format!("{VMON_POS_OPT_PREFIX}{tag}"), format!("{x},{y}"));
+        log::info!("fgtw vmon: saved position {x},{y} for guest {tag}");
+    }
     Command::new("xrandr").args(["--output", &output, "--off"]).output().ok();
     *VIRTUAL_OUTPUT.lock().unwrap() = None;
+    *VMON_GUEST_TAG.lock().unwrap() = None;
     log::info!("fgtw vmon: '{output}' turned off, virtual head gone");
 }
 
 pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> ResultType<()> {
     // The virtual head resizes by driving a fresh mode, not a scale transform.
     if virtual_output_name().as_deref() == Some(name) {
-        return ensure_virtual_monitor(width, height);
+        return ensure_virtual_monitor(width, height, None);
     }
     // VirtualBox-style follow WITHOUT touching the monitor's mode: `--scale-from` resizes the
     // logical desktop (framebuffer) to exactly W×H and the panel up/down-samples it, staying on

@@ -366,6 +366,9 @@ pub struct Connection {
     voice_call_request_timestamp: Option<NonZeroI64>,
     voice_calling: bool,
     options_in_login: Option<OptionMessage>,
+    /// The fleet device that authorized this connection, when fgtw auth did.
+    #[allow(dead_code)]
+    fgtw_device_pk: Option<[u8; 32]>,
     #[cfg(not(any(target_os = "ios")))]
     pressed_modifiers: HashSet<rdev::Key>,
     #[cfg(target_os = "linux")]
@@ -568,6 +571,7 @@ impl Connection {
             voice_call_request_timestamp: None,
             voice_calling: false,
             options_in_login: None,
+            fgtw_device_pk: None,
             #[cfg(not(any(target_os = "ios")))]
             pressed_modifiers: Default::default(),
             #[cfg(target_os = "linux")]
@@ -1904,7 +1908,14 @@ impl Connection {
             #[cfg(target_os = "linux")]
             if self.authed_conn_type() == Some(AuthConnType::Remote) {
                 if let Some((w, h)) = self.fleet_requested_size() {
-                    if let Err(e) = crate::platform::linux::ensure_virtual_monitor(w, h) {
+                    // The tag makes placement deterministic per guest: each device's head
+                    // comes back wherever that device last left it.
+                    let tag = self
+                        .fgtw_device_pk
+                        .map(|pk| pk[..8].iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    if let Err(e) =
+                        crate::platform::linux::ensure_virtual_monitor(w, h, tag.as_deref())
+                    {
                         log::error!("fgtw vmon: could not create virtual monitor: {e}");
                     } else {
                         log::info!("fgtw vmon: virtual head up at {w}x{h} for this session");
@@ -2690,6 +2701,8 @@ impl Connection {
             if let Some(device_pk) = crate::fgtw_auth::take_authed(self.inner.id()) {
                 if Config::get_option("enable-fgtw-auth") != "N" {
                     log::info!("fgtw: authorizing fleet device {:02x?}", &device_pk[..4]);
+                    // Kept for per-guest state, e.g. remembering where this guest's virtual head was arranged.
+                    self.fgtw_device_pk = Some(device_pk);
                     self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Fgtw);
                     #[cfg(target_os = "linux")]
                     self.linux_headless_handle.wait_desktop_cm_ready().await;
