@@ -324,7 +324,15 @@ impl FluorViewer {
         let (ox, oy, scale) = self.view_rect(vw, vh, fw as f32, fh as f32);
         let rx = ((x - ox) / scale) as i32;
         let ry = ((y - oy) / scale) as i32;
-        Some((rx.clamp(0, fw as i32 - 1), ry.clamp(0, fh as i32 - 1)))
+        // Clamp to the frame, THEN shift into the host's absolute desktop space. The host maps
+        // the coordinate straight to the OS (mouse_move_to takes absolute screen coords), so a
+        // monitor at a non-zero offset — the virtual head at +3840+0 — needs its origin added
+        // or every click lands that many pixels to the left, on the primary panel. This field
+        // was set for exactly this and never actually read; here is where it is read.
+        let (dox, doy) = *self.shared.display_origin.lock().unwrap();
+        let rx = rx.clamp(0, fw as i32 - 1) + dox;
+        let ry = ry.clamp(0, fh as i32 - 1) + doy;
+        Some((rx, ry))
     }
 
     fn send_move(&self, ctx: &Context, x: Coord, y: Coord) {
