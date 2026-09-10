@@ -51,6 +51,8 @@ struct Shared {
     frame: Mutex<FrameBuf>,
     /// Set once the fluor host hands us the wake proxy (after app construction).
     proxy: Mutex<Option<Arc<dyn WakeSender<Wake>>>>,
+    /// How we are reaching the host, for the connection strip. See `TransportKind`.
+    transport: Mutex<TransportKind>,
     /// Remote cursor position (device px in the remote's space), for drawing our own pointer.
     cursor: Mutex<(i32, i32)>,
     /// The current display's origin (x, y) in the remote's virtual-desktop space. Added to
@@ -158,7 +160,11 @@ impl InvokeUiSession for FluorHandler {
     fn update_privacy_mode(&self) {}
     fn set_permission(&self, _name: &str, _value: bool) {}
     fn update_quality_status(&self, _qs: crate::client::QualityStatus) {}
-    fn set_connection_type(&self, _is_secured: bool, _direct: bool, _stream_type: &str) {}
+    fn set_connection_type(&self, _is_secured: bool, _direct: bool, stream_type: &str) {
+        let kind = TransportKind::from_tag(stream_type);
+        *self.shared.transport.lock().unwrap() = kind;
+        log::info!("fluor: transport is {stream_type}");
+    }
     fn set_fingerprint(&self, _fingerprint: String) {}
     fn job_error(&self, _id: i32, _err: String, _file_num: i32) {}
     fn job_done(&self, _id: i32, _file_num: i32) {}
@@ -236,6 +242,8 @@ const BTN_MIDDLE: i32 = 4;
 
 /// Opaque dark-grey letterbox, α+darkness packed (darkness 0xC0 → visible 0x3F).
 const BACKDROP: u32 = 0xFFC0_C0C0;
+/// Height of the connection strip in pixels — enough to notice, thin enough to ignore.
+const STRIP_PX: usize = 3;
 
 /// Quiet time after the last window-size change before we ask the host to follow — long enough
 /// that dragging the window doesn't mint an xrandr mode per pixel, short enough to feel live.
@@ -256,6 +264,44 @@ const fn argb(r: u8, g: u8, b: u8, a: u8) -> u32 {
 const HUD_GREEN: u32 = argb(0x30, 0xFF, 0x50, 0xFF);
 const HUD_AMBER: u32 = argb(0xFF, 0xC0, 0x20, 0xFF);
 const HUD_SHADOW: u32 = argb(0x00, 0x00, 0x00, 0xFF);
+
+/// How the session reaches the host — drawn as a strip along the top edge so the path is
+/// visible at a glance, because the difference between them is milliseconds versus a WAN
+/// round trip and you cannot feel which one you got until something is slow.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum TransportKind {
+    /// Relayed through the fgtw seed — works anywhere, costs a WAN round trip.
+    #[default]
+    Relay,
+    /// Punched straight through to a peer across the internet.
+    WanDirect,
+    /// A peer on our own network, dialled at its published LAN address.
+    Lan,
+    /// A raw address we were given, no discovery involved.
+    Direct,
+}
+
+impl TransportKind {
+    /// Map the transport tag `Client::start` reports into a kind.
+    fn from_tag(tag: &str) -> Self {
+        match tag {
+            "FGTW-LAN" => Self::Lan,
+            "FGTW" => Self::Relay,
+            "FGTW-PUNCH" => Self::WanDirect,
+            _ => Self::Direct, // plain TCP/UDP: an address we were handed
+        }
+    }
+
+    /// Strip colour: amber relay, green punched WAN, cyan LAN, blue direct.
+    fn colour(self) -> u32 {
+        match self {
+            Self::Relay => argb(0xFF, 0xC0, 0x20, 0xFF),
+            Self::WanDirect => argb(0x30, 0xFF, 0x50, 0xFF),
+            Self::Lan => argb(0x20, 0xE0, 0xE0, 0xFF),
+            Self::Direct => argb(0x40, 0x90, 0xFF, 0xFF),
+        }
+    }
+}
 
 struct FluorViewer {
     session: Session<FluorHandler>,
@@ -665,6 +711,15 @@ impl FluorApp for FluorViewer {
             draw_image(&mut canvas, &f.pixels, fw, fh, cx, cy, dw, dh, None);
         }
         drop(f);
+        // Connection strip along the very top, drawn OVER the video: a few pixels of colour
+        // naming the path we got (amber relay / green WAN / cyan LAN / blue direct).
+        {
+            let colour = self.shared.transport.lock().unwrap().colour();
+            let rows = STRIP_PX.min(bh);
+            for px in target.iter_mut().take(rows * bw) {
+                *px = colour;
+            }
+        }
         // Backdrop UNDER everything: fills the letterbox and makes the window opaque, while
         // the (opaque) video pixels ride through unchanged.
         for px in target.iter_mut() {
