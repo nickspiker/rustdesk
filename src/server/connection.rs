@@ -4387,9 +4387,8 @@ impl Connection {
     #[cfg(target_os = "linux")]
     fn virtual_monitor_index(&self) -> Option<usize> {
         let displays = display_service::try_get_displays().ok()?;
-        displays
-            .iter()
-            .position(|d| d.name() == crate::platform::linux::VIRTUAL_MONITOR)
+        let vname = crate::platform::linux::virtual_output_name()?;
+        displays.iter().position(|d| d.name() == vname)
     }
 
     /// The active display's current size, or `None` if it cannot be read.

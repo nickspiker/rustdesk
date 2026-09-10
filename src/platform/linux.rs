@@ -1572,11 +1572,12 @@ pub fn resolutions(name: &str) -> Vec<Resolution> {
 }
 
 pub fn current_resolution(name: &str) -> ResultType<Resolution> {
-    // The virtual head is a monitor, not an output — xrandr --query never lists it.
-    if name == VIRTUAL_MONITOR {
-        return match virtual_monitor_geometry() {
-            Some((_, _, w, h)) => Ok(Resolution { width: w as _, height: h as _, ..Default::default() }),
-            None => Err(hbb_common::anyhow::anyhow!("virtual monitor '{VIRTUAL_MONITOR}' not present")),
+    // The virtual head is a real output; read its active mode directly so a forced fleet mode
+    // is reported even if the connected-output regex below does not match it.
+    if virtual_output_name().as_deref() == Some(name) {
+        return match active_mode_size(name) {
+            Some((w, h)) => Ok(Resolution { width: w as _, height: h as _, ..Default::default() }),
+            None => Err(hbb_common::anyhow::anyhow!("virtual head '{name}' has no active mode")),
         };
     }
     let xrandr_output = run_cmds("xrandr --query | tr -s ' '")?;
@@ -1594,122 +1595,149 @@ pub fn current_resolution(name: &str) -> ResultType<Resolution> {
 }
 
 // ── the fleet virtual monitor ──
+//
+// A fleet session gets its OWN display head by driving a real mode onto an idle output (a
+// connected-but-unused connector like HDMI-A-0, or a disconnected one). Unlike an
+// `xrandr --setmonitor` region — which the desktop treats as second-class: never painted,
+// never arrangeable, captured as a black void — a real output has a crtc, so the DE paints
+// wallpaper on it, lets you drag windows to it, and arranges it like any monitor. It works
+// with or without a physical screen attached and never touches the primary.
 
-/// The session's own display head: a RandR virtual monitor in a grown framebuffer region.
-/// The physical output is never resized, cloned, or fought over; a host with no monitor plugged in still has a real display to capture.
-pub const VIRTUAL_MONITOR: &str = "RustDesk-Fleet";
+use std::sync::Mutex;
 
-/// `(right edge, bottom edge)` over every monitor except `exclude` — the framebuffer space real screens occupy, i.e. where the virtual head goes and what to shrink back to.
-fn extent_excluding(exclude: &str) -> (usize, usize) {
-    let Ok(out) = Command::new("xrandr").arg("--listmonitors").output() else {
-        return (0, 0);
-    };
+/// The output we have commandeered as the virtual head this session, if any.
+static VIRTUAL_OUTPUT: Mutex<Option<String>> = Mutex::new(None);
+
+/// The output currently serving as the fleet virtual head, `None` if not up.
+pub fn virtual_output_name() -> Option<String> {
+    VIRTUAL_OUTPUT.lock().unwrap().clone()
+}
+
+/// One `xrandr --query` output line, split into `(name, state, is_primary, has_active_mode)`.
+fn parse_output_line(line: &str) -> Option<(String, String, bool, bool)> {
+    if line.starts_with(' ') || line.starts_with('\t') || line.starts_with("Screen") {
+        return None; // a mode line or the screen header, not an output
+    }
+    let mut p = line.split_whitespace();
+    let name = p.next()?.to_string();
+    let state = p.next()?.to_string();
+    if state != "connected" && state != "disconnected" {
+        return None;
+    }
+    let is_primary = line.contains(" primary ");
+    // An active output carries a geometry token like "2560x1570+0+0".
+    let has_mode = line
+        .split_whitespace()
+        .any(|t| t.contains('x') && t.contains('+') && t.chars().next().map_or(false, |c| c.is_ascii_digit()));
+    Some((name, state, is_primary, has_mode))
+}
+
+/// The primary output's name, for placing the head beside it.
+fn primary_output() -> Option<String> {
+    let out = Command::new("xrandr").arg("--query").output().ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(parse_output_line)
+        .find(|(_, _, primary, _)| *primary)
+        .map(|(name, _, _, _)| name)
+}
+
+/// Choose an output to drive as the virtual head: prefer a connected-but-idle connector (a
+/// real crtc with nothing showing on it, e.g. HDMI-A-0 while the monitor is on DisplayPort-0),
+/// then any disconnected output. Never the primary or an already-active output.
+fn pick_virtual_output() -> Option<String> {
+    let out = Command::new("xrandr").arg("--query").output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let (mut w, mut h) = (0usize, 0usize);
-    // Lines look like: ` 0: +*HDMI-A-0 2560/344x1570/193+0+0  HDMI-A-0` (first line is a count).
-    for line in text.lines().skip(1) {
-        let mut parts = line.split_whitespace();
-        let _idx = parts.next();
-        let name = parts.next().unwrap_or("").trim_start_matches(['+', '*']);
-        if name == exclude {
-            continue;
+    let (mut connected_idle, mut disconnected) = (None, None);
+    for line in text.lines() {
+        let Some((name, state, is_primary, has_mode)) = parse_output_line(line) else { continue };
+        if is_primary || has_mode {
+            continue; // in use — leave it alone
         }
-        if let Some((r, b)) = parts.next().and_then(parse_monitor_geometry) {
-            w = w.max(r);
-            h = h.max(b);
+        if state == "connected" && connected_idle.is_none() {
+            connected_idle = Some(name);
+        } else if state == "disconnected" && disconnected.is_none() {
+            disconnected = Some(name);
         }
     }
-    (w, h)
+    connected_idle.or(disconnected)
 }
 
-/// `"2560/344x1570/193+0+0"` → `(right, bottom)` = `(w+x, h+y)`.
-fn parse_monitor_geometry(geo: &str) -> Option<(usize, usize)> {
-    let mut it = geo.split('+');
-    let size = it.next()?;
-    let x: usize = it.next()?.parse().ok()?;
-    let y: usize = it.next()?.parse().ok()?;
-    let (wp, hp) = size.split_once('x')?;
-    let w: usize = wp.split('/').next()?.parse().ok()?;
-    let h: usize = hp.split('/').next()?.parse().ok()?;
-    Some((w + x, h + y))
+/// A CVT reduced-blanking modeline for `width`x`height`@60 — the params `xrandr --newmode`
+/// wants (everything after the quoted mode name). Reduced blanking keeps the pixel clock low
+/// enough for a digital output to accept an arbitrary size.
+fn cvt_modeline(width: usize, height: usize) -> Option<String> {
+    let out = Command::new("cvt")
+        .args(["-r", &width.to_string(), &height.to_string(), "60"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Line: Modeline "2560x1570R"  251.50  2560 2608 2640 2720  1570 1573 1583 1603 +hsync -vsync
+    let ml = text.lines().find(|l| l.trim_start().starts_with("Modeline"))?;
+    let after_name = ml.split('"').nth(2)?.trim();
+    (!after_name.is_empty()).then(|| after_name.to_string())
 }
 
-/// Create (or resize) the virtual monitor at `width`x`height`, placed to the right of every physical screen. Idempotent when already that size.
+/// The mode name we register for a given size.
+fn fleet_mode_name(width: usize, height: usize) -> String {
+    format!("fleet-{width}x{height}")
+}
+
+/// Bring the virtual head up (or resize it) at `width`x`height` on an idle output, placed
+/// right of the primary. Idempotent when already that size.
 pub fn ensure_virtual_monitor(width: usize, height: usize) -> ResultType<()> {
-    if virtual_monitor_geometry().map(|g| (g.2, g.3)) == Some((width, height)) {
-        return Ok(());
-    }
-    // Recreate from scratch on any size change or stale leftover — delmonitor on a missing name just errors quietly.
-    Command::new("xrandr").args(["--delmonitor", VIRTUAL_MONITOR]).output().ok();
-    let (px, ph) = extent_excluding(VIRTUAL_MONITOR);
-    let fb = format!("{}x{}", px + width, ph.max(height));
-    let out = Command::new("xrandr").args(["--fb", &fb]).output()?;
-    if !out.status.success() {
-        bail!("xrandr --fb {fb}: {}", String::from_utf8_lossy(&out.stderr));
-    }
-    // Physical mm at ~96dpi so the DE derives a sane DPI for the head instead of inventing one.
-    let geo = format!(
-        "{width}/{}x{height}/{}+{px}+0",
-        width * 254 / 960,
-        height * 254 / 960
-    );
-    let out = Command::new("xrandr")
-        .args(["--setmonitor", VIRTUAL_MONITOR, &geo, "none"])
-        .output()?;
-    if !out.status.success() {
-        // Roll the framebuffer back so a failed head does not leave dead desktop space.
-        if px > 0 && ph > 0 {
-            let back = format!("{px}x{ph}");
-            Command::new("xrandr").args(["--fb", &back]).output().ok();
+    if let Some(name) = virtual_output_name() {
+        if active_mode_size(&name) == Some((width, height)) {
+            return Ok(());
         }
-        bail!("xrandr --setmonitor {geo}: {}", String::from_utf8_lossy(&out.stderr));
     }
-    log::info!("fgtw vmon: '{VIRTUAL_MONITOR}' up at {width}x{height}+{px}+0 (fb {fb})");
+    let output = match virtual_output_name() {
+        Some(n) => n,
+        None => pick_virtual_output()
+            .ok_or_else(|| hbb_common::anyhow::anyhow!("no idle output to use as a virtual head"))?,
+    };
+    let mode = fleet_mode_name(width, height);
+    let params = cvt_modeline(width, height)
+        .ok_or_else(|| hbb_common::anyhow::anyhow!("cvt produced no modeline for {width}x{height}"))?;
+    // newmode may already exist from a prior session — ignore that specific failure.
+    Command::new("xrandr")
+        .arg("--newmode")
+        .arg(&mode)
+        .args(params.split_whitespace())
+        .output()
+        .ok();
+    Command::new("xrandr").args(["--addmode", &output, &mode]).output().ok();
+    let mut args = vec!["--output".to_string(), output.clone(), "--mode".to_string(), mode.clone()];
+    match primary_output() {
+        Some(primary) if primary != output => {
+            args.push("--right-of".to_string());
+            args.push(primary);
+        }
+        _ => {
+            args.push("--pos".to_string());
+            args.push("0x0".to_string());
+        }
+    }
+    let out = Command::new("xrandr").args(&args).output()?;
+    if !out.status.success() {
+        bail!("xrandr --output {output} --mode {mode}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    *VIRTUAL_OUTPUT.lock().unwrap() = Some(output.clone());
+    log::info!("fgtw vmon: driving '{output}' at {width}x{height} (mode {mode}) as the virtual head");
     Ok(())
 }
 
-/// Full geometry `(x, y, w, h)` of the virtual monitor, `None` if absent.
-pub fn virtual_monitor_geometry() -> Option<(usize, usize, usize, usize)> {
-    let out = Command::new("xrandr").arg("--listmonitors").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines().skip(1) {
-        let mut parts = line.split_whitespace();
-        let _idx = parts.next();
-        let name = parts.next().unwrap_or("").trim_start_matches(['+', '*']);
-        if name != VIRTUAL_MONITOR {
-            continue;
-        }
-        // "W/mmxH/mm+X+Y"
-        let geo = parts.next()?;
-        let mut it = geo.split('+');
-        let size = it.next()?;
-        let x: usize = it.next()?.parse().ok()?;
-        let y: usize = it.next()?.parse().ok()?;
-        let (wp, hp) = size.split_once('x')?;
-        let w: usize = wp.split('/').next()?.parse().ok()?;
-        let h: usize = hp.split('/').next()?.parse().ok()?;
-        return Some((x, y, w, h));
-    }
-    None
-}
-
-/// Tear the virtual monitor down and shrink the framebuffer back to the physical screens.
+/// Turn the virtual head's output back off and forget it.
 pub fn remove_virtual_monitor() {
-    if virtual_monitor_geometry().is_none() {
-        return;
-    }
-    Command::new("xrandr").args(["--delmonitor", VIRTUAL_MONITOR]).output().ok();
-    let (w, h) = extent_excluding(VIRTUAL_MONITOR);
-    if w > 0 && h > 0 {
-        let fb = format!("{w}x{h}");
-        Command::new("xrandr").args(["--fb", &fb]).output().ok();
-    }
-    log::info!("fgtw vmon: '{VIRTUAL_MONITOR}' removed, framebuffer back to physical extent");
+    let Some(output) = virtual_output_name() else { return };
+    Command::new("xrandr").args(["--output", &output, "--off"]).output().ok();
+    *VIRTUAL_OUTPUT.lock().unwrap() = None;
+    log::info!("fgtw vmon: '{output}' turned off, virtual head gone");
 }
 
 pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> ResultType<()> {
-    // The virtual head resizes by recreation, never by transform — it has no mode to scale.
-    if name == VIRTUAL_MONITOR {
+    // The virtual head resizes by driving a fresh mode, not a scale transform.
+    if virtual_output_name().as_deref() == Some(name) {
         return ensure_virtual_monitor(width, height);
     }
     // VirtualBox-style follow WITHOUT touching the monitor's mode: `--scale-from` resizes the
