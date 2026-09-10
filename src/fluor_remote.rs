@@ -143,6 +143,12 @@ impl InvokeUiSession for FluorHandler {
         *self.shared.display_idx.lock().unwrap() = pi.current_display;
         *self.shared.peer_platform.lock().unwrap() = pi.platform.clone();
         *self.shared.display_count.lock().unwrap() = pi.displays.len();
+        // Seed the origin from the CURRENT display, not just on a later SwitchDisplay. Without
+        // this, display_origin stays (0,0) and every click lands on the primary panel even
+        // when we are viewing a monitor at a non-zero offset (the virtual head at +3840+0).
+        if let Some(d) = pi.displays.get(pi.current_display as usize) {
+            *self.shared.display_origin.lock().unwrap() = (d.x, d.y);
+        }
     }
     fn set_displays(&self, displays: &Vec<hbb_common::message_proto::DisplayInfo>) {
         *self.shared.display_count.lock().unwrap() = displays.len();
