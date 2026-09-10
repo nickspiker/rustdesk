@@ -885,10 +885,17 @@ async fn direct_server(server: ServerPtr) {
     loop {
         // fgtw fork: direct-server follows its own option only; `stop-service` no longer
         // silently disables it.
-        let disabled = !option2bool(
-            OPTION_DIRECT_SERVER,
-            &Config::get_option(OPTION_DIRECT_SERVER),
-        );
+        // fgtw fork: a fleet host listens directly by DEFAULT. Upstream makes this opt-in
+        // because a bare port is an attack surface when a password is the only gate — but here
+        // the fgtw handshake authorizes every connection, direct or relayed, and a non-member
+        // is refused outright. Leaving it off only meant we published a LAN address nothing
+        // answered on, and every same-network session paid a WAN round trip through the relay.
+        // An explicit "N" still turns it off.
+        let opt = Config::get_option(OPTION_DIRECT_SERVER);
+        #[cfg(feature = "fgtw")]
+        let disabled = opt == "N";
+        #[cfg(not(feature = "fgtw"))]
+        let disabled = !option2bool(OPTION_DIRECT_SERVER, &opt);
         if !disabled && listener.is_none() {
             port = get_direct_port();
             match hbb_common::tcp::listen_any(port as _).await {
