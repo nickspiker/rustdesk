@@ -2263,7 +2263,19 @@ impl LoginConfigHandler {
             } else {
                 option.disable_keyboard = f(false);
                 option.disable_clipboard = f(self.get_toggle_option("disable-clipboard"));
-                option.show_remote_cursor = f(self.get_toggle_option("show-remote-cursor"));
+                // fgtw fork: the fluor viewer DRAWS the remote cursor itself rather than
+                // relying on an embedded one, so leaving this off means no pointer feedback at
+                // all — shape changes like resize arrows and the I-beam simply never arrive.
+                // Default it on; an explicit "N" still turns it off.
+                #[cfg(feature = "fluor-viewer")]
+                {
+                    option.show_remote_cursor =
+                        f(self.get_option("show-remote-cursor") != "N");
+                }
+                #[cfg(not(feature = "fluor-viewer"))]
+                {
+                    option.show_remote_cursor = f(self.get_toggle_option("show-remote-cursor"));
+                }
                 option.enable_file_transfer = f(self.config.enable_file_copy_paste.v);
                 option.lock_after_session_end = f(self.config.lock_after_session_end.v);
                 if config.show_my_cursor.v {
