@@ -55,6 +55,11 @@ struct Shared {
     transport: Mutex<TransportKind>,
     /// Remote cursor position (device px in the remote's space), for drawing our own pointer.
     cursor: Mutex<(i32, i32)>,
+    /// Cursor bitmaps the host has sent, by id. The host sends each shape ONCE and then refers
+    /// to it by id, so a shape must be kept to be drawn again later.
+    cursors: Mutex<std::collections::HashMap<u64, CursorImage>>,
+    /// Which cursor shape is current, `None` before the host names one.
+    cursor_id: Mutex<Option<u64>>,
     /// The current display's origin (x, y) in the remote's virtual-desktop space. Added to
     /// mapped coords so a non-primary monitor (origin != 0,0) targets the right pixels.
     display_origin: Mutex<(i32, i32)>,
@@ -132,8 +137,35 @@ impl InvokeUiSession for FluorHandler {
     }
 
     // ── everything below is not needed by a bare viewer (yet) ──
-    fn set_cursor_data(&self, _cd: CursorData) {}
-    fn set_cursor_id(&self, _id: String) {}
+    fn set_cursor_data(&self, cd: CursorData) {
+        let (w, h) = (cd.width.max(0) as usize, cd.height.max(0) as usize);
+        if w == 0 || h == 0 || cd.colors.len() < w * h * 4 {
+            return;
+        }
+        // Same packing as on_rgba: keep alpha, invert the colour channels. The wire order here
+        // is RGBA (not the frame's ARGB), so channels are read straight through.
+        let mut pixels = vec![0u32; w * h];
+        for i in 0..w * h {
+            let r = cd.colors[i * 4] as u32;
+            let g = cd.colors[i * 4 + 1] as u32;
+            let b = cd.colors[i * 4 + 2] as u32;
+            let a = cd.colors[i * 4 + 3] as u32;
+            pixels[i] = (a << 24) | ((255 - r) << 16) | ((255 - g) << 8) | (255 - b);
+        }
+        let img = CursorImage { pixels, w, h, hot: (cd.hotx, cd.hoty) };
+        self.shared.cursors.lock().unwrap().insert(cd.id, img);
+        // A shape usually arrives BECAUSE it just became current, and the host does not always
+        // follow up with a separate id message — adopt it so the change is visible immediately.
+        *self.shared.cursor_id.lock().unwrap() = Some(cd.id);
+        self.shared.wake(Wake::Frame);
+    }
+
+    fn set_cursor_id(&self, id: String) {
+        if let Ok(id) = id.parse::<u64>() {
+            *self.shared.cursor_id.lock().unwrap() = Some(id);
+            self.shared.wake(Wake::Frame);
+        }
+    }
     fn set_display(&self, x: i32, y: i32, _w: i32, _h: i32, _cursor_embedded: bool, _scale: f64) {
         *self.shared.display_origin.lock().unwrap() = (x, y);
     }
@@ -302,6 +334,16 @@ impl TransportKind {
             Self::Relay => argb(0xFF, 0xC0, 0x20, 0xFF),
         }
     }
+}
+
+/// One cursor shape, pre-packed into fluor's α+darkness format so render does no conversion.
+struct CursorImage {
+    pixels: Vec<u32>,
+    w: usize,
+    h: usize,
+    /// The point INSIDE the image that sits on the hotspot — an arrow points from its tip, an
+    /// I-beam from its middle. Ignoring it puts every shape a few pixels off.
+    hot: (i32, i32),
 }
 
 struct FluorViewer {
@@ -712,6 +754,30 @@ impl FluorApp for FluorViewer {
             draw_image(&mut canvas, &f.pixels, fw, fh, cx, cy, dw, dh, None);
         }
         drop(f);
+        // The remote's cursor SHAPE, drawn over the video. The host sends shapes (resize
+        // arrows, I-beam, hand) and we only ever showed the Mac's own arrow, so every shape
+        // change was invisible — you could not see what the remote pointer had become. Mapped
+        // through the same scale/origin as the frame so it lands exactly where the host has it.
+        {
+            let id = *self.shared.cursor_id.lock().unwrap();
+            let cursors = self.shared.cursors.lock().unwrap();
+            if let Some(img) = id.and_then(|i| cursors.get(&i)) {
+                let (rx, ry) = *self.shared.cursor.lock().unwrap();
+                // Cursor positions are absolute desktop coordinates, but the frame is ONE
+                // display — take the origin off, exactly as the send path adds it, or the
+                // cursor lands offset by the monitor's position on every non-primary head.
+                let (dox, doy) = *self.shared.display_origin.lock().unwrap();
+                // Host-pixel position of the image's top-left, then into viewport space.
+                let px = (rx - dox - img.hot.0) as f32;
+                let py = (ry - doy - img.hot.1) as f32;
+                let dwc = img.w as f32 * scale;
+                let dhc = img.h as f32 * scale;
+                let ccx = ox + px * scale + dwc * 0.5;
+                let ccy = oy + py * scale + dhc * 0.5;
+                let mut canvas = Canvas::new(target, bw, bh, ctx.damage);
+                draw_image(&mut canvas, &img.pixels, img.w, img.h, ccx, ccy, dwc, dhc, None);
+            }
+        }
         // Connection strip along the very top, drawn OVER the video: a few pixels of colour
         // naming the path we got (amber relay / green WAN / cyan LAN / blue direct).
         {
