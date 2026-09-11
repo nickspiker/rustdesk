@@ -4389,6 +4389,15 @@ impl Connection {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    /// The name of the display we are currently capturing.
+    #[cfg(target_os = "linux")]
+    fn current_display_name(&self) -> Option<String> {
+        display_service::try_get_displays()
+            .ok()?
+            .get(self.display_idx)
+            .map(|d| d.name())
+    }
+
     /// The size the guest asked for in its login options, if any — the virtual head's size.
     #[cfg(target_os = "linux")]
     fn fleet_requested_size(&self) -> Option<(usize, usize)> {
@@ -4589,9 +4598,27 @@ impl Connection {
                 // size — the "act like a second monitor" model. Point capture at it here,
                 // before the video service starts. Other platforms keep the resize path.
                 // The virtual head was created at login (send_logon_response). A later
-                // change_resolution is the guest resizing its window: resize the head to match
-                // (routed to the vmon on Linux), or the physical output elsewhere. Idempotent —
-                // re-applying the current size would needlessly restart the capturer.
+                // change_resolution is the guest resizing its window, and it must ONLY ever
+                // reach that head. On Linux, when no head could be created (every output has a
+                // real monitor on it), this used to fall through and resize the PHYSICAL panel
+                // to the guest's window instead — snapping a 4K OLED down to 720x576, the
+                // nearest mode it would accept. Resizing a screen someone is sitting in front
+                // of is never what "follow my window" means.
+                #[cfg(target_os = "linux")]
+                {
+                    let head = crate::platform::linux::virtual_output_name();
+                    let on_head = match (head.as_deref(), self.current_display_name()) {
+                        (Some(h), Some(cur)) => h == cur,
+                        _ => false,
+                    };
+                    if !on_head {
+                        log::info!(
+                            "fgtw follow: no virtual head — leaving the physical display at its own resolution"
+                        );
+                        return;
+                    }
+                }
+                // Idempotent: re-applying the current size would restart the capturer for nothing.
                 let already = self.current_display_resolution();
                 if already == Some((r.width, r.height)) {
                     log::info!("fgtw follow: already {}x{} — leaving the capturer alone", r.width, r.height);
