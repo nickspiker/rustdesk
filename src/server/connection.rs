@@ -4400,6 +4400,21 @@ impl Connection {
 
     /// The size the guest asked for in its login options, if any — the virtual head's size.
     #[cfg(target_os = "linux")]
+    /// Linux: is capture pointed at the session's virtual head right now? A follow-resize is
+    /// only ever legitimate THERE — any other display is a physical monitor someone may be
+    /// sitting in front of, and resizing it (or shrinking the framebuffer around it) is never
+    /// what "follow my window" means.
+    #[cfg(target_os = "linux")]
+    fn follow_on_virtual_head(&self) -> bool {
+        match (
+            crate::platform::linux::virtual_output_name().as_deref(),
+            self.current_display_name().as_deref(),
+        ) {
+            (Some(h), Some(cur)) => h == cur,
+            _ => false,
+        }
+    }
+
     fn fleet_requested_size(&self) -> Option<(usize, usize)> {
         let r = self.options_in_login.as_ref()?.custom_resolution.as_ref()?;
         (r.width > 0 && r.height > 0).then_some((r.width as usize, r.height as usize))
@@ -4466,6 +4481,17 @@ impl Connection {
     }
 
     fn change_resolution(&mut self, d: Option<usize>, r: &Resolution) {
+        // Linux fleet host: enforce the virtual-head rule HERE, where every caller converges.
+        // The login path guarded itself, but the guest's mid-session ChangeResolution message
+        // (the viewer's follow-retry) reached this function unguarded, resized the PRIMARY
+        // display through the framebuffer-shrinking scale path, and pushed the real monitor
+        // clean off the screen (leviathan 2026-09-12: DP-0 stranded at +3840 on a 2560-wide
+        // framebuffer). One guard, one place, no path around it.
+        #[cfg(target_os = "linux")]
+        if !self.follow_on_virtual_head() {
+            log::info!("fgtw follow: no virtual head — refusing to resize a physical display");
+            return;
+        }
         if self.keyboard {
             if let Ok(displays) = display_service::try_get_displays() {
                 let display_idx = d.unwrap_or(self.display_idx);
@@ -4605,18 +4631,11 @@ impl Connection {
                 // nearest mode it would accept. Resizing a screen someone is sitting in front
                 // of is never what "follow my window" means.
                 #[cfg(target_os = "linux")]
-                {
-                    let head = crate::platform::linux::virtual_output_name();
-                    let on_head = match (head.as_deref(), self.current_display_name()) {
-                        (Some(h), Some(cur)) => h == cur,
-                        _ => false,
-                    };
-                    if !on_head {
-                        log::info!(
-                            "fgtw follow: no virtual head — leaving the physical display at its own resolution"
-                        );
-                        return;
-                    }
+                if !self.follow_on_virtual_head() {
+                    log::info!(
+                        "fgtw follow: no virtual head — leaving the physical display at its own resolution"
+                    );
+                    return;
                 }
                 // Idempotent: re-applying the current size would restart the capturer for nothing.
                 let already = self.current_display_resolution();
