@@ -623,6 +623,14 @@ impl UI {
         refresh_fleet_peers();
     }
 
+    /// Re-probe one device (single click on its tile) so its tier is current.
+    fn ping_fleet_device(&self, id: String) {
+        #[cfg(feature = "fgtw")]
+        ping_fleet_device(id);
+        #[cfg(not(feature = "fgtw"))]
+        let _ = id;
+    }
+
     /// This machine's fleet name for the home screen — what the rest of the fleet calls us.
     fn get_fleet_self_name(&self) -> String {
         #[cfg(feature = "fgtw")]
@@ -860,6 +868,7 @@ impl sciter::EventHandler for UI {
         fn get_lan_peers();
         fn get_fleet_peers();
         fn refresh_fleet_peers();
+        fn ping_fleet_device(String);
         fn has_fleet();
         fn get_fleet_self_name();
         fn get_uuid();

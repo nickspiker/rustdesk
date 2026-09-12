@@ -386,6 +386,28 @@ class SessionList: Reactor.Component {
         </div>;
     }
 
+    // Single click PINGS: re-probe this device so its tier is current, and warm the path while
+    // we are at it (the probe is the same connect the dialler makes). Connecting stays on
+    // double click — a status check should never be one stray click away from a session.
+    event click $(div.remote-session-link) (evt, me) {
+        if (this.type != "fleet" || !me.id) return;
+        handler.ping_fleet_device(me.id);
+        // The probe is off-thread: repaint a few times so the tile lands on its new colour
+        // whenever the result arrives, instead of guessing one delay that is right for a LAN
+        // peer and far too short for one that has to time out.
+        var tries = 8;
+        function poll() {
+            self.timer(300ms, function() {
+                tries -= 1;
+                var p = (app || {}).multipleSessions;
+                if (p) p.update();
+                if (tries > 0) poll();
+                return false;
+            });
+        }
+        poll();
+    }
+
     event dblclick $(div.remote-session-link) (evt, me) {
         createNewConnect(me.id, "connect");
     }

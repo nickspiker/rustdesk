@@ -850,6 +850,37 @@ pub fn get_fleet_peers() -> Vec<HashMap<&'static str, String>> {
     FLEET_PEERS.lock().map(|v| v.clone()).unwrap_or_default()
 }
 
+/// Re-probe ONE fleet device and update its cached row, off-thread.
+///
+/// A tile shows the tier from whenever the roster was last built, which goes stale the moment
+/// anything on the network moves — so clicking a device re-asks rather than making you reopen
+/// the page and re-probe the whole fleet. It also warms the path: the probe is the same connect
+/// the dialler would make, so a device that has just become reachable says so immediately.
+#[cfg(feature = "fgtw")]
+pub fn ping_fleet_device(id: String) {
+    if id.is_empty() {
+        return; // no published id — nothing to reach
+    }
+    std::thread::spawn(move || {
+        let Some((_, lan)) = crate::fgtw_auth::device_and_lan_for_rustdesk_id(&id) else {
+            return;
+        };
+        let tier = crate::fgtw_auth::probe_lan_tier(&lan);
+        if let Ok(mut rows) = FLEET_PEERS.lock() {
+            if let Some(row) = rows.iter_mut().find(|r| r.get("id") == Some(&id)) {
+                // Only the reachability tier changes; identity fields stay as the roster built them.
+                let status = match tier {
+                    Some(t) => t.tag().to_owned(),
+                    // No direct path now. Keep whatever the roster last decided about the relay
+                    // rather than inventing "offline" from one failed probe.
+                    None => row.get("status").cloned().unwrap_or_else(|| "unknown".to_owned()),
+                };
+                row.insert("status", status);
+            }
+        }
+    });
+}
+
 /// Refresh the fleet chooser cache in the background (called when the tab is opened).
 /// Same session-row shape as LAN discovery, plus `alias` = the fleet-scoped device name so
 /// the tile renders the name with the ID as tooltip. Devices that haven't published an ID

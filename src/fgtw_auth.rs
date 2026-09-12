@@ -552,7 +552,7 @@ pub fn our_lan_v4() -> Option<std::net::Ipv4Addr> {
 /// A tile that only knows "the relay pipe is open" cannot tell a peer in the same room from one
 /// on another continent — both are merely reachable. One short connect per candidate is what
 /// separates them, and it is the same probe the dialler would make anyway.
-fn lan_reachable(lan: &Option<String>) -> Option<fgtw::traverse::gather::PathTier> {
+pub fn probe_lan_tier(lan: &Option<String>) -> Option<fgtw::traverse::gather::PathTier> {
     use fgtw::traverse::gather::PathTier;
     let list = lan.as_ref()?;
     let ours = our_lan_v4();
@@ -654,7 +654,7 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
             direct_tier: if me == Some(*m) {
                 None
             } else {
-                lan_reachable(&lans.get(m).cloned())
+                probe_lan_tier(&lans.get(m).cloned())
             },
             lan_addr: lans.get(m).cloned(),
         })
