@@ -850,31 +850,32 @@ pub fn get_fleet_peers() -> Vec<HashMap<&'static str, String>> {
     FLEET_PEERS.lock().map(|v| v.clone()).unwrap_or_default()
 }
 
-/// Re-probe ONE fleet device and update its cached row, off-thread.
+/// Re-probe ONE fleet device: drop it to offline, ping every address it publishes, then report
+/// the best tier that answers.
 ///
-/// A tile shows the tier from whenever the roster was last built, which goes stale the moment
-/// anything on the network moves — so clicking a device re-asks rather than making you reopen
-/// the page and re-probe the whole fleet. It also warms the path: the probe is the same connect
-/// the dialler would make, so a device that has just become reachable says so immediately.
+/// Going offline FIRST is the point, not a side effect — it is how you can see the ping actually
+/// fired. Leaving the old colour up while probing makes a stale "reachable" and a fresh one look
+/// identical, which is exactly the doubt that makes you click in the first place.
 #[cfg(feature = "fgtw")]
 pub fn ping_fleet_device(id: String) {
     if id.is_empty() {
         return; // no published id — nothing to reach
     }
+    // Drop to offline immediately so the tile visibly goes dark while the ping is out.
+    if let Ok(mut rows) = FLEET_PEERS.lock() {
+        if let Some(row) = rows.iter_mut().find(|r| r.get("id") == Some(&id)) {
+            row.insert("status", "offline".to_owned());
+        }
+    }
     std::thread::spawn(move || {
-        let Some((_, lan)) = crate::fgtw_auth::device_and_lan_for_rustdesk_id(&id) else {
-            return;
+        let Some((device, lan)) = crate::fgtw_auth::device_and_lan_for_rustdesk_id(&id) else {
+            return; // not a fleet peer — it stays offline, which is the truth
         };
-        let tier = crate::fgtw_auth::probe_lan_tier(&lan);
+        let tier = crate::fgtw_auth::probe_best_tier(&device, &lan);
         if let Ok(mut rows) = FLEET_PEERS.lock() {
             if let Some(row) = rows.iter_mut().find(|r| r.get("id") == Some(&id)) {
-                // Only the reachability tier changes; identity fields stay as the roster built them.
-                let status = match tier {
-                    Some(t) => t.tag().to_owned(),
-                    // No direct path now. Keep whatever the roster last decided about the relay
-                    // rather than inventing "offline" from one failed probe.
-                    None => row.get("status").cloned().unwrap_or_else(|| "unknown".to_owned()),
-                };
+                // Nothing answered anywhere: offline is now a measurement, not a guess.
+                let status = tier.map_or("offline", |t| t.tag()).to_owned();
                 row.insert("status", status);
             }
         }

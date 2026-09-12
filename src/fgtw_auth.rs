@@ -566,17 +566,35 @@ pub fn probe_lan_tier(lan: &Option<String>) -> Option<fgtw::traverse::gather::Pa
                 .is_ok()
             {
                 let tier = fgtw::traverse::gather::classify_path(&sa, ours);
-                // Tiers sort best-first, so keep the best any candidate achieved.
+                // Probe EVERY address and keep the best. Stopping at the first hit would report
+                // whichever answered soonest, which is not the same as the best path available —
+                // a router-free link can easily answer after a LAN one.
                 if best.map_or(true, |b| tier < b) {
                     best = Some(tier);
-                }
-                if tier == PathTier::NoRouter {
-                    return best; // nothing beats a router-free link
                 }
             }
         }
     }
     best
+}
+
+/// Ping every way we know of reaching a device and report the BEST tier that answers.
+///
+/// Direct addresses first, then the relay as the floor: a device that answers nothing directly
+/// but whose pipe is open is reachable, just expensively. `None` means genuinely nothing
+/// answered — offline.
+pub fn probe_best_tier(
+    device: &[u8; 32],
+    lan: &Option<String>,
+) -> Option<fgtw::traverse::gather::PathTier> {
+    use fgtw::traverse::gather::PathTier;
+    if let Some(t) = probe_lan_tier(lan) {
+        return Some(t);
+    }
+    match pipe_alive(device) {
+        Some(true) => Some(PathTier::Relay),
+        _ => None,
+    }
 }
 
 /// The fleet device behind a RustDesk id, plus its published LAN address if it has one.
