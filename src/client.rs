@@ -2406,7 +2406,15 @@ impl LoginConfigHandler {
         if !view_only && self.get_toggle_option("lock-after-session-end") {
             msg.lock_after_session_end = BoolOption::Yes.into();
         }
-        if self.get_toggle_option("disable-audio") {
+        // fgtw fork: remote audio starts MUTED. Two machines in one room feed each other's
+        // speakers and mics into a howling echo, and a 4K session should not spend bandwidth on
+        // sound nobody asked for. Toggle it on from the viewer's Local menu when it is wanted;
+        // the choice then persists like any other session option.
+        #[cfg(feature = "fluor-viewer")]
+        let muted = self.get_option("disable-audio") != "N";
+        #[cfg(not(feature = "fluor-viewer"))]
+        let muted = self.get_toggle_option("disable-audio");
+        if muted {
             msg.disable_audio = BoolOption::Yes.into();
         }
         if !view_only && self.get_toggle_option(keys::OPTION_ENABLE_FILE_COPY_PASTE) {

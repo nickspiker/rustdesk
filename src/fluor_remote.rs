@@ -258,6 +258,7 @@ const MENU_HOST_NEXT: u32 = 3;
 const MENU_HOST_PREV: u32 = 4;
 const MENU_LOCAL_NEXT: u32 = 5;
 const MENU_LOCAL_PREV: u32 = 6;
+const MENU_AUDIO: u32 = 7;
 
 /// Trackpad `Pixels` scroll → "lines" divisor. A swipe is hundreds of px; this + accumulation
 /// keeps scroll speed sane (bigger = slower). Wheel `Lines` bypass this (already ±1/notch).
@@ -528,6 +529,8 @@ impl FluorApp for FluorViewer {
                     MenuItem::Separator,
                     MenuItem::Action { id: MENU_FULLSCREEN, label: "Toggle Fullscreen".into() },
                     MenuItem::Action { id: MENU_HUD, label: "Toggle Input HUD".into() },
+                    MenuItem::Separator,
+                    MenuItem::Action { id: MENU_AUDIO, label: "Toggle Remote Audio".into() },
                 ],
             },
         ]
@@ -682,6 +685,11 @@ impl FluorApp for FluorViewer {
                 MENU_HUD => {
                     self.hud = !self.hud;
                     ctx.window.request_redraw();
+                }
+                MENU_AUDIO => {
+                    self.session.toggle_option("disable-audio".to_owned());
+                    let muted = self.session.get_toggle_option("disable-audio".to_owned());
+                    log::info!("fluor: remote audio {}", if muted { "muted" } else { "on" });
                 }
                 MENU_HOST_NEXT => self.switch_host_display(1),
                 MENU_HOST_PREV => self.switch_host_display(-1),
