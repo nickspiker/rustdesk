@@ -57,6 +57,30 @@ plumbing, with no say in who trusts whom.
   password/consent flow, untouched. Built without the feature flag, the binary
   is byte-identical to vanilla.
 
+## Your own screen
+
+Remote desktop normally means watching someone else's monitor, badly — letterboxed, rescaled,
+or stretched until the text goes soft. This fork gives the viewer a display of its own.
+
+- **The host grows a monitor for you.** Connect, and a virtual head comes up at exactly your
+  window's pixel size, with its own workspace, taskbar, clock and wallpaper. Your desktop icons
+  and new windows follow to it. Disconnect and it goes away. Nothing is scaled: what you see is
+  the host rendering at your resolution, not a resampled copy of someone else's.
+- **Nobody at the desk loses anything.** The physical monitor is never resized, never scaled, and
+  never borrowed. Stretching a real display is how remote tools leave the person in front of it
+  with off-target clicks and a compositor that has stopped painting — so the host refuses to do
+  it, and renders on the head instead.
+- **Headless is a first-class state.** With nothing plugged in and nobody connected, there is no
+  display at all. A session brings one into existence; ending it takes it away.
+
+The head needs one connector to live on — any unused port, no cable, no dongle. Set it up once:
+
+```
+sudo bash tools/fleet-head/install-fleet-head.sh HDMI-A-1 3840x2160
+```
+
+Linux/X11 today. See [tools/fleet-head/](tools/fleet-head/) for what it does and how to undo it.
+
 ## Install
 
 One line, prebuilt, verified (Linux x86_64 / macOS Apple Silicon; more coming):
