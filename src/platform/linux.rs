@@ -1609,6 +1609,8 @@ use std::sync::Mutex;
 static VIRTUAL_OUTPUT: Mutex<Option<String>> = Mutex::new(None);
 /// The guest tag whose head this is — names the config key its position is saved under.
 static VMON_GUEST_TAG: Mutex<Option<String>> = Mutex::new(None);
+/// Config key that turns virtual-head creation off entirely (value "Y").
+const VMON_DISABLED_OPT: &str = "fgtw-vmon-disabled";
 /// Config key prefix for a guest's remembered head position ("x,y").
 const VMON_POS_OPT_PREFIX: &str = "fgtw-vmon-pos-";
 
@@ -1636,9 +1638,81 @@ pub fn virtual_monitor_position() -> Option<(usize, usize)> {
     Some((x, y))
 }
 
-/// The output currently serving as the fleet virtual head, `None` if not up.
+/// Monitor-name prefix stamped into the fleet dummy's forced EDID (see `install-fleet-head.sh`).
+const FLEET_EDID_PREFIX: &str = "FLEET";
+/// Cached name of the persistent fleet head. Only positive results are cached: the EDID cannot
+/// change without a reboot (and a reboot restarts us), but a head that is not up yet may appear later.
+static FLEET_HEAD: Mutex<Option<String>> = Mutex::new(None);
+
+/// The EDID "monitor name" (descriptor type 0xFC) an output reports, if any.
+///
+/// Read from sysfs rather than `xrandr --props`, because the blob there is hex-formatted across
+/// continuation lines and the X output name (`HDMI-A-0`) does not match the DRM connector name
+/// (`card1-HDMI-A-1`) anyway. Matching on the trailing connector type + index is what bridges them.
+fn output_edid_name(output: &str) -> Option<String> {
+    let suffix = output.rsplit_once('-').map(|(t, n)| (t.to_string(), n.to_string()))?;
+    let dir = std::fs::read_dir("/sys/class/drm").ok()?;
+    for entry in dir.flatten() {
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        // "card1-HDMI-A-1" — the connector type must match; the index may be renumbered by X.
+        let Some((_, conn)) = name.split_once('-') else { continue };
+        let Some((ctype, _)) = conn.rsplit_once('-') else { continue };
+        if ctype != suffix.0 {
+            continue;
+        }
+        // `continue`, never `?`: one connector with an unreadable or absent EDID must not abort the
+        // scan, or a second matching connector later in the directory is never examined. sysfs also
+        // reports size 0 for these binary attributes, so a length check on metadata would skip all
+        // of them — the read itself is the only way to know.
+        let Ok(edid) = std::fs::read(entry.path().join("edid")) else { continue };
+        if edid.len() < 128 {
+            continue;
+        }
+        // Descriptors live at 54, 72, 90, 108; type byte 0xFC marks the monitor name.
+        for off in (54..126).step_by(18) {
+            let d = &edid[off..off + 18];
+            if d.len() == 18 && d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 0xFC {
+                let text = String::from_utf8_lossy(&d[5..18]);
+                return Some(text.trim_end_matches(['\n', ' ', '\0']).to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The permanently-attached fleet head: a *connected* output whose forced EDID names it ours.
+///
+/// This is the fake-EDID dummy the host installs so the desktop environment treats it as a real
+/// monitor — it gets its own workspace, panel and clock, and survives compositor restarts, none of
+/// which a merely-disconnected connector ever gets. It is safe to resize for exactly the reason a
+/// real monitor is not: nobody is physically looking at it.
+fn fleet_head_output() -> Option<String> {
+    if let Some(cached) = FLEET_HEAD.lock().unwrap().clone() {
+        return Some(cached);
+    }
+    let out = Command::new("xrandr").arg("--query").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let found = text
+        .lines()
+        .filter_map(parse_output_line)
+        .filter(|(_, state, _, _)| state == "connected")
+        .map(|(name, _, _, _)| name)
+        .find(|name| {
+            output_edid_name(name).is_some_and(|n| n.starts_with(FLEET_EDID_PREFIX))
+        })?;
+    log::info!("fgtw vmon: found persistent fleet head '{found}' (forced EDID)");
+    *FLEET_HEAD.lock().unwrap() = Some(found.clone());
+    Some(found)
+}
+
+/// The output serving as the fleet virtual head — the one we commandeered this session, else the
+/// permanently-attached fake-EDID head. `None` if neither is present.
 pub fn virtual_output_name() -> Option<String> {
-    VIRTUAL_OUTPUT.lock().unwrap().clone()
+    VIRTUAL_OUTPUT
+        .lock()
+        .unwrap()
+        .clone()
+        .or_else(fleet_head_output)
 }
 
 /// One `xrandr --query` output line, split into `(name, state, is_primary, has_active_mode)`.
@@ -1670,6 +1744,40 @@ fn primary_output() -> Option<String> {
         .map(|(name, _, _, _)| name)
 }
 
+/// The primary output's rectangle `(x, y, w, h)` from xrandr, for overlap checks.
+fn primary_geometry() -> Option<(usize, usize, usize, usize)> {
+    let out = Command::new("xrandr").arg("--query").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| parse_output_line(l).map_or(false, |(_, _, p, _)| p))?;
+    let geo = line
+        .split_whitespace()
+        .find(|t| t.contains('x') && t.contains('+') && t.chars().next().map_or(false, |c| c.is_ascii_digit()))?;
+    let mut plus = geo.split('+');
+    let size = plus.next()?;
+    let x: usize = plus.next()?.parse().ok()?;
+    let y: usize = plus.next()?.parse().ok()?;
+    let (w, h) = size.split_once('x')?;
+    // The mode token can carry a refresh suffix ("1920x1080i" / trailing junk) — take digits only.
+    let w: usize = w.trim_matches(|c: char| !c.is_ascii_digit()).parse().ok()?;
+    let h: usize = h.trim_matches(|c: char| !c.is_ascii_digit()).parse().ok()?;
+    Some((x, y, w, h))
+}
+
+/// Would a head of `w`x`h` placed at `(x, y)` cover any part of the primary display?
+///
+/// A remembered position is only safe to restore if it still sits clear of the screen someone is
+/// physically looking at. Restoring one that overlaps stacks the head on top of the real monitor:
+/// X grows the screen to enclose both, the desktop's own window manager sees a layout it never
+/// arranged, and on Cinnamon the compositor stops painting entirely — a black screen on both the
+/// monitor AND the remote, with no way back in except a shell. Seen on a 1920x1080 display whose
+/// saved position was `0,0` from an earlier headless session; every reconnect re-blacked the box.
+fn overlaps_primary(x: usize, y: usize, w: usize, h: usize) -> bool {
+    let Some((px, py, pw, ph)) = primary_geometry() else {
+        return false; // no primary to conflict with (headless) — anywhere is fine
+    };
+    x < px + pw && px < x + w && y < py + ph && py < y + h
+}
+
 /// Choose an output to drive as the virtual head — ONLY a disconnected connector (a real crtc
 /// with no monitor physically attached). A `connected` output is never a candidate, even if it
 /// has no active mode: a real monitor that is merely asleep or momentarily idle reads exactly
@@ -1678,6 +1786,16 @@ fn primary_output() -> Option<String> {
 /// screen anyone is looking at, so it is the only safe target. `None` if there is none — the
 /// caller then refuses rather than grabbing a physical display.
 fn pick_virtual_output() -> Option<String> {
+    // Opt-out for desktops that cannot survive a RandR screen-size change. Adding a head grows the
+    // X screen to enclose it, and some compositors (Cinnamon/muffin, seen on a 1920x1080 box) stop
+    // painting the moment that happens — black on the monitor AND the remote, recoverable only from
+    // a shell. Where the guest is meant to watch the physical display anyway, a head buys nothing,
+    // so `fgtw-vmon-disabled = 'Y'` refuses to create one and the caller falls back to capturing the
+    // real screen at its own resolution.
+    if Config::get_option(VMON_DISABLED_OPT) == "Y" {
+        log::info!("fgtw vmon: virtual head disabled by config ({VMON_DISABLED_OPT}) — capturing the physical display instead");
+        return None;
+    }
     let out = Command::new("xrandr").arg("--query").output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     // Any disconnected connector — the primary flag is irrelevant here, since a disconnected
@@ -1775,7 +1893,15 @@ pub fn ensure_virtual_monitor(width: usize, height: usize, guest_tag: Option<&st
     // stays exactly where the user arranged it in the OS display settings.
     if fresh {
         *VMON_GUEST_TAG.lock().unwrap() = guest_tag.map(|t| t.to_string());
-        match guest_tag.and_then(saved_position) {
+        match guest_tag.and_then(saved_position).filter(|&(x, y)| {
+            if overlaps_primary(x, y, width, height) {
+                log::warn!(
+                    "fgtw vmon: saved position {x},{y} would cover the primary display — ignoring it and placing the head beside it instead"
+                );
+                return false;
+            }
+            true
+        }) {
             Some((x, y)) => {
                 args.push("--pos".to_string());
                 args.push(format!("{x}x{y}"));
@@ -1792,28 +1918,116 @@ pub fn ensure_virtual_monitor(width: usize, height: usize, guest_tag: Option<&st
             },
         }
     }
+    // Primary follows the head. The desktop folder's icons render on the primary monitor only (a
+    // Nemo/Cinnamon rule with no per-monitor override), and new windows default there — so while a
+    // session is up, the screen the person is actually looking at should own both.
+    args.push("--primary".to_string());
     let out = Command::new("xrandr").args(&args).output()?;
     if !out.status.success() {
         bail!("xrandr --output {output} --mode {mode}: {}", String::from_utf8_lossy(&out.stderr));
     }
     *VIRTUAL_OUTPUT.lock().unwrap() = Some(output.clone());
     log::info!("fgtw vmon: driving '{output}' at {width}x{height} (mode {mode}) as the virtual head");
+    reflow_after_resize(&output, width, height);
     Ok(())
+}
+
+/// Push any output the resized head now overlaps clear of it, to the head's immediate right.
+///
+/// The head's origin is fixed, so growing it swallows whatever sits to its right — on a desktop
+/// that is a real monitor suddenly sharing pixels with the head, which reads to the user as two
+/// screens stacked on top of each other. Shrinking is left alone: a gap costs nothing, and moving
+/// a monitor the user deliberately arranged is worse than a gap.
+fn reflow_after_resize(head: &str, width: usize, height: usize) {
+    let Ok(out) = Command::new("xrandr").arg("--query").output() else { return };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let head_x = output_position(&text, head).map_or(0, |(x, _)| x);
+    let head_right = head_x + width;
+    for line in text.lines() {
+        let Some((name, state, _, has_mode)) = parse_output_line(line) else { continue };
+        if name == head || state != "connected" || !has_mode {
+            continue;
+        }
+        let Some((x, y)) = output_position(&text, &name) else { continue };
+        let Some((w, _)) = output_size(&text, &name) else { continue };
+        if x + w <= head_x || x >= head_right {
+            continue; // already clear
+        }
+        log::info!("fgtw vmon: '{name}' overlapped the head resized to {width}x{height} — moving it to {head_right},{y}");
+        Command::new("xrandr")
+            .args(["--output", &name, "--pos", &format!("{head_right}x{y}")])
+            .output()
+            .ok();
+    }
+}
+
+/// `(x, y)` of an output's geometry token in an `xrandr --query` dump.
+fn output_position(text: &str, output: &str) -> Option<(usize, usize)> {
+    let line = text.lines().find(|l| l.split_whitespace().next() == Some(output))?;
+    let geo = line.split_whitespace().find(|t| {
+        t.contains('x') && t.contains('+') && t.chars().next().is_some_and(|c| c.is_ascii_digit())
+    })?;
+    let mut plus = geo.split('+');
+    plus.next()?;
+    Some((plus.next()?.parse().ok()?, plus.next()?.parse().ok()?))
+}
+
+/// `(w, h)` of an output's geometry token in an `xrandr --query` dump.
+fn output_size(text: &str, output: &str) -> Option<(usize, usize)> {
+    let line = text.lines().find(|l| l.split_whitespace().next() == Some(output))?;
+    let geo = line.split_whitespace().find(|t| {
+        t.contains('x') && t.contains('+') && t.chars().next().is_some_and(|c| c.is_ascii_digit())
+    })?;
+    let (size, _) = geo.split_once('+')?;
+    let (w, h) = size.split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
 }
 
 /// Turn the virtual head's output back off and forget it, remembering where the user left it
 /// so the same guest's next session brings it back in the same place.
 pub fn remove_virtual_monitor() {
-    let Some(output) = virtual_output_name() else { return };
-    let tag = VMON_GUEST_TAG.lock().unwrap().clone();
-    if let (Some(tag), Some((x, y))) = (tag, virtual_monitor_position()) {
-        Config::set_option(format!("{VMON_POS_OPT_PREFIX}{tag}"), format!("{x},{y}"));
-        log::info!("fgtw vmon: saved position {x},{y} for guest {tag}");
+    let commandeered = VIRTUAL_OUTPUT.lock().unwrap().clone();
+    // A commandeered connector and the persistent fake-EDID head are both switched off at session
+    // end: with nobody viewing it, a head is a screen that exists only to be captured, and leaving
+    // it on strands the desktop's icons and new windows on a monitor no one can see. The persistent
+    // head is only switched OFF, never forgotten — it is still discoverable by its EDID next session.
+    let Some(output) = commandeered.clone().or_else(fleet_head_output) else { return };
+    if commandeered.is_some() {
+        // Position is only ours to remember for a connector we placed; the desktop owns where the
+        // persistent head sits.
+        let tag = VMON_GUEST_TAG.lock().unwrap().clone();
+        if let (Some(tag), Some((x, y))) = (tag, virtual_monitor_position()) {
+            Config::set_option(format!("{VMON_POS_OPT_PREFIX}{tag}"), format!("{x},{y}"));
+            log::info!("fgtw vmon: saved position {x},{y} for guest {tag}");
+        }
     }
     Command::new("xrandr").args(["--output", &output, "--off"]).output().ok();
     *VIRTUAL_OUTPUT.lock().unwrap() = None;
     *VMON_GUEST_TAG.lock().unwrap() = None;
+    restore_primary_after_head_off(&output);
     log::info!("fgtw vmon: '{output}' turned off, virtual head gone");
+}
+
+/// Hand `--primary` to a real monitor once the head is switched off.
+///
+/// X leaves the primary flag on an output it just disabled, and a primary that is off is the same
+/// as none: the desktop folder's icons have nowhere to render. Pick any other connected output that
+/// still has a mode. If there is none, the machine is genuinely headless — no monitor plugged in and
+/// no session — and having no primary is the correct description of that.
+fn restore_primary_after_head_off(head: &str) {
+    let Ok(out) = Command::new("xrandr").arg("--query").output() else { return };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let next = text
+        .lines()
+        .filter_map(parse_output_line)
+        .find(|(name, state, _, has_mode)| name != head && state == "connected" && *has_mode);
+    match next {
+        Some((name, _, _, _)) => {
+            log::info!("fgtw vmon: primary handed back to '{name}'");
+            Command::new("xrandr").args(["--output", &name, "--primary"]).output().ok();
+        }
+        None => log::info!("fgtw vmon: head off and no other monitor attached — no primary, headless"),
+    }
 }
 
 pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> ResultType<()> {
@@ -1821,12 +2035,19 @@ pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> Re
     if virtual_output_name().as_deref() == Some(name) {
         return ensure_virtual_monitor(width, height, None);
     }
-    // VirtualBox-style follow WITHOUT touching the monitor's mode: `--scale-from` resizes the
-    // logical desktop (framebuffer) to exactly W×H and the panel up/down-samples it, staying on
-    // its native mode the whole time. Capture reads the framebuffer, so the peer gets exact
-    // pixels; no EDID/out-of-range risk, no mode change for the DE to react to, and restore is
-    // just scale-from at the native size (identity). `--fb` pins the framebuffer so the capture
-    // size can't drift from xrandr's transform rounding.
+    // Never scale-transform a display that is not our head.
+    //
+    // The `--scale-from` path below stretches the logical desktop over a monitor's real mode. The
+    // window manager is not told: it keeps laying out for the mode while X, the pointer and the
+    // capture all work in the stretched size. Clicks land off-target, drags double, and on Cinnamon
+    // the compositor stops painting entirely — black on the monitor AND the remote at once, with a
+    // shell the only way back. It also persists, because nothing restores the transform on a crash.
+    // When the peer wants a size the physical panel is not, the right answer is to render it on the
+    // virtual head, which is exactly what the branch above does; refusing here costs the peer a
+    // rescale on its own side and costs the person at the desk nothing.
+    if virtual_output_name().as_deref() != Some(name) {
+        bail!("refusing to scale physical display '{name}' to {width}x{height} — resize targets the virtual head only");
+    }
     let identity = active_mode_size(name) == Some((width, height));
     if !identity {
         pin_ui_scale();
@@ -1852,16 +2073,11 @@ pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> Re
 fn active_mode_size(output: &str) -> Option<(usize, usize)> {
     let out = Command::new("xrandr").output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut in_output = false;
-    for line in text.lines() {
-        if !line.starts_with(' ') && !line.starts_with('\t') {
-            in_output = line.split_whitespace().next() == Some(output);
-        } else if in_output && line.contains('*') {
-            let (w, h) = line.split_whitespace().next()?.split_once('x')?;
-            return Some((w.parse().ok()?, h.parse().ok()?));
-        }
-    }
-    None
+    // Read the size off the OUTPUT line's geometry token ("2560x1570+0+0"), never off the starred
+    // mode line. A mode we minted is named `fleet-2560x1570`, so parsing a width out of the mode
+    // NAME yields "fleet-2560" and fails — which reads back as "no active mode" and makes every
+    // later resize of a head we are already driving fail. The geometry token is always numeric.
+    output_size(&text, output)
 }
 
 const SAVED_UI_SCALE_OPT: &str = "fgtw-saved-ui-scale";
