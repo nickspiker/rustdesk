@@ -42,8 +42,8 @@ plumbing, with no say in who trusts whom.
 
 ## What it feels like
 
-- **If you're logged in** (e.g. [Photon](https://holdmyoscilloscope.com/photon/) attested this machine), RustDesk adopts
-  that login automatically. Zero setup. The **My Fleet** tab lists your machines
+- **If the machine has an identity** (e.g. [Photon](https://holdmyoscilloscope.com/photon/) attested it), RustDesk adopts
+  that identity automatically. Zero setup. The **My Fleet** tab lists your machines
   by name; click one and you're on it.
 - **Connecting is passless both ways.** The host proves itself to you (its
   identity is signed by a fleet key you can check yourself), and you prove
@@ -97,17 +97,17 @@ Building from source is a developer path only — see [MAC-SETUP.md](MAC-SETUP.m
 
 ## Setup
 
-Nothing, usually. If the machine has a passless login (Photon), RustDesk adopts
-it at startup — membership is proven by the fleet key itself, not by anything
-you type. On a machine with no login yet, once:
+Nothing, usually. If the machine already has a passless identity (Photon, or any
+other passless app), RustDesk adopts it at startup — membership is proven by the
+fleet key itself, not by anything you type. On a machine with no identity yet, once:
 
 ```
 rustdesk --fgtw-enroll <handle>
 ```
 
 First machine ever claims the fleet; later machines show pair-words you approve
-from a device you already hold. That enrollment *is* the machine's login — every
-passless app shares it from then on. Details: [docs/fgtw.md](docs/fgtw.md), macOS: [MAC-SETUP.md](MAC-SETUP.md).
+from a device you already hold. That enrollment *is* the machine's identity — every
+passless app shares it from then on, and no app owns it. Details: [docs/fgtw.md](docs/fgtw.md), macOS: [MAC-SETUP.md](MAC-SETUP.md).
 
 ## Build
 
