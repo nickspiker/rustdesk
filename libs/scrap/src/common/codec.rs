@@ -28,7 +28,7 @@ use hbb_common::config::option2bool;
 use hbb_common::{
     anyhow::anyhow,
     bail,
-    config::{Config, PeerConfig},
+    config::{Config},
     lazy_static, log,
     message_proto::{
         supported_decoding::PreferCodec, video_frame, Chroma, CodecAbility, EncodedVideoFrames,

@@ -9,7 +9,6 @@ use crate::clipboard::try_empty_clipboard_files;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::clipboard::{update_clipboard, ClipboardSide};
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-use crate::clipboard_file::*;
 #[cfg(target_os = "android")]
 use crate::keyboard::client::map_key_to_control_key;
 #[cfg(target_os = "linux")]
@@ -4439,7 +4438,10 @@ impl Connection {
 
     /// Block until the active display actually reads back `width`x`height`, or the budget runs out.
     /// Bounded on purpose: a host that cannot reach the size must not hang the login forever, so we give up and stream at whatever size it is — the guest then draws that honestly rather than showing nothing.
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    // Only called on non-Linux: the Linux path resizes the virtual head, whose size we set and read
+    // back synchronously, so there is nothing to wait for. Gated to match its one call site rather
+    // than left compiled-but-unreachable.
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "linux")))]
     async fn await_resolution(&self, width: i32, height: i32) {
         const BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
         const POLL: f32 = 0.05;

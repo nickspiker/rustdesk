@@ -76,7 +76,9 @@ struct Shared {
 impl Shared {
     fn wake(&self, w: Wake) {
         if let Some(p) = self.proxy.lock().unwrap().as_ref() {
-            p.send(w);
+            // A failed send means the event loop is gone — the window is closing and nothing is left
+            // to wake. Dropping it is correct; there is no recovery and no one to report it to.
+            let _ = p.send(w);
         }
     }
 }
