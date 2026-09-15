@@ -507,6 +507,20 @@ impl FluorApp for FluorViewer {
 
     fn init(&mut self, _ctx: &mut Context) {}
 
+    /// Cover the macOS system menu bar.
+    ///
+    /// The viewer's surface is monitor-sized, and resolution-follow asks the host to render at
+    /// exactly that surface's backing size. On macOS the menu bar is drawn above ordinary windows,
+    /// so without this the top strip is not ours: the surface loses those rows, the host is asked
+    /// for a correspondingly shorter frame, and a 4K display streams the guest at less than 4K.
+    /// Hiding it makes the request match the panel exactly, which is also what removes the rescale.
+    ///
+    /// This is auto-hide, not hide — the menu bar slides back on a mouse-to-edge gesture, so nothing
+    /// becomes unreachable while a session is up.
+    fn covers_menu_bar(&self) -> bool {
+        true
+    }
+
     /// Native menu bar (always visible on macOS) carrying the viewer controls — so we don't have
     /// to steal Ctrl+Alt combos from the guest. Static for now; clicks arrive as
     /// `FEvent::MenuItem(id)` and are handled in `on_event`.
