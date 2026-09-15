@@ -1,5 +1,7 @@
 <p align="center">
-  <img src="res/logo-header.svg" alt="RustDesk - Your remote desktop"><br>
+  <img src="res/hero-lightkeeper.webp" alt="Dusk on a coastal headland: a figure walks a path carrying a lantern while a lighthouse beam answers from across the water"><br>
+  <sub><i>Lightkeeper &middot; photographed by Scott Spiker, 2006 &middot; the figure on the path is the author.<br>
+  Canon EOS 5D, 14&thinsp;mm, partial IR composite &mdash; the source frame's capture metadata is left intact in the file.</i></sub><br><br>
   <a href="#raw-steps-to-build">Build</a> •
   <a href="#how-to-build-with-docker">Docker</a> •
   <a href="#file-structure">Structure</a> •
