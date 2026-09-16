@@ -395,20 +395,26 @@ fn run_pos(sp: EmptyExtraFieldService, state: &mut StatePos) -> ResultType<()> {
 fn run_cursor(sp: MouseCursorService, state: &mut StateCursor) -> ResultType<()> {
     if let Some(hcursor) = crate::get_cursor()? {
         if hcursor != state.hcursor {
-            let msg;
-            if let Some(cached) = state.cached_cursor_data.get(&hcursor) {
+            // Key state and cache on the id the fetched image actually carries. On X11 that is
+            // the serial of the cursor on screen at fetch time, which can differ from `hcursor`
+            // (read a moment earlier) when the cursor is changing quickly; on Windows/macOS it
+            // is exactly `hcursor`. Recording the real id is what stops a fast flip from being
+            // re-fetched (and re-failed) every tick.
+            let (msg, id) = if let Some(cached) = state.cached_cursor_data.get(&hcursor) {
                 super::log::trace!("Cursor data cached, hcursor: {}", hcursor);
-                msg = cached.clone();
+                (cached.clone(), hcursor)
             } else {
                 let mut data = crate::get_cursor_data(hcursor)?;
+                let id = data.id;
                 data.colors = hbb_common::compress::compress(&data.colors[..]).into();
                 let mut tmp = Message::new();
                 tmp.set_cursor_data(data);
-                msg = Arc::new(tmp);
-                state.cached_cursor_data.insert(hcursor, msg.clone());
-                super::log::trace!("Cursor data updated, hcursor: {}", hcursor);
-            }
-            state.hcursor = hcursor;
+                let msg = Arc::new(tmp);
+                state.cached_cursor_data.insert(id, msg.clone());
+                super::log::trace!("Cursor data updated, hcursor: {}", id);
+                (msg, id)
+            };
+            state.hcursor = id;
             sp.send_shared(msg.clone());
             state.cursor_data = msg;
         }

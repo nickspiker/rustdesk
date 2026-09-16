@@ -385,7 +385,15 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
             if !d.is_null() {
                 unsafe {
                     let img = XFixesGetCursorImage(**d);
-                    if !img.is_null() && hcursor == (*img).cursor_serial as u64 {
+                    // Take the image we just fetched, whatever serial it carries. `hcursor` came
+                    // from an EARLIER XFixesGetCursorImage in get_cursor(); demanding the serial
+                    // still match here raced every transient cursor — an arrow → resize-arrow →
+                    // arrow flip as the pointer crosses a window edge lasts less than the gap
+                    // between the two calls — so those "failed" and the service parked for a
+                    // second each time, and resize arrows never reached the guest. The cursor on
+                    // screen NOW is the right thing to send; its serial rides along in `id`.
+                    let _ = hcursor;
+                    if !img.is_null() {
                         let mut cd: CursorData = Default::default();
                         cd.hotx = (*img).xhot as _;
                         cd.hoty = (*img).yhot as _;
