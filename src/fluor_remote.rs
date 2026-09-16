@@ -427,10 +427,24 @@ impl FluorViewer {
         Some((rx, ry))
     }
 
+    /// The modifiers held RIGHT NOW, in `send_mouse`'s `(alt, ctrl, shift, command)` order. Every
+    /// mouse event must carry them: on each mouse-down the host runs `fix_modifiers`, which
+    /// RELEASES any modifier that is physically held but not listed in the event ("ctrl is down
+    /// but not in modifiers → change ctrl to up"). Sending none — as this viewer did — meant the
+    /// host lifted a held Shift/Cmd/Ctrl at the instant of the click, so shift-click multi-select
+    /// and every modifier+click combo landed as a plain click even though the key path had
+    /// pressed the modifier correctly. Wheel events read them too (shift = horizontal scroll,
+    /// ctrl = zoom on most hosts).
+    fn mouse_mods(ctx: &Context) -> (bool, bool, bool, bool) {
+        let m = ctx.modifiers;
+        (m.alt, m.ctrl, m.shift, m.meta)
+    }
+
     fn send_move(&self, ctx: &Context, x: Coord, y: Coord) {
         if let Some((rx, ry)) = self.to_remote(ctx, x, y) {
+            let (alt, ctrl, shift, cmd) = Self::mouse_mods(ctx);
             self.session
-                .send_mouse((self.buttons << 3) | TYPE_MOVE, rx, ry, false, false, false, false);
+                .send_mouse((self.buttons << 3) | TYPE_MOVE, rx, ry, alt, ctrl, shift, cmd);
         }
     }
 
@@ -634,8 +648,9 @@ impl FluorApp for FluorViewer {
                 } else {
                     self.buttons &= !btn;
                 }
+                let (alt, ctrl, shift, cmd) = Self::mouse_mods(ctx);
                 self.session
-                    .send_mouse((btn << 3) | ty, rx, ry, false, false, false, false);
+                    .send_mouse((btn << 3) | ty, rx, ry, alt, ctrl, shift, cmd);
             }
             FEvent::MouseWheel { delta } => {
                 // Pass the wheel THROUGH to the host (RustDesk MOUSE_TYPE_WHEEL), not a local pan —
@@ -664,8 +679,9 @@ impl FluorApp for FluorViewer {
                     x = 0;
                 }
                 if x != 0 || y != 0 {
+                    let (alt, ctrl, shift, cmd) = Self::mouse_mods(ctx);
                     self.session
-                        .send_mouse(TYPE_WHEEL, x, y, false, false, false, false);
+                        .send_mouse(TYPE_WHEEL, x, y, alt, ctrl, shift, cmd);
                 }
             }
             FEvent::KeyboardInput { event } => {
