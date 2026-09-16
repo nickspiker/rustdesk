@@ -141,17 +141,26 @@ impl InvokeUiSession for FluorHandler {
     // ── everything below is not needed by a bare viewer (yet) ──
     fn set_cursor_data(&self, cd: CursorData) {
         let (w, h) = (cd.width.max(0) as usize, cd.height.max(0) as usize);
-        if w == 0 || h == 0 || cd.colors.len() < w * h * 4 {
+        // The host zstd-compresses the pixels before sending (input_service run_cursor), and
+        // the sciter/flutter backends decompress on receipt. Reading `cd.colors` raw meant the
+        // buffer was always shorter than w*h*4, the guard below dropped EVERY shape, and the
+        // cursor stayed a plain pointer no matter what the host sent.
+        let colors = hbb_common::compress::decompress(&cd.colors);
+        if w == 0 || h == 0 || colors.len() < w * h * 4 {
+            log::warn!(
+                "fluor: cursor {} dropped — {}x{} but {} bytes ({} on the wire)",
+                cd.id, w, h, colors.len(), cd.colors.len()
+            );
             return;
         }
         // Same packing as on_rgba: keep alpha, invert the colour channels. The wire order here
         // is RGBA (not the frame's ARGB), so channels are read straight through.
         let mut pixels = vec![0u32; w * h];
         for i in 0..w * h {
-            let r = cd.colors[i * 4] as u32;
-            let g = cd.colors[i * 4 + 1] as u32;
-            let b = cd.colors[i * 4 + 2] as u32;
-            let a = cd.colors[i * 4 + 3] as u32;
+            let r = colors[i * 4] as u32;
+            let g = colors[i * 4 + 1] as u32;
+            let b = colors[i * 4 + 2] as u32;
+            let a = colors[i * 4 + 3] as u32;
             pixels[i] = (a << 24) | ((255 - r) << 16) | ((255 - g) << 8) | (255 - b);
         }
         let img = CursorImage { pixels, w, h, hot: (cd.hotx, cd.hoty) };
