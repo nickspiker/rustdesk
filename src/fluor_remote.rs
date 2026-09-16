@@ -370,6 +370,10 @@ struct FluorViewer {
     /// Cursor derived from the last raw CursorMoved (raw − window_origin, pass-0 px). Used by
     /// MouseInput (which carries no position) and as the send_move source.
     last_cursor: (Coord, Coord),
+    /// The pointer is over our window. The remote cursor shape is painted at `last_cursor`
+    /// only while this is true, and the OS pointer is hidden only while this is true — once
+    /// the pointer leaves, the stale `last_cursor` must not keep a phantom cursor on screen.
+    pointer_inside: bool,
     /// Last time HUD telemetry was chatted to the host (throttle ~2s). The host logs HUD|
     /// lines, giving us the viewer's runtime numbers on the HOST's disk — readable even when
     /// the viewer machine is unreachable.
@@ -601,7 +605,12 @@ impl FluorApp for FluorViewer {
         }
         match event {
             FEvent::CloseRequested => return EventResponse::Close,
+            FEvent::CursorLeft => {
+                self.pointer_inside = false;
+                ctx.window.request_redraw();
+            }
             FEvent::CursorMoved { x, y } => {
+                self.pointer_inside = true;
                 // Map from the RAW winit position minus the window's origin — both in pass-0
                 // pixel space — bypassing fluor's internal cursor bookkeeping entirely. On the
                 // Mac (fullscreen-compositor host) ctx.cursor_x arrives ≈0 with garbage y; the
@@ -809,19 +818,19 @@ impl FluorApp for FluorViewer {
         {
             let id = *self.shared.cursor_id.lock().unwrap();
             let cursors = self.shared.cursors.lock().unwrap();
-            if let Some(img) = id.and_then(|i| cursors.get(&i)) {
-                let (rx, ry) = *self.shared.cursor.lock().unwrap();
-                // Cursor positions are absolute desktop coordinates, but the frame is ONE
-                // display — take the origin off, exactly as the send path adds it, or the
-                // cursor lands offset by the monitor's position on every non-primary head.
-                let (dox, doy) = *self.shared.display_origin.lock().unwrap();
-                // Host-pixel position of the image's top-left, then into viewport space.
-                let px = (rx - dox - img.hot.0) as f32;
-                let py = (ry - doy - img.hot.1) as f32;
+            if let Some(img) = id.and_then(|i| cursors.get(&i)).filter(|_| self.pointer_inside) {
+                // Paint the shape at OUR pointer, not at the position the host echoes back.
+                // We are the thing moving the host's pointer, so we already know exactly where
+                // it is — and the echo only flows when the cursor-POSITION service is subscribed
+                // (`show_remote_cursor`), which it was not: the echoed position stayed (0,0) and
+                // every shape was painted in the top-left corner under the connection strip,
+                // invisible, while the native arrow showed on top. Local placement is also
+                // zero-latency: the shape moves with the hand, not a round trip behind it.
+                let (lx, ly) = self.last_cursor;
                 let dwc = img.w as f32 * scale;
                 let dhc = img.h as f32 * scale;
-                let ccx = ox + px * scale + dwc * 0.5;
-                let ccy = oy + py * scale + dhc * 0.5;
+                let ccx = lx - img.hot.0 as f32 * scale + dwc * 0.5;
+                let ccy = ly - img.hot.1 as f32 * scale + dhc * 0.5;
                 let mut canvas = Canvas::new(target, bw, bh, ctx.damage);
                 draw_image(&mut canvas, &img.pixels, img.w, img.h, ccx, ccy, dwc, dhc, None);
             }
@@ -874,7 +883,19 @@ impl FluorApp for FluorViewer {
         _y: Coord,
         _ctx: &Context,
     ) -> fluor::event::CursorIcon {
-        fluor::event::CursorIcon::Default
+        // While the host has told us what its cursor looks like, WE paint that shape at the
+        // pointer (see render) — so the Mac's own arrow must not sit on top of it, or every
+        // shape change (resize arrows, I-beam, hand) stays invisible under a plain pointer.
+        // Before the first shape arrives, the native arrow is the honest fallback.
+        let have_shape = {
+            let id = *self.shared.cursor_id.lock().unwrap();
+            id.is_some_and(|i| self.shared.cursors.lock().unwrap().contains_key(&i))
+        };
+        if self.pointer_inside && have_shape {
+            fluor::event::CursorIcon::Hidden
+        } else {
+            fluor::event::CursorIcon::Default
+        }
     }
 }
 
@@ -1058,6 +1079,7 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
         follow_tries: 0,
         follow_at: None,
         last_cursor: (0.0, 0.0),
+        pointer_inside: false,
         last_telemetry: None,
         hud: false, // off by default; Ctrl+Alt+H toggles the on-screen diagnostic overlay
         dbg_raw: (0.0, 0.0),
