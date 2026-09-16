@@ -531,25 +531,23 @@ impl FluorApp for FluorViewer {
     /// for a correspondingly shorter frame, and a 4K display streams the guest at less than 4K.
     /// Hiding it makes the request match the panel exactly, which is also what removes the rescale.
     ///
-    /// Fully hidden, not auto-hidden. Auto-hide was the first cut and it is the wrong gesture here:
-    /// the bar reveals on pointer-to-top-edge, which is exactly what the viewer forwards to the
-    /// guest, so reaching for the guest's OWN menu bar kept pulling ours in over the stream. The
-    /// controls live in the Dock menu instead — see `dock_menu`.
+    /// Auto-hide, not hide. Fully hiding the bar was tried and AppKit's pairing rule makes it
+    /// unusable: `HideMenuBar` forces `HideDock`, so the app ends up with no menu bar AND no Dock,
+    /// and its own controls become unreachable without Cmd-Tabbing off the session first. Auto-hide
+    /// keeps both one pointer-to-edge gesture away. The cost is that the viewer forwards that same
+    /// top-edge gesture to the guest, so reaching for the guest's own menu bar can pull ours in.
     fn covers_menu_bar(&self) -> bool {
         true
     }
 
-    /// Viewer controls, carried by the Dock icon's menu rather than the menu bar — `covers_menu_bar`
-    /// hides the bar, and on macOS that hides an app's own menus with it. Keeping them off the
-    /// keyboard is the point: no Ctrl+Alt combo has to be stolen from the guest. Clicks arrive as
-    /// `FEvent::MenuItem(id)` either way and are handled in `on_event`.
+    /// The same controls on the Dock icon — a second route to them, since the auto-hidden menu bar
+    /// competes with the guest for the top edge. Clicks arrive as `FEvent::MenuItem(id)` from either
+    /// surface and are handled in `on_event`, so neither is privileged.
     fn dock_menu(&self) -> Vec<MenuItem> {
         self.menu()
     }
 
-    /// The control spec itself. Still returned from `menu()` so the items exist as a real NSMenu —
-    /// `dock_menu` reuses it verbatim, and a build that ever stops covering the bar gets the menu
-    /// bar back for free. Static for now.
+    /// The control spec itself, shared by the menu bar and `dock_menu`. Static for now.
     fn menu(&self) -> Vec<MenuItem> {
         vec![
             // "Remote" = the host (leviathan): which of ITS monitors we're viewing.
@@ -855,7 +853,7 @@ impl FluorApp for FluorViewer {
                 self.dbg_org.0, self.dbg_org.1, self.dbg_rem.0, self.dbg_rem.1
             );
             let line3 = format!("key: {}", self.dbg_key);
-            let line4 = "dock icon menu: Local/Remote monitor · Fullscreen · HUD";
+            let line4 = "menu bar (top edge) or dock icon: Local/Remote monitor · Fullscreen · HUD";
             let size = (bh as f32 * 0.028).clamp(16.0, 40.0);
             let x = size * 0.5;
             let mut y = size * 0.9;
