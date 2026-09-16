@@ -137,7 +137,8 @@ pub type PrivacyModeCreator = fn(impl_key: &str) -> Box<dyn PrivacyMode>;
 lazy_static::lazy_static! {
     static ref PRIVACY_MODE_CREATOR: Arc<Mutex<HashMap<&'static str, PrivacyModeCreator>>> = {
         #[cfg(not(windows))]
-        let map: HashMap<&'static str, PrivacyModeCreator> = HashMap::new();
+        #[allow(unused_mut)]
+        let mut map: HashMap<&'static str, PrivacyModeCreator> = HashMap::new();
         #[cfg(target_os = "macos")]
         {
             map.insert(macos::PRIVACY_MODE_IMPL, |impl_key: &str| {
