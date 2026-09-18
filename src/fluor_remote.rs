@@ -815,15 +815,16 @@ impl FluorApp for FluorViewer {
         }
         let cx = ox + dw * 0.5;
         let cy = oy + dh * 0.5;
-        {
-            let mut canvas = Canvas::new(target, bw, bh, ctx.damage);
-            draw_image(&mut canvas, &f.pixels, fw, fh, cx, cy, dw, dh, None);
-        }
-        drop(f);
-        // The remote's cursor SHAPE, drawn over the video. The host sends shapes (resize
-        // arrows, I-beam, hand) and we only ever showed the Mac's own arrow, so every shape
-        // change was invisible — you could not see what the remote pointer had become. Mapped
-        // through the same scale/origin as the frame so it lands exactly where the host has it.
+        // The remote's cursor SHAPE, over the video. The host sends shapes (resize arrows,
+        // I-beam, hand) and we only ever showed the Mac's own arrow, so every shape change was
+        // invisible — you could not see what the remote pointer had become. Mapped through the
+        // same scale/origin as the frame so it lands exactly where the host has it.
+        //
+        // Painted BEFORE the frame, and that order is the whole trick: fluor's draw_image composes
+        // each pixel UNDER what is already in the buffer, so first-drawn is topmost. Painting the
+        // cursor after the (fully opaque) video put it underneath the video — and with the native
+        // arrow hidden in cursor_for, the pointer vanished entirely. Same rule the backdrop below
+        // relies on from the other side: it is drawn last precisely so it ends up under everything.
         {
             let id = *self.shared.cursor_id.lock().unwrap();
             let cursors = self.shared.cursors.lock().unwrap();
@@ -844,6 +845,11 @@ impl FluorApp for FluorViewer {
                 draw_image(&mut canvas, &img.pixels, img.w, img.h, ccx, ccy, dwc, dhc, None);
             }
         }
+        {
+            let mut canvas = Canvas::new(target, bw, bh, ctx.damage);
+            draw_image(&mut canvas, &f.pixels, fw, fh, cx, cy, dw, dh, None);
+        }
+        drop(f);
         // Connection strip along the very top, drawn OVER the video: a few pixels of colour
         // naming the path we got (amber relay / green WAN / cyan LAN / blue direct).
         {
