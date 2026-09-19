@@ -264,3 +264,15 @@ rpath = true
 
 [profile.dev]
 debug = 1
+
+# The PQ signature crates (via fgtw) are slow unoptimised — SLH-DSA-128s signing is tens of seconds in a debug build, under a second in release. Per-package, so the rest of the tree stays debuggable. Profile overrides only apply from the build root, which is why fgtw's own copy of this does not reach here.
+[profile.dev.package.fips205]
+opt-level = 3
+[profile.dev.package.fn-dsa-sign]
+opt-level = 3
+[profile.dev.package.fn-dsa-vrfy]
+opt-level = 3
+[profile.dev.package.fn-dsa-kgen]
+opt-level = 3
+[profile.dev.package.fn-dsa-comm]
+opt-level = 3
