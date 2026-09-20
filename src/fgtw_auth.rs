@@ -8,8 +8,28 @@
 //! untouched — they never set the `PublicKey.fgtw` handshake field.
 //!
 //! This module owns three things: the HTTP transport binding fgtw's oracle to RustDesk's
-//! reqwest stack, the on-disk enrollment state, and the sign/verify halves of the
+//! reqwest stack, a PUBLIC chain cache (never a root), and the sign/verify halves of the
 //! handshake. It is compiled only under the `fgtw` cargo feature.
+//!
+//! # Nothing secret touches disk
+//!
+//! The session roots (`handle_proof`, `identity_seed`) live in tohu's boot-locked session and
+//! are read from there at every use — client-side only, since only a client acts on the fleet.
+//! An earlier version copied them to `fgtw_auth.vsf` in plaintext at first adoption, which made
+//! every device the "unattended reboot" case tohu refuses to make the default: a powered-off
+//! stolen laptop came back as its owner, and the fleet's name sat readable on disk. That file is
+//! scrubbed on sight.
+//!
+//! # The host is stateless
+//!
+//! A host holds one key — the device key, re-derived from the machine fingerprint — and needs no
+//! session. The guest presents `handle_proof` in the handshake (verification-only material; it is
+//! already the public registry slot key), the host fetches THAT fleet's chain, checks its own key
+//! is in it (else a foreign fleet), then checks the guest's eggs against the bundle the chain
+//! records for it, at the fleet's floor. Powered on ⇒ hosting; a locked or wiped device still
+//! hosts, which is what lets the owner always reach it. The only thing cached is the chain's
+//! public bytes, so hosting survives the fleet server being unreachable for a bounded time; a
+//! reader of that cache learns which devices are in the fleet and nothing else.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,7 +37,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fgtw::client::{FgtwResponse, FgtwTransport};
+use fgtw::fleet::{scheme, Egg, MembershipBlob};
 use fgtw::keys::{derive_device_keypair, Keypair};
+use fgtw::pq::{self, FleetSigner, KeyBundle, SigningBundle};
 use hbb_common::config::Config;
 use hbb_common::{log, ResultType};
 use vsf::VsfType;
@@ -25,8 +47,11 @@ use vsf::VsfType;
 const FGTW_URL_DEFAULT: &str = "https://fgtw.org";
 /// Domain separator for the handshake signature — binds the signed bytes to this
 /// exact protocol so a signature can never be lifted into another context.
-const HS_DOMAIN: &[u8] = b"fgtw-rustdesk-hs-v0";
-const STATE_FILE: &str = "fgtw_auth.vsf";
+const HS_DOMAIN: &[u8] = b"fgtw-rustdesk-hs-v1";
+/// The retired plaintext-roots file. Deleted whenever it is seen — it held `handle_proof` and `identity_seed` in the clear.
+const LEGACY_STATE_FILE: &str = "fgtw_auth.vsf";
+/// The public chain cache: the last verified membership chain's bytes and when they were fetched. Public data only.
+const CHAIN_CACHE_FILE: &str = "fgtw_chain.vsf";
 /// Default max age (seconds) of a cached member set used when the fleet server is
 /// unreachable. Beyond this, an incoming fleet auth is denied rather than trusted stale.
 const CACHE_MAX_AGE_DEFAULT: u64 = 3600;
@@ -99,109 +124,72 @@ pub fn device_keypair() -> ResultType<Keypair> {
     Ok(derive_device_keypair(&machine_fingerprint()?))
 }
 
-// ── enrollment state ──
+// ── roots: read from the session, never from disk ──
 
-/// What enrollment persists: the handle proof (identifies the fleet), the identity seed
-/// (fleet-scoped device naming + fleet-state addressing — verification-only material, no
-/// signing power, same at-rest exposure class as the proof), the last verified member set +
-/// its chain-tip time (a monotonic freshness guard), and when it was fetched (staleness
-/// bound for offline auth).
+/// The fleet identity this device acts under, from tohu's boot-locked session: `(handle_proof, identity_seed)`. `None` when nobody is logged in on this machine — and then this device can HOST but cannot act as a client, because nothing on disk stands in for the session.
+fn session_roots() -> Option<([u8; 32], [u8; 32])> {
+    let s = tohu::session()?;
+    Some((s.handle_proof, s.identity_seed))
+}
+
+/// This device's full signing bundle — Ed25519 plus Falcon-512 and SPHINCS+, all derived from the machine fingerprint — computed once per process. Derivation costs about a second of SLH-DSA keygen, which is far too much per handshake and exactly right per launch.
+fn signing_bundle() -> Option<&'static SigningBundle> {
+    static B: OnceLock<Option<SigningBundle>> = OnceLock::new();
+    B.get_or_init(|| machine_fingerprint().ok().map(|fp| SigningBundle::derive(&fp))).as_ref()
+}
+
+// ── the public chain cache ──
+
+/// The last verified membership chain, kept so a host can verify guests while the fleet server is unreachable (within `fgtw-cache-max-age`). PUBLIC data: the worker serves these bytes to anyone holding the slot key. Holds no root — the fleet it belongs to is named by the chain's own genesis, and this device's membership by the fold.
 #[derive(Clone)]
-pub struct EnrollState {
-    pub handle_proof: [u8; 32],
-    pub identity_seed: [u8; 32],
-    pub members: Vec<[u8; 32]>,
-    pub tip_osc: i64,
+pub struct ChainCache {
+    pub blob: Vec<u8>,
     pub fetched_at: u64,
 }
 
-fn state_path() -> PathBuf {
-    Config::path(STATE_FILE)
+fn cache_path() -> PathBuf {
+    Config::path(CHAIN_CACHE_FILE)
 }
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-impl EnrollState {
-    fn to_bytes(&self) -> Result<Vec<u8>, String> {
-        let mut section = vsf::VsfSection::new("fgtw_enroll");
-        section.add_field("hp", VsfType::hP(self.handle_proof.to_vec()));
-        section.add_field("is", VsfType::hP(self.identity_seed.to_vec()));
-        // One multi-valued field: repeated same-name fields don't accumulate on read.
-        section.add_field_multi(
-            "m",
-            self.members.iter().map(|m| VsfType::ke(m.to_vec())).collect(),
-        );
-        // Fixed 8-byte LE, not VSF's auto-sized int field: the `i`/`u` variants re-type on
-        // decode (a positive `i` comes back as `u`), so raw bytes round-trip cleanly — the
-        // same reason fgtw packs eagle_time as to_le_bytes().
-        section.add_field("tip", VsfType::hR(self.tip_osc.to_le_bytes().to_vec()));
+impl ChainCache {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut section = vsf::VsfSection::new("fgtw_chain");
+        section.add_field("cb", VsfType::ge(self.blob.clone()));
+        // Fixed 8-byte LE, not VSF's auto-sized int: the `i`/`u` variants re-type on decode, so raw bytes round-trip cleanly.
         section.add_field("at", VsfType::hR(self.fetched_at.to_le_bytes().to_vec()));
         vsf::VsfBuilder::new()
             .creation_time_oscillations(vsf::eagle_time_oscillations())
             .add_section_direct(section)
             .build()
-            .map_err(|e| format!("fgtw state build: {e}"))
+            .map_err(|e| format!("encode chain cache: {e}"))
     }
 
-    fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let (_, header_end) = vsf::verification::read_verified(bytes, None)
-            .map_err(|e| format!("fgtw state verify: {e}"))?;
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let (_, header_end) = vsf::verification::read_verified(bytes, None).map_err(|e| format!("chain cache: {e}"))?;
         let mut ptr = header_end;
-        let section = vsf::VsfSection::parse(bytes, &mut ptr)
-            .map_err(|e| format!("fgtw state section: {e}"))?;
-        let hp = match section.get_field("hp").and_then(|f| f.values.first()) {
-            Some(VsfType::hP(b)) if b.len() == 32 => {
-                let mut a = [0u8; 32];
-                a.copy_from_slice(b);
-                a
-            }
-            _ => return Err("fgtw state: missing handle proof".into()),
-        };
-        // Pre-seed state files lack this field; a missing seed reads as unreadable state, which
-        // load() surfaces as "not enrolled" — re-enroll to regenerate (dev-phase flag day).
-        let identity_seed = match section.get_field("is").and_then(|f| f.values.first()) {
-            Some(VsfType::hP(b)) if b.len() == 32 => {
-                let mut a = [0u8; 32];
-                a.copy_from_slice(b);
-                a
-            }
-            _ => return Err("fgtw state: missing identity seed (re-enroll)".into()),
-        };
-        let members = section
-            .get_field("m")
-            .map(|f| {
-                f.values
-                    .iter()
-                    .filter_map(|v| match v {
-                        VsfType::ke(b) if b.len() == 32 => {
-                            let mut a = [0u8; 32];
-                            a.copy_from_slice(b);
-                            Some(a)
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let tip_osc = match section.get_field("tip").and_then(|f| f.values.first()) {
-            Some(VsfType::hR(b)) if b.len() == 8 => i64::from_le_bytes(b.as_slice().try_into().unwrap()),
-            _ => 0,
+        let section = vsf::VsfSection::parse(bytes, &mut ptr).map_err(|e| format!("chain cache section: {e}"))?;
+        let blob = match section.get_field("cb").and_then(|f| f.values.first()) {
+            Some(VsfType::ge(b)) if !b.is_empty() => b.clone(),
+            _ => return Err("chain cache: missing chain bytes".into()),
         };
         let fetched_at = match section.get_field("at").and_then(|f| f.values.first()) {
             Some(VsfType::hR(b)) if b.len() == 8 => u64::from_le_bytes(b.as_slice().try_into().unwrap()),
             _ => 0,
         };
-        Ok(Self { handle_proof: hp, identity_seed, members, tip_osc, fetched_at })
+        Ok(Self { blob, fetched_at })
     }
 
     pub fn load() -> Option<Self> {
-        let bytes = std::fs::read(state_path()).ok()?;
+        scrub_legacy_state();
+        let bytes = std::fs::read(cache_path()).ok()?;
         match Self::from_bytes(&bytes) {
-            Ok(s) => Some(s),
+            Ok(c) => Some(c),
             Err(e) => {
-                log::warn!("fgtw enroll state unreadable: {e}");
+                log::warn!("fgtw chain cache unreadable: {e}");
                 None
             }
         }
@@ -209,18 +197,34 @@ impl EnrollState {
 
     pub fn save(&self) -> Result<(), String> {
         let bytes = self.to_bytes()?;
-        let path = state_path();
-        // The config dir may not exist yet on a first run (fresh install / scratch config).
+        let path = cache_path();
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("create fgtw state dir: {e}"))?;
+            std::fs::create_dir_all(dir).map_err(|e| format!("create fgtw cache dir: {e}"))?;
         }
-        std::fs::write(&path, bytes).map_err(|e| format!("write fgtw state: {e}"))
+        std::fs::write(&path, bytes).map_err(|e| format!("write fgtw chain cache: {e}"))
+    }
+
+    /// The chain this cache holds, if it still parses.
+    fn chain(&self) -> Option<MembershipBlob> {
+        MembershipBlob::from_vsf_bytes(&self.blob).ok()
     }
 }
 
-/// True iff this machine is enrolled in a fleet.
+/// Delete the retired plaintext-roots file if it is still here. It held `handle_proof` and `identity_seed` in the clear, which is the one thing this module must never leave on disk again.
+fn scrub_legacy_state() {
+    let legacy = Config::path(LEGACY_STATE_FILE);
+    if legacy.exists() {
+        match std::fs::remove_file(&legacy) {
+            Ok(()) => log::warn!("fgtw: removed legacy plaintext enroll state {}", legacy.display()),
+            Err(e) => log::error!("fgtw: could not remove legacy plaintext enroll state {}: {e}", legacy.display()),
+        }
+    }
+}
+
+/// Can this machine act in a fleet at all? A logged-in session makes it a client; a cached chain makes it a host that can verify guests offline. Neither implies the other.
 pub fn is_enrolled() -> bool {
-    state_path().exists()
+    scrub_legacy_state();
+    session_roots().is_some() || cache_path().exists()
 }
 
 // ── pending handshake auth ──
@@ -262,30 +266,41 @@ fn cache_max_age() -> u64 {
     v.parse().unwrap_or(CACHE_MAX_AGE_DEFAULT)
 }
 
-/// The current fleet member set, refreshed from FGTW when reachable, else the cached set
-/// within the staleness bound. Adopts a fresh fold only when its chain tip is `>=` the
-/// cached tip (monotonic guard against a stale R2 read overwriting a post-revocation set).
-/// Updates the cache file on a successful refresh. Returns `Err` when neither a fresh nor a
-/// fresh-enough cached set is available.
-fn current_fleet(state: &EnrollState) -> Result<Vec<[u8; 32]>, String> {
-    match fgtw::client::current_members_with_ts(&RdTransport::auth(), &state.handle_proof) {
-        Ok((members, tip)) if tip >= state.tip_osc => {
-            let refreshed =
-                EnrollState { members: members.clone(), tip_osc: tip, fetched_at: now_secs(), ..state.clone() };
-            if let Err(e) = refreshed.save() {
-                log::warn!("fgtw cache update failed: {e}");
+/// The membership chain for `handle_proof`, fetched from FGTW when reachable, else the cached chain within the staleness bound. Adopts a fresh chain only when its tip is `>=` the cached tip (monotonic guard against a stale read overwriting a post-removal set). Updates the cache on a successful refresh. `Err` when neither a fresh nor a fresh-enough cached chain is available.
+///
+/// The cache is only ever written with a chain THIS device is a member of, so it always names this device's own fleet. A guest naming a foreign fleet gets a live fetch and, on failure, no fallback — there is nothing legitimate to fall back to.
+fn current_chain(handle_proof: &[u8; 32]) -> Result<MembershipBlob, String> {
+    let cached = ChainCache::load();
+    let cached_chain = cached.as_ref().and_then(|c| c.chain());
+    let cached_is_this_fleet = cached_chain.as_ref().and_then(|c| c.genesis_handle_proof()) == Some(*handle_proof);
+    let cached_tip = cached_chain.as_ref().and_then(|c| c.fold_with_ts().ok()).map(|(_, t)| t).unwrap_or(i64::MIN);
+    match fgtw::client::fetch(&RdTransport::auth(), handle_proof) {
+        Ok(Some(fresh)) => {
+            let (members, tip) = fresh.fold_with_ts().map_err(|e| format!("fetched fleet does not fold: {e:?}"))?;
+            if cached_is_this_fleet && tip < cached_tip {
+                // Fresh fetch is older than what we hold (eventual-consistency lag) — keep cached.
+                return Ok(cached_chain.unwrap());
             }
-            Ok(members)
+            // Cache only our own fleet: a chain we are a member of.
+            if let Ok(me) = device_keypair() {
+                if members.contains(&me.public.to_bytes()) {
+                    if let Err(e) = (ChainCache { blob: fresh.to_vsf_bytes().map_err(|e| format!("{e}"))?, fetched_at: now_secs() }).save() {
+                        log::warn!("fgtw cache update failed: {e}");
+                    }
+                }
+            }
+            Ok(fresh)
         }
-        Ok(_) => {
-            // Fresh fetch is older than what we hold (eventual-consistency lag) — keep cached.
-            Ok(state.members.clone())
-        }
+        Ok(None) => Err("no fleet chain exists for that identity".into()),
         Err(e) => {
-            let age = now_secs().saturating_sub(state.fetched_at);
+            let Some(c) = cached else { return Err(format!("fgtw unreachable and no cached chain: {e}")) };
+            if !cached_is_this_fleet {
+                return Err(format!("fgtw unreachable and the cached chain is for a different fleet: {e}"));
+            }
+            let age = now_secs().saturating_sub(c.fetched_at);
             if age <= cache_max_age() {
-                log::info!("fgtw offline ({e}); using cached fleet ({age}s old)");
-                Ok(state.members.clone())
+                log::info!("fgtw offline ({e}); using cached fleet chain ({age}s old)");
+                cached_chain.ok_or_else(|| "cached chain unreadable".to_string())
             } else {
                 Err(format!("fgtw unreachable and cache stale ({age}s): {e}"))
             }
@@ -399,9 +414,9 @@ impl fgtw::client::FleetSealer for RdSealer {
 /// The fleet key for this device, or why we can't have it right now. `recover_or_establish`
 /// mints epoch 1 when this device is the genesis founder; a freshly-paired device whose wrap
 /// hasn't been rotated in yet gets `None` — that's the two-phase gate, not an error.
-fn fleet_key(t: &RdTransport, state: &EnrollState) -> Result<[u8; 32], String> {
+fn fleet_key(t: &RdTransport, handle_proof: &[u8; 32], identity_seed: &[u8; 32]) -> Result<[u8; 32], String> {
     let kp = device_keypair().map_err(|e| e.to_string())?;
-    fgtw::client::recover_or_establish_fleet_key(t, &state.handle_proof, &kp, &state.identity_seed)?
+    fgtw::client::recover_or_establish_fleet_key(t, handle_proof, &kp, identity_seed)?
         .ok_or_else(|| "no fleet-key wrap for this device yet (awaiting sponsor rotation)".into())
 }
 
@@ -409,18 +424,18 @@ fn fleet_key(t: &RdTransport, state: &EnrollState) -> Result<[u8; 32], String> {
 /// Pull-merge-push (like photon's push_roster) so sibling maps and the roster ride along
 /// untouched. Best-effort: chooser data, not auth — failure is logged, never fatal, and the
 /// next enroll/ID-change retries.
-pub fn publish_own_id(state: &EnrollState, device_key: &Keypair) {
-    match publish_own_id_inner(state, device_key) {
+pub fn publish_own_id(handle_proof: &[u8; 32], identity_seed: &[u8; 32], device_key: &Keypair) {
+    match publish_own_id_inner(handle_proof, identity_seed, device_key) {
         Ok(()) => log::info!("fgtw: published this device's rustdesk id ({}) to the fleet", Config::get_id()),
         Err(e) => log::warn!("fgtw: publishing rustdesk id to fleet failed (will retry later): {e}"),
     }
 }
 
-fn publish_own_id_inner(state: &EnrollState, device_key: &Keypair) -> Result<(), String> {
+fn publish_own_id_inner(handle_proof: &[u8; 32], identity_seed: &[u8; 32], device_key: &Keypair) -> Result<(), String> {
     use fgtw::fstate::{DeviceSetting, DeviceSettings};
     let t = RdTransport::enroll();
-    let key = fleet_key(&t, state)?;
-    let mut fs = fgtw::client::pull_fstate(&t, &RdSealer, &state.handle_proof, &key)?
+    let key = fleet_key(&t, handle_proof, identity_seed)?;
+    let mut fs = fgtw::client::pull_fstate(&t, &RdSealer, handle_proof, &key)?
         .unwrap_or_default();
     let me = device_key.public.to_bytes();
     let now = vsf::eagle_time_oscillations();
@@ -457,21 +472,18 @@ fn publish_own_id_inner(state: &EnrollState, device_key: &Keypair) -> Result<(),
             entries,
         }),
     }
-    fgtw::client::push_fstate(&t, &RdSealer, &state.handle_proof, device_key, &key, &fs)
+    fgtw::client::push_fstate(&t, &RdSealer, handle_proof, device_key, &key, &fs)
 }
 
 /// Re-publish this device's RustDesk ID after it changed (e.g. the rendezvous server forced
 /// a new one on UUID mismatch), so the fleet's chooser map tracks it. Off-thread — callers
 /// sit in async/networking paths and publish_own_id blocks on HTTP. No-op when not enrolled.
 pub fn republish_own_id() {
-    if !is_enrolled() {
-        return;
-    }
-    std::thread::spawn(|| {
-        let (Some(state), Ok(kp)) = (EnrollState::load(), device_keypair()) else {
-            return;
-        };
-        publish_own_id(&state, &kp);
+    // Publishing needs the fleet key, and the fleet key needs the session — a host alone has nothing to publish with.
+    let Some((hp, seed)) = session_roots() else { return };
+    std::thread::spawn(move || {
+        let Ok(kp) = device_keypair() else { return };
+        publish_own_id(&hp, &seed, &kp);
     });
 }
 
@@ -479,12 +491,9 @@ pub fn republish_own_id() {
 /// us in its chooser (device_name_default over our pubkey + the identity seed). Pure
 /// local derivation; `None` when not enrolled.
 pub fn self_fleet_name() -> Option<String> {
-    let state = EnrollState::load()?;
+    let (_, seed) = session_roots()?;
     let kp = device_keypair().ok()?;
-    Some(fgtw::pair::device_name_default(
-        &kp.public.to_bytes(),
-        &state.identity_seed,
-    ))
+    Some(fgtw::pair::device_name_default(&kp.public.to_bytes(), &seed))
 }
 
 /// Is this device's rustdesk relay pipe open right now? The seed answers with one bit.
@@ -608,15 +617,15 @@ pub fn device_and_lan_for_rustdesk_id(id: &str) -> Option<([u8; 32], Option<Stri
 }
 
 pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
-    let state = EnrollState::load().ok_or("not enrolled")?;
-    let members = current_fleet(&state)?;
+    let (hp, seed) = session_roots().ok_or("not logged in on this machine")?;
+    let members = current_chain(&hp)?.fold().map_err(|e| format!("fleet does not fold: {e:?}"))?;
     let me = device_keypair().map(|k| k.public.to_bytes()).ok();
     // ID map is best-effort: an unreachable slot or missing wrap degrades to names-only.
     #[allow(clippy::type_complexity)]
     let ((ids, lans), names): ((HashMap<[u8; 32], String>, HashMap<[u8; 32], String>), HashMap<[u8; 32], String>) = (|| -> Result<_, String> {
         let t = RdTransport::auth();
-        let key = fleet_key(&t, &state)?;
-        let fs = fgtw::client::pull_fstate(&t, &RdSealer, &state.handle_proof, &key)?
+        let key = fleet_key(&t, &hp, &seed)?;
+        let fs = fgtw::client::pull_fstate(&t, &RdSealer, &hp, &key)?
             .unwrap_or_default();
         // Names the user set in photon's Fleet page. Photon writes `fleet.name.<pkhex>` as a
         // fleet-LINKED setting, so the value lives in the fleet-global layer, not the authoring
@@ -664,7 +673,7 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
             name: names
                 .get(m)
                 .cloned()
-                .unwrap_or_else(|| fgtw::pair::device_name_default(m, &state.identity_seed)),
+                .unwrap_or_else(|| fgtw::pair::device_name_default(m, &seed)),
             rustdesk_id: ids.get(m).cloned(),
             is_self: me == Some(*m),
             // Only probe peers: our own pipe's state is not interesting and would cost a round trip per refresh.
@@ -685,10 +694,14 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum FgtwVerdict {
     Ok,
+    /// This host has no device key to verify with — the machine fingerprint is unavailable.
     NotEnrolled,
     BadPayload,
     BadSignature,
+    /// The guest is not a current member of the fleet it named.
     NotMember,
+    /// The guest named a fleet THIS host is not a member of. A host only ever accepts its own fleet.
+    ForeignFleet,
     StaleCache,
 }
 
@@ -698,28 +711,22 @@ impl FgtwVerdict {
     }
 }
 
-/// The bytes both sides sign/verify: domain-tagged, binding the client's fresh per-connection
-/// box public key to the host's stable identity key. A relayed signature is useless (the MITM
-/// lacks the box secret) and cannot be replayed against a different host.
-fn hs_digest(client_box_pk: &[u8; 32], host_sign_pk: &[u8; 32]) -> [u8; 32] {
+/// The bytes both sides sign/verify: domain-tagged, binding the FLEET, the client's fresh per-connection box public key, and the host's stable identity key. A relayed signature is useless (the MITM lacks the box secret), it cannot be replayed against a different host, and it cannot be replayed into a different fleet.
+fn hs_digest(handle_proof: &[u8; 32], client_box_pk: &[u8; 32], host_sign_pk: &[u8; 32]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(HS_DOMAIN);
+    h.update(handle_proof);
     h.update(client_box_pk);
     h.update(host_sign_pk);
     *h.finalize().as_bytes()
 }
 
-/// Build the client's `PublicKey.fgtw` payload: VSF `{device_pubkey, sig}`. `None` if this
-/// machine isn't enrolled (caller falls back to the vanilla handshake).
-pub fn build_hs_payload(client_box_pk: &[u8; 32], host_sign_pk: &[u8; 32]) -> Option<Vec<u8>> {
-    if !is_enrolled() {
-        return None;
-    }
-    let kp = device_keypair().ok()?;
-    let sig = kp.sign(&hs_digest(client_box_pk, host_sign_pk)).to_bytes().to_vec();
+/// Encode a handshake payload: VSF `{hp, dk, eggs}` — the fleet, the guest's device key, and its egg list (`pq::eggs_to_bytes`) over [`hs_digest`]. Separated from [`build_hs_payload`] so tests can drive it with a chosen signer and mask.
+fn encode_hs_payload(handle_proof: &[u8; 32], device_pubkey: &[u8; 32], eggs: &[Egg]) -> Option<Vec<u8>> {
     let mut section = vsf::VsfSection::new("fgtw_hs");
-    section.add_field("dk", VsfType::ke(kp.public.to_bytes().to_vec()));
-    section.add_field("sig", VsfType::ge(sig));
+    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
+    section.add_field("dk", VsfType::ke(device_pubkey.to_vec()));
+    section.add_field("eggs", VsfType::ge(pq::eggs_to_bytes(eggs)));
     vsf::VsfBuilder::new()
         .creation_time_oscillations(vsf::eagle_time_oscillations())
         .add_section_direct(section)
@@ -727,68 +734,82 @@ pub fn build_hs_payload(client_box_pk: &[u8; 32], host_sign_pk: &[u8; 32]) -> Op
         .ok()
 }
 
-fn parse_hs_payload(payload: &[u8]) -> Option<([u8; 32], Vec<u8>)> {
-    let (_, header_end) = vsf::verification::read_verified(payload, None).ok()?;
-    let mut ptr = header_end;
-    // Near-form sections are anonymous on the wire (the name lives in the header TOC and
-    // comes back empty here), so we gate on field presence, not section.name. The verified
-    // read above already rejects tampered/foreign bytes; the handshake signature is the
-    // real authenticity check.
-    let section = vsf::VsfSection::parse(payload, &mut ptr).ok()?;
-    let dk = match section.get_field("dk").and_then(|f| f.values.first()) {
-        Some(VsfType::ke(b)) if b.len() == 32 => {
-            let mut a = [0u8; 32];
-            a.copy_from_slice(b);
-            a
-        }
-        _ => return None,
+/// Build the client's `PublicKey.fgtw` payload. `None` when nobody is logged in on this machine — a device without a session cannot act as a client, by construction: the fleet it would name lives only in the session.
+///
+/// Signs with every scheme the chain knows this device holds (its declared bundle, else Ed25519 alone). Emitting an egg the host has no key for would fail closed under the every-egg-must-verify rule, so the mask is read off the chain rather than assumed.
+pub fn build_hs_payload(client_box_pk: &[u8; 32], host_sign_pk: &[u8; 32]) -> Option<Vec<u8>> {
+    let (hp, _) = session_roots()?;
+    let kp = device_keypair().ok()?;
+    let me = kp.public.to_bytes();
+    let mask = current_chain(&hp).ok().map(|c| c.declared_mask(&me)).unwrap_or(scheme::MASK_BASE);
+    let digest = hs_digest(&hp, client_box_pk, host_sign_pk);
+    let eggs = match signing_bundle() {
+        Some(b) => b.eggs(&digest, mask),
+        None => kp.eggs(&digest, mask),
     };
-    let sig = match section.get_field("sig").and_then(|f| f.values.first()) {
-        Some(VsfType::ge(b)) if b.len() == 64 => b.clone(),
-        _ => return None,
-    };
-    Some((dk, sig))
+    encode_hs_payload(&hp, &me, &eggs)
 }
 
-/// Host side: verify an incoming `PublicKey.fgtw` payload. Checks the signature binds the
-/// client's box key to our identity key, then that the signing device is a current member of
-/// our own fleet (fresh fetch, cache fallback within bound). Returns the verified device
-/// pubkey on success, or the reason it was rejected.
+/// `(handle_proof, device_pubkey, eggs)` from a payload, or `None` if it is not a well-formed handshake.
+fn parse_hs_payload(payload: &[u8]) -> Option<([u8; 32], [u8; 32], Vec<Egg>)> {
+    let (_, header_end) = vsf::verification::read_verified(payload, None).ok()?;
+    let mut ptr = header_end;
+    // Near-form sections are anonymous on the wire (the name lives in the header TOC and comes back empty here), so we gate on field presence, not section.name. The verified read above already rejects tampered/foreign bytes; the eggs are the real authenticity check.
+    let section = vsf::VsfSection::parse(payload, &mut ptr).ok()?;
+    let take32 = |name: &str| -> Option<[u8; 32]> {
+        match section.get_field(name).and_then(|f| f.values.first()) {
+            Some(VsfType::hP(b)) | Some(VsfType::ke(b)) if b.len() == 32 => {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(b);
+                Some(a)
+            }
+            _ => None,
+        }
+    };
+    let hp = take32("hp")?;
+    let dk = take32("dk")?;
+    let eggs = match section.get_field("eggs").and_then(|f| f.values.first()) {
+        Some(VsfType::ge(b)) => pq::eggs_from_bytes(b).ok()?,
+        _ => return None,
+    };
+    Some((hp, dk, eggs))
+}
+
+/// Host side, STATELESS: verify an incoming `PublicKey.fgtw` payload holding nothing but our own device key.
+///
+/// The guest names the fleet. We fetch that fleet's chain (cache within bound when offline), require that WE are a current member of it — a host only ever accepts its own fleet — then that the guest is, then verify the guest's eggs against the bundle the chain records for it, at the fleet's scheme floor. Returns the verified device pubkey.
+///
+/// Not yet checked here: whether the guest is LOCKED OUT. Lock-out is a fan-out fact (no wrap under the re-minted key), not a chain fact, so it needs the guest to prove possession of the current epoch key — the asymmetric epoch key on the fan-out header. That proof slots in after the membership check below; until it lands, a locked device is still a chain member and this accepts it.
 pub fn verify_hs_payload(
     payload: &[u8],
     client_box_pk: &[u8; 32],
     our_sign_pk: &[u8; 32],
 ) -> Result<[u8; 32], FgtwVerdict> {
-    let state = EnrollState::load().ok_or(FgtwVerdict::NotEnrolled)?;
-    let (device_pk, sig) = parse_hs_payload(payload).ok_or(FgtwVerdict::BadPayload)?;
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-    let vk = VerifyingKey::from_bytes(&device_pk).map_err(|_| FgtwVerdict::BadPayload)?;
-    let sig_arr = <[u8; 64]>::try_from(sig.as_slice()).map_err(|_| FgtwVerdict::BadPayload)?;
-    vk.verify(&hs_digest(client_box_pk, our_sign_pk), &Signature::from_bytes(&sig_arr))
-        .map_err(|_| FgtwVerdict::BadSignature)?;
-    match current_fleet(&state) {
-        Ok(members) if members.contains(&device_pk) => Ok(device_pk),
-        Ok(_) => Err(FgtwVerdict::NotMember),
-        Err(e) => {
-            log::warn!("fgtw membership check failed: {e}");
-            Err(FgtwVerdict::StaleCache)
-        }
+    let me = device_keypair().map_err(|_| FgtwVerdict::NotEnrolled)?.public.to_bytes();
+    let (hp, device_pk, eggs) = parse_hs_payload(payload).ok_or(FgtwVerdict::BadPayload)?;
+    let chain = current_chain(&hp).map_err(|e| {
+        log::warn!("fgtw membership check failed: {e}");
+        FgtwVerdict::StaleCache
+    })?;
+    let (members, floor) = chain.fold_full().map_err(|_| FgtwVerdict::StaleCache)?;
+    if !members.contains(&me) {
+        return Err(FgtwVerdict::ForeignFleet);
     }
+    if !members.contains(&device_pk) {
+        return Err(FgtwVerdict::NotMember);
+    }
+    let bundle = chain.declared_bundle(&device_pk).unwrap_or_else(|| KeyBundle::ed25519_only(&device_pk));
+    if !pq::verify_eggs(&eggs, &bundle, &hs_digest(&hp, client_box_pk, our_sign_pk), floor) {
+        return Err(FgtwVerdict::BadSignature);
+    }
+    Ok(device_pk)
 }
 
-/// Client side: is `signed_id` (the host's `SignedId.id` bytes) signed by a device in our own
-/// fleet? Tries each member pubkey as the verifying key over the `IdPk` bytes. Returns the
-/// decoded `(id, box_pk)` on the first hit, so the caller can proceed as it does for a
-/// rendezvous-verified host. `None` when not enrolled or the host isn't a fleet member.
-/// Verify a host's `SignedId` against the current fleet fold. Returns
-/// `(rustdesk_id, host_box_pk, host_device_sign_pk)` — the third element is the member key
-/// that verified it, which is also the host's identity key (rustdesk sign key == fleet device
-/// key, `seed_rustdesk_identity`). The fleet handshake needs it to bind the client's box key
-/// to the host's identity, exactly as the rendezvous path binds to `signed_id_pk`.
+/// Client side: is `signed_id` (the host's `SignedId.id` bytes) signed by a device in OUR fleet? Tries each member pubkey as the verifying key over the `IdPk` bytes. Returns `(rustdesk_id, host_box_pk, host_device_sign_pk)` on the first hit — the third element is the host's identity key (rustdesk sign key == fleet device key, `seed_rustdesk_identity`), which the fleet handshake binds the client's box key to. `None` when nobody is logged in or the host isn't a fleet member.
 pub fn verify_host_signed_id(signed_id: &[u8]) -> Option<(String, [u8; 32], [u8; 32])> {
     use hbb_common::sodiumoxide::crypto::sign;
-    let state = EnrollState::load()?;
-    let members = current_fleet(&state).ok()?;
+    let (hp, _) = session_roots()?;
+    let members = current_chain(&hp).ok()?.fold().ok()?;
     for m in &members {
         // Reuse rustdesk's own IdPk decode (verify sig + parse) — same path secure_connection uses.
         if let Ok((id, box_pk)) = crate::common::decode_id_pk(signed_id, &sign::PublicKey(*m)) {
@@ -800,58 +821,42 @@ pub fn verify_host_signed_id(signed_id: &[u8]) -> Option<(String, [u8; 32], [u8;
 
 // ── session adoption (the passless path) ──
 
-/// Adopt this machine's existing login: read the tohu session registers (set by whichever
-/// app the user attested in — e.g. Photon) and prove membership with the FLEET KEY — if this
-/// device's key opens a wrap in the fleet's fan-out, the machine is a current member; no
-/// handle typed, no ceremony. Persists EnrollState, seeds the RustDesk identity from the
-/// fleet key, and publishes our RustDesk ID to the fleet's chooser map.
+/// Act on this machine's login: read the tohu session (set by whichever app the user attested in — e.g. Photon) and prove membership with the FLEET KEY — if this device's key opens a wrap in the fleet's fan-out, the machine is a current member; no handle typed, no ceremony. Caches the fleet's PUBLIC chain (so this host can verify guests offline), seeds the RustDesk identity from the device key, publishes our RustDesk ID to the fleet's chooser map, and declares our key bundle to the chain.
 ///
-/// `Err` means "couldn't adopt right now", not "unauthorized": no session (nobody logged in
-/// on this machine), no wrap yet (freshly-bound device awaiting its sponsor's confirm
-/// rotation), or the fleet server is unreachable. Callers retry later or fall back to
-/// `--fgtw-enroll <handle>` bootstrap.
+/// Persists no root. Every later use reads the session again; when the session is gone this device stops being a client and keeps being a host.
+///
+/// `Err` means "couldn't adopt right now", not "unauthorized": no session, no wrap yet (freshly-bound device awaiting its sponsor's confirm rotation), or the fleet server unreachable.
 pub fn adopt_session() -> Result<String, String> {
-    let s = tohu::session()
-        .ok_or("no session on this machine — log in (e.g. Photon), or run --fgtw-enroll <handle>")?;
+    let (hp, seed) = session_roots().ok_or("no session on this machine — log in (e.g. Photon), or run --fgtw-enroll <handle>")?;
     let device_key = device_keypair().map_err(|e| e.to_string())?;
     let t = RdTransport::enroll();
     // The fleet-key gate: only current members hold a wrap in the fan-out.
-    fgtw::client::recover_fleet_key(&t, &s.handle_proof, &device_key, &s.identity_seed)?
+    fgtw::client::recover_fleet_key(&t, &hp, &device_key, &seed)?
         .ok_or("this device has no fleet-key wrap yet (not a member, or awaiting sponsor rotation)")?;
-    let (members, tip) = fgtw::client::current_members_with_ts(&t, &s.handle_proof)?;
-    let state = EnrollState {
-        handle_proof: s.handle_proof,
-        identity_seed: s.identity_seed,
-        members: members.clone(),
-        tip_osc: tip,
-        fetched_at: now_secs(),
-    };
-    state.save()?;
+    let chain = current_chain(&hp)?;
+    let members = chain.fold().map_err(|e| format!("fleet does not fold: {e:?}"))?;
     seed_rustdesk_identity(&device_key);
-    publish_own_id(&state, &device_key);
-    Ok(format!(
-        "Adopted session: fleet member on this machine ({} member(s)).",
-        members.len()
-    ))
+    publish_own_id(&hp, &seed, &device_key);
+    declare_own_bundle(&hp);
+    Ok(format!("Adopted session: fleet member on this machine ({} member(s)).", members.len()))
 }
 
-/// Best-effort background fleet bootstrap for service/UI startup, off-thread, never blocks.
-/// Not enrolled yet → adopt the machine's login. Already enrolled → (re)publish our rustdesk
-/// id every start, because the id is what the My Fleet chooser connects by: the original
-/// enroll-time publish can fail (offline, no fleet-key wrap yet) or go stale (id changed, map
-/// reset), and without a re-publish the fleet tile stays unconnectable forever.
+/// Publish this device's key bundle to the chain, off-thread — what lifts this device to three eggs, and, when the last member does it, lifts the fleet's floor. Idempotent; no-op for a device with nothing beyond Ed25519.
+fn declare_own_bundle(handle_proof: &[u8; 32]) {
+    let Some(bundle) = signing_bundle() else { return };
+    let hp = *handle_proof;
+    std::thread::spawn(move || match fgtw::client::declare_device(&RdTransport::enroll(), bundle, &hp) {
+        Ok(()) => log::info!("fgtw: key bundle declared (or already on the chain)"),
+        Err(e) => log::warn!("fgtw: key-bundle declare failed (will retry next start): {e}"),
+    });
+}
+
+/// Best-effort background fleet bootstrap for service/UI startup, off-thread, never blocks. With a session: adopt it (idempotent — re-publishes our id every start because the id is what the My Fleet chooser connects by, and re-declares our bundle). Without one: this machine hosts only, and says so.
 pub fn try_adopt_session() {
-    if let Some(state) = EnrollState::load() {
-        std::thread::spawn(move || {
-            if let Ok(kp) = device_keypair() {
-                publish_own_id(&state, &kp);
-            }
-        });
-        return;
-    }
+    scrub_legacy_state();
     std::thread::spawn(|| match adopt_session() {
         Ok(msg) => log::info!("fgtw: {msg}"),
-        Err(e) => log::info!("fgtw: session adoption not available: {e}"),
+        Err(e) => log::info!("fgtw: session adoption not available (hosting only): {e}"),
     });
 }
 
@@ -897,10 +902,8 @@ pub fn enroll(handle_input: &str) -> Result<String, String> {
             }
             // Not a member and a fleet already exists → must be added from an existing device.
             Err(e) if e.contains("enroll it from an existing device") => {
-                return pair_flow(&t, &device_key, &handle_proof, &identity_seed).map(|msg| {
-                    park_session();
-                    msg
-                });
+                park_session();
+                return pair_flow(&t, &device_key, &handle_proof, &identity_seed);
             }
             Err(e) => {
                 last_err = e;
@@ -914,18 +917,12 @@ pub fn enroll(handle_input: &str) -> Result<String, String> {
     if !established {
         return Err(last_err);
     }
-    let (members, tip) = fgtw::client::current_members_with_ts(&t, &handle_proof)?;
-    let state = EnrollState {
-        handle_proof,
-        identity_seed,
-        members: members.clone(),
-        tip_osc: tip,
-        fetched_at: now_secs(),
-    };
-    state.save()?;
-    seed_rustdesk_identity(&device_key);
-    publish_own_id(&state, &device_key);
+    // The session must be parked BEFORE anything that reads roots, since nothing else holds them now.
     park_session();
+    let members = current_chain(&handle_proof)?.fold().map_err(|e| format!("fleet does not fold: {e:?}"))?;
+    seed_rustdesk_identity(&device_key);
+    publish_own_id(&handle_proof, &identity_seed, &device_key);
+    declare_own_bundle(&handle_proof);
     Ok(format!(
         "Enrolled. This device ({:02x?}…) is one of {} fleet member(s).",
         &me[..4],
@@ -953,9 +950,11 @@ fn pair_flow(
     identity_seed: &[u8; 32],
 ) -> Result<String, String> {
     let me = device_key.public.to_bytes();
-    // Post the binding request: device-signed consent, co-signed by the identity key (the
-    // registry write gate). No NFC secret from a CLI enroll — all-zero = none offered.
-    fgtw::client::bindreq_put(t, device_key, identity_seed, handle_proof, &[0u8; 32])?;
+    // Post the binding request: consent with every scheme we hold plus our bundle (a promoted fleet refuses a bare Ed25519 join), co-signed by the identity key (the registry write gate). No NFC secret from a CLI enroll — all-zero = none offered.
+    match signing_bundle() {
+        Some(b) => fgtw::client::bindreq_put(t, b, identity_seed, handle_proof, &[0u8; 32])?,
+        None => fgtw::client::bindreq_put(t, device_key, identity_seed, handle_proof, &[0u8; 32])?,
+    };
     println!("\nThis device isn't in the fleet yet. On an already-enrolled device (e.g. Photon),");
     println!("approve pairing for these words:\n");
     println!("    {}\n", fgtw::pair::masked_device_words(&me, identity_seed));
@@ -966,7 +965,10 @@ fn pair_flow(
     for i in 0..150 {
         std::thread::sleep(std::time::Duration::from_secs(2));
         if i == 105 {
-            let _ = fgtw::client::bindreq_put(t, device_key, identity_seed, handle_proof, &[0u8; 32]);
+            let _ = match signing_bundle() {
+                Some(b) => fgtw::client::bindreq_put(t, b, identity_seed, handle_proof, &[0u8; 32]),
+                None => fgtw::client::bindreq_put(t, device_key, identity_seed, handle_proof, &[0u8; 32]),
+            };
         }
         let (members, tip) = match fgtw::client::current_members_with_ts(t, handle_proof) {
             Ok(v) => v,
@@ -975,16 +977,12 @@ fn pair_flow(
         if members.contains(&me) {
             // Best-effort: clear our own request now that we're bound (else the stamp lapses).
             let _ = fgtw::client::bindreq_withdraw(t, device_key, handle_proof);
-            let state = EnrollState {
-                handle_proof: *handle_proof,
-                identity_seed: *identity_seed,
-                members: members.clone(),
-                tip_osc: tip,
-                fetched_at: now_secs(),
-            };
-            state.save()?;
+            let _ = tip;
+            // Refresh the public chain cache now that we are in it.
+            let _ = current_chain(handle_proof);
             seed_rustdesk_identity(device_key);
-            publish_own_id(&state, device_key);
+            publish_own_id(handle_proof, identity_seed, device_key);
+            declare_own_bundle(handle_proof);
             return Ok(format!(
                 "Paired. This device ({:02x?}…) is now one of {} fleet member(s).",
                 &me[..4],
@@ -1006,32 +1004,58 @@ mod tests {
     #[test]
     fn payload_round_trips_and_verifies_binding() {
         let dev = kp(7);
+        let hp = [0xAB; 32];
         let box_pk = [3u8; 32];
         let host_pk = [9u8; 32];
-        let sig = dev.sign(&hs_digest(&box_pk, &host_pk)).to_bytes().to_vec();
-        let mut section = vsf::VsfSection::new("fgtw_hs");
-        section.add_field("dk", VsfType::ke(dev.public.to_bytes().to_vec()));
-        section.add_field("sig", VsfType::ge(sig));
-        let payload = vsf::VsfBuilder::new()
-            .creation_time_oscillations(vsf::eagle_time_oscillations())
-            .add_section_direct(section)
-            .build()
-            .unwrap();
-        let (parsed_dk, parsed_sig) = parse_hs_payload(&payload).unwrap();
+        let eggs = dev.eggs(&hs_digest(&hp, &box_pk, &host_pk), scheme::MASK_BASE);
+        let payload = encode_hs_payload(&hp, &dev.public.to_bytes(), &eggs).unwrap();
+        let (parsed_hp, parsed_dk, parsed_eggs) = parse_hs_payload(&payload).unwrap();
+        assert_eq!(parsed_hp, hp);
         assert_eq!(parsed_dk, dev.public.to_bytes());
-        assert_eq!(parsed_sig.len(), 64);
+        assert_eq!(parsed_eggs, eggs);
 
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-        let vk = VerifyingKey::from_bytes(&parsed_dk).unwrap();
-        let sig_arr = <[u8; 64]>::try_from(parsed_sig.as_slice()).unwrap();
+        let bundle = KeyBundle::ed25519_only(&parsed_dk);
         // Right binding verifies.
-        assert!(vk
-            .verify(&hs_digest(&box_pk, &host_pk), &Signature::from_bytes(&sig_arr))
-            .is_ok());
+        assert!(pq::verify_eggs(&parsed_eggs, &bundle, &hs_digest(&hp, &box_pk, &host_pk), scheme::MASK_BASE));
         // Wrong box key does not — the signature is channel-bound.
-        assert!(vk
-            .verify(&hs_digest(&[4u8; 32], &host_pk), &Signature::from_bytes(&sig_arr))
-            .is_err());
+        assert!(!pq::verify_eggs(&parsed_eggs, &bundle, &hs_digest(&hp, &[4u8; 32], &host_pk), scheme::MASK_BASE));
+        // Wrong fleet does not — it is fleet-bound too.
+        assert!(!pq::verify_eggs(&parsed_eggs, &bundle, &hs_digest(&[0xCD; 32], &box_pk, &host_pk), scheme::MASK_BASE));
+    }
+
+    /// Three-egg handshake against a real chain: the host verifies the guest's Falcon and SPHINCS+ eggs against the bundle the CHAIN holds for it, and a short handshake fails once the fleet's floor has risen.
+    #[test]
+    fn three_egg_handshake_verifies_against_the_declared_bundle() {
+        let host = SigningBundle::derive(b"host-machine");
+        let guest = SigningBundle::derive(b"guest-machine");
+        let hp = [0xAB; 32];
+        let seed = [0x11; 32];
+        let mut chain = MembershipBlob::genesis(&host, hp, &seed, 100);
+        let gpk = guest.keypair().public.to_bytes();
+        let msg = fgtw::fleet::bindreq_signing_bytes(&hp, &gpk, 190);
+        chain.add_declared(&host, gpk, 200, 190, guest.eggs(&msg, scheme::MASK_ALL), guest.public());
+        chain.declare(&host, 300);
+        let (members, floor) = chain.fold_full().unwrap();
+        assert_eq!(floor, scheme::MASK_ALL);
+        assert!(members.contains(&gpk));
+
+        let box_pk = [3u8; 32];
+        let host_pk = host.keypair().public.to_bytes();
+        let digest = hs_digest(&hp, &box_pk, &host_pk);
+        let bundle = chain.declared_bundle(&gpk).unwrap();
+
+        // Full eggs: verifies at the floor.
+        let full = guest.eggs(&digest, chain.declared_mask(&gpk));
+        let (_, dk, eggs) = parse_hs_payload(&encode_hs_payload(&hp, &gpk, &full).unwrap()).unwrap();
+        assert!(pq::verify_eggs(&eggs, &bundle, &digest, floor));
+        assert_eq!(dk, gpk);
+        // Ed25519 alone: short of the floor, refused — the payload cannot be stripped down.
+        let short = guest.keypair().eggs(&digest, scheme::MASK_BASE);
+        assert!(!pq::verify_eggs(&short, &bundle, &digest, floor));
+        // A tampered Falcon egg is rejected.
+        let mut bad = full.clone();
+        bad.iter_mut().find(|e| e.scheme == scheme::FALCON512).unwrap().sig[5] ^= 1;
+        assert!(!pq::verify_eggs(&bad, &bundle, &digest, floor));
     }
 
     #[test]
@@ -1076,28 +1100,23 @@ mod tests {
         use fgtw::client::FleetSealer;
         let key = [7u8; 32];
         let sealed = RdSealer.seal(b"fleet state bytes", &key).unwrap();
-        // kete wire form: 12-byte nonce ‖ ct(+16 tag)
-        assert_eq!(sealed.len(), 12 + 17 + 16);
+        // kete wire form: XChaCha20-Poly1305, 24-byte nonce ‖ ct(+16 tag). The old comment said 12 and the assert agreed with the comment rather than the code — this test had been failing since the sealer went XChaCha.
+        assert_eq!(sealed.len(), 24 + 17 + 16);
         assert_eq!(RdSealer.open(&sealed, &key).unwrap(), b"fleet state bytes");
         assert!(RdSealer.open(&sealed, &[8u8; 32]).is_err());
         assert!(RdSealer.open(&sealed[..20], &key).is_err());
     }
 
     #[test]
-    fn enroll_state_round_trips() {
-        let s = EnrollState {
-            handle_proof: [5u8; 32],
-            identity_seed: [6u8; 32],
-            members: vec![[1u8; 32], [2u8; 32]],
-            tip_osc: 123456789,
-            fetched_at: 99,
-        };
-        let bytes = s.to_bytes().unwrap();
-        let back = EnrollState::from_bytes(&bytes).unwrap();
-        assert_eq!(back.handle_proof, s.handle_proof);
-        assert_eq!(back.identity_seed, s.identity_seed);
-        assert_eq!(back.members, s.members);
-        assert_eq!(back.tip_osc, s.tip_osc);
-        assert_eq!(back.fetched_at, s.fetched_at);
+    fn chain_cache_round_trips_and_holds_no_root() {
+        let a = kp(1);
+        let chain = MembershipBlob::genesis(&a, [5u8; 32], &[6u8; 32], 100);
+        let c = ChainCache { blob: chain.to_vsf_bytes().unwrap(), fetched_at: 99 };
+        let back = ChainCache::from_bytes(&c.to_bytes().unwrap()).unwrap();
+        assert_eq!(back.blob, c.blob);
+        assert_eq!(back.fetched_at, 99);
+        assert_eq!(back.chain().unwrap().fold().unwrap(), vec![a.public.to_bytes()]);
+        // The identity seed is nowhere in the cache — only what the public chain already carries.
+        assert!(!c.to_bytes().unwrap().windows(32).any(|w| w == [6u8; 32]));
     }
 }
