@@ -862,6 +862,10 @@ pub fn verify_hs_payload(
     if !members.contains(&device_pk) {
         return Err(FgtwVerdict::NotMember);
     }
+    // The chain's own lock-out, beside the epoch proof below: a device the fleet has written off on the chain is refused even if it somehow holds a wrap under the current key. Public data, no secret needed — exactly what a stateless host can check.
+    if chain.locked_out().map_err(|_| FgtwVerdict::StaleCache)?.contains(&device_pk) {
+        return Err(FgtwVerdict::LockedOut);
+    }
     let bundle = chain.declared_bundle(&device_pk).unwrap_or_else(|| KeyBundle::ed25519_only(&device_pk));
     let digest = hs_digest(&hp, client_box_pk, our_sign_pk);
     if !pq::verify_eggs(&eggs, &bundle, &digest, floor) {
