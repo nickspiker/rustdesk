@@ -53,7 +53,7 @@ const LEGACY_STATE_FILE: &str = "fgtw_auth.vsf";
 /// The public chain cache: the last verified membership chain's bytes and when they were fetched. Public data only.
 const CHAIN_CACHE_FILE: &str = "fgtw_chain.vsf";
 /// The schemes a per-connection epoch proof carries: Ed25519 + Falcon-512. SPHINCS+ is left to the chain, where an op is rare and archival — at 7.8 KB a signature it has no place on every handshake.
-const EPOCH_TIER: scheme::Mask = scheme::MASK_BASE | (1 << scheme::FALCON512);
+const EPOCH_TIER: scheme::Mask = pq::ENVELOPE_TIER;
 /// Default max age (seconds) of a cached member set used when the fleet server is
 /// unreachable. Beyond this, an incoming fleet auth is denied rather than trusted stale.
 const CACHE_MAX_AGE_DEFAULT: u64 = 3600;
@@ -135,7 +135,7 @@ fn session_roots() -> Option<([u8; 32], [u8; 32])> {
 }
 
 /// This device's full signing bundle — Ed25519 plus Falcon-512 and SPHINCS+, all derived from the machine fingerprint — computed once per process. Derivation costs about a second of SLH-DSA keygen, which is far too much per handshake and exactly right per launch.
-fn signing_bundle() -> Option<&'static SigningBundle> {
+pub(crate) fn signing_bundle() -> Option<&'static SigningBundle> {
     static B: OnceLock<Option<SigningBundle>> = OnceLock::new();
     B.get_or_init(|| machine_fingerprint().ok().map(|fp| SigningBundle::derive(&fp))).as_ref()
 }
@@ -345,6 +345,17 @@ fn current_fanout(handle_proof: &[u8; 32], members: &[[u8; 32]]) -> Result<fgtw:
             fgtw::client::verify_fanout_doc(&doc, members)
         }
     }
+}
+
+/// What a relay frame from `peer` must be verified against: the bundle the (cached) chain declares for it, and the schemes an envelope from this fleet must carry — the envelope tier clipped to the fleet's floor, so an Ed25519-only fleet still talks and a promoted one is held to Falcon. `None` when we hold no chain naming that peer.
+pub(crate) fn peer_envelope_policy(peer: &[u8; 32]) -> Option<(KeyBundle, scheme::Mask)> {
+    let chain = ChainCache::load()?.chain()?;
+    let (members, floor) = chain.fold_full().ok()?;
+    if !members.contains(peer) {
+        return None;
+    }
+    let bundle = chain.declared_bundle(peer).unwrap_or_else(|| KeyBundle::ed25519_only(peer));
+    Some((bundle, pq::ENVELOPE_TIER & floor))
 }
 
 // ── fleet-shared state (device chooser) ──

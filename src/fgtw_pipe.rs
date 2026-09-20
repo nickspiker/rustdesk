@@ -34,7 +34,7 @@ use hbb_common::{
 
 use fgtw::keys::Keypair;
 use fgtw::pipe::{
-    build_relay_envelope, peel_relay_envelope, RdFrame, RD_FLAG_FIN, RD_FLAG_NACK, RD_FLAG_SYN,
+    build_relay_envelope, peel_relay_envelope_eggs, RdFrame, RD_FLAG_FIN, RD_FLAG_NACK, RD_FLAG_SYN,
     SVC_RUSTDESK,
 };
 
@@ -71,6 +71,8 @@ struct Router {
 /// The live pipe. One per process, lazily built.
 pub struct PipeClient {
     device_key: Arc<Keypair>,
+    /// Everything this device signs relay frames with — the full bundle when the fingerprint yielded one, else the bare keypair. Frames carry Ed25519 + Falcon (the envelope tier); a peer holds them to its chain's floor.
+    signer: Arc<dyn fgtw::pq::FleetSigner + Send + Sync>,
     /// Sink: already-built envelope bytes to push up the WebSocket.
     out_tx: mpsc::UnboundedSender<Vec<u8>>,
     router: Arc<Router>,
@@ -99,7 +101,11 @@ pub fn client() -> ResultType<Arc<PipeClient>> {
 impl PipeClient {
     fn connect() -> ResultType<Arc<Self>> {
         let kp = crate::fgtw_auth::device_keypair()?;
-        let device_key = Arc::new(kp);
+        let device_key = Arc::new(kp.clone());
+        let signer: Arc<dyn fgtw::pq::FleetSigner + Send + Sync> = match crate::fgtw_auth::signing_bundle() {
+            Some(b) => Arc::new(b.clone()),
+            None => Arc::new(kp),
+        };
         let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let router = Arc::new(Router {
             streams: Mutex::new(HashMap::new()),
@@ -114,6 +120,7 @@ impl PipeClient {
         });
         Ok(Arc::new(Self {
             device_key,
+            signer,
             out_tx,
             router,
         }))
@@ -130,7 +137,7 @@ impl PipeClient {
 
     /// Seal one frame to `peer` and push it up the pipe.
     fn send_frame(&self, peer: &[u8; 32], frame: &RdFrame) -> ResultType<()> {
-        let env = build_relay_envelope(&self.device_key, peer, Some(SVC_RUSTDESK), &frame.encode())
+        let env = build_relay_envelope(&*self.signer, peer, Some(SVC_RUSTDESK), &frame.encode())
             .map_err(|e| anyhow!("relay envelope: {e}"))?;
         self.out_tx
             .send(env)
@@ -241,8 +248,15 @@ async fn pump(
 
 /// Peel one inbound envelope and hand its frame to the right stream (or accept a new one).
 fn route_inbound(router: &Arc<Router>, data: &[u8]) {
-    let Some((sender_device, inner)) = peel_relay_envelope(data) else {
+    // Structural peel first (vsf anchors the Ed25519 egg); that tells us WHO sent it, and only then can the frame be held to what the chain says that sender holds.
+    let Some((sender_device, inner, eggs, file_hash)) = peel_relay_envelope_eggs(data) else {
         return; // unverifiable/garbage — drop, never fault
+    };
+    let Some((bundle, required)) = crate::fgtw_auth::peer_envelope_policy(&sender_device) else {
+        return; // not a member of our fleet as far as our chain knows — drop
+    };
+    if !fgtw::pq::verify_eggs(&eggs, &bundle, &file_hash, required) {
+        return; // Ed25519 alone from a fleet that has reached Falcon is a stripped frame — drop
     };
     let Some(frame) = RdFrame::decode(&inner) else {
         return;
