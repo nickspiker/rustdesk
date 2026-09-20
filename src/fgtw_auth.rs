@@ -52,6 +52,8 @@ const HS_DOMAIN: &[u8] = b"fgtw-rustdesk-hs-v1";
 const LEGACY_STATE_FILE: &str = "fgtw_auth.vsf";
 /// The public chain cache: the last verified membership chain's bytes and when they were fetched. Public data only.
 const CHAIN_CACHE_FILE: &str = "fgtw_chain.vsf";
+/// The schemes a per-connection epoch proof carries: Ed25519 + Falcon-512. SPHINCS+ is left to the chain, where an op is rare and archival — at 7.8 KB a signature it has no place on every handshake.
+const EPOCH_TIER: scheme::Mask = scheme::MASK_BASE | (1 << scheme::FALCON512);
 /// Default max age (seconds) of a cached member set used when the fleet server is
 /// unreachable. Beyond this, an incoming fleet auth is denied rather than trusted stale.
 const CACHE_MAX_AGE_DEFAULT: u64 = 3600;
@@ -144,6 +146,8 @@ fn signing_bundle() -> Option<&'static SigningBundle> {
 #[derive(Clone)]
 pub struct ChainCache {
     pub blob: Vec<u8>,
+    /// The last verified fan-out DOCUMENT (the signed `fanout_put` the worker stored), so a host can re-run the provenance check and read the epoch public bundle while the fleet server is unreachable. Public: the worker serves it to anyone holding the slot key.
+    pub fanout_doc: Option<Vec<u8>>,
     pub fetched_at: u64,
 }
 
@@ -159,6 +163,9 @@ impl ChainCache {
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         let mut section = vsf::VsfSection::new("fgtw_chain");
         section.add_field("cb", VsfType::ge(self.blob.clone()));
+        if let Some(fd) = &self.fanout_doc {
+            section.add_field("fd", VsfType::ge(fd.clone()));
+        }
         // Fixed 8-byte LE, not VSF's auto-sized int: the `i`/`u` variants re-type on decode, so raw bytes round-trip cleanly.
         section.add_field("at", VsfType::hR(self.fetched_at.to_le_bytes().to_vec()));
         vsf::VsfBuilder::new()
@@ -180,7 +187,11 @@ impl ChainCache {
             Some(VsfType::hR(b)) if b.len() == 8 => u64::from_le_bytes(b.as_slice().try_into().unwrap()),
             _ => 0,
         };
-        Ok(Self { blob, fetched_at })
+        let fanout_doc = match section.get_field("fd").and_then(|f| f.values.first()) {
+            Some(VsfType::ge(b)) if !b.is_empty() => Some(b.clone()),
+            _ => None,
+        };
+        Ok(Self { blob, fanout_doc, fetched_at })
     }
 
     pub fn load() -> Option<Self> {
@@ -284,7 +295,9 @@ fn current_chain(handle_proof: &[u8; 32]) -> Result<MembershipBlob, String> {
             // Cache only our own fleet: a chain we are a member of.
             if let Ok(me) = device_keypair() {
                 if members.contains(&me.public.to_bytes()) {
-                    if let Err(e) = (ChainCache { blob: fresh.to_vsf_bytes().map_err(|e| format!("{e}"))?, fetched_at: now_secs() }).save() {
+                    // Keep the fan-out document we already hold; the epoch check refreshes it separately.
+                    let fanout_doc = cached.as_ref().and_then(|c| c.fanout_doc.clone());
+                    if let Err(e) = (ChainCache { blob: fresh.to_vsf_bytes().map_err(|e| format!("{e}"))?, fanout_doc, fetched_at: now_secs() }).save() {
                         log::warn!("fgtw cache update failed: {e}");
                     }
                 }
@@ -304,6 +317,32 @@ fn current_chain(handle_proof: &[u8; 32]) -> Result<MembershipBlob, String> {
             } else {
                 Err(format!("fgtw unreachable and cache stale ({age}s): {e}"))
             }
+        }
+    }
+}
+
+/// The fleet's current fan-out with its provenance verified from public data — the envelope signature, its signer being the rotator, the rotator being in `members` — so a stateless host can read the epoch public bundle it checks a guest's proof against. Cached alongside the chain; offline, the cached document is re-verified against the (cached) member set within the same staleness bound.
+fn current_fanout(handle_proof: &[u8; 32], members: &[[u8; 32]]) -> Result<fgtw::fanout::Fanout, String> {
+    match fgtw::client::fetch_fanout_verified(&RdTransport::auth(), handle_proof, members) {
+        Ok(Some((f, doc))) => {
+            if let Some(mut c) = ChainCache::load() {
+                c.fanout_doc = Some(doc);
+                if let Err(e) = c.save() {
+                    log::warn!("fgtw fan-out cache update failed: {e}");
+                }
+            }
+            Ok(f)
+        }
+        Ok(None) => Err("no fan-out published for this fleet".into()),
+        Err(e) => {
+            let c = ChainCache::load().ok_or_else(|| format!("fgtw unreachable and no cached fan-out: {e}"))?;
+            let age = now_secs().saturating_sub(c.fetched_at);
+            if age > cache_max_age() {
+                return Err(format!("fgtw unreachable and cache stale ({age}s): {e}"));
+            }
+            let doc = c.fanout_doc.ok_or_else(|| format!("fgtw unreachable and no cached fan-out: {e}"))?;
+            log::info!("fgtw offline ({e}); using cached fan-out ({age}s old)");
+            fgtw::client::verify_fanout_doc(&doc, members)
         }
     }
 }
@@ -702,6 +741,8 @@ pub enum FgtwVerdict {
     NotMember,
     /// The guest named a fleet THIS host is not a member of. A host only ever accepts its own fleet.
     ForeignFleet,
+    /// The guest is in the chain but could not prove the CURRENT epoch — it holds no wrap under the re-minted fleet key. Lock-out, or a departed device, or a fresh bind awaiting its sponsor's grow. Membership is not enough; the epoch is what lock-out removes.
+    LockedOut,
     StaleCache,
 }
 
@@ -721,12 +762,15 @@ fn hs_digest(handle_proof: &[u8; 32], client_box_pk: &[u8; 32], host_sign_pk: &[
     *h.finalize().as_bytes()
 }
 
-/// Encode a handshake payload: VSF `{hp, dk, eggs}` — the fleet, the guest's device key, and its egg list (`pq::eggs_to_bytes`) over [`hs_digest`]. Separated from [`build_hs_payload`] so tests can drive it with a chosen signer and mask.
-fn encode_hs_payload(handle_proof: &[u8; 32], device_pubkey: &[u8; 32], eggs: &[Egg]) -> Option<Vec<u8>> {
+/// Encode a handshake payload: VSF `{hp, dk, eggs, ee?}` — the fleet, the guest's device key, its device egg list over [`hs_digest`], and (when it holds the current fleet key) its EPOCH egg list over the same digest under the fleet's epoch bundle. Separated from [`build_hs_payload`] so tests can drive it with chosen signers and masks.
+fn encode_hs_payload(handle_proof: &[u8; 32], device_pubkey: &[u8; 32], eggs: &[Egg], epoch_eggs: Option<&[Egg]>) -> Option<Vec<u8>> {
     let mut section = vsf::VsfSection::new("fgtw_hs");
     section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
     section.add_field("dk", VsfType::ke(device_pubkey.to_vec()));
     section.add_field("eggs", VsfType::ge(pq::eggs_to_bytes(eggs)));
+    if let Some(ee) = epoch_eggs {
+        section.add_field("ee", VsfType::ge(pq::eggs_to_bytes(ee)));
+    }
     vsf::VsfBuilder::new()
         .creation_time_oscillations(vsf::eagle_time_oscillations())
         .add_section_direct(section)
@@ -738,7 +782,7 @@ fn encode_hs_payload(handle_proof: &[u8; 32], device_pubkey: &[u8; 32], eggs: &[
 ///
 /// Signs with every scheme the chain knows this device holds (its declared bundle, else Ed25519 alone). Emitting an egg the host has no key for would fail closed under the every-egg-must-verify rule, so the mask is read off the chain rather than assumed.
 pub fn build_hs_payload(client_box_pk: &[u8; 32], host_sign_pk: &[u8; 32]) -> Option<Vec<u8>> {
-    let (hp, _) = session_roots()?;
+    let (hp, seed) = session_roots()?;
     let kp = device_keypair().ok()?;
     let me = kp.public.to_bytes();
     let mask = current_chain(&hp).ok().map(|c| c.declared_mask(&me)).unwrap_or(scheme::MASK_BASE);
@@ -747,11 +791,16 @@ pub fn build_hs_payload(client_box_pk: &[u8; 32], host_sign_pk: &[u8; 32]) -> Op
         Some(b) => b.eggs(&digest, mask),
         None => kp.eggs(&digest, mask),
     };
-    encode_hs_payload(&hp, &me, &eggs)
+    // The epoch proof: only a device holding the CURRENT fleet key — one with a wrap under it, i.e. an unlocked member of this epoch — can derive the epoch bundle. A locked device cannot, sends no `ee`, and the host refuses it as LockedOut. Nothing else in the handshake can stand in for this.
+    let epoch_eggs = fgtw::client::recover_fleet_key(&RdTransport::auth(), &hp, &kp, &seed)
+        .ok()
+        .flatten()
+        .map(|k| pq::epoch_bundle(&k).eggs(&digest, EPOCH_TIER));
+    encode_hs_payload(&hp, &me, &eggs, epoch_eggs.as_deref())
 }
 
-/// `(handle_proof, device_pubkey, eggs)` from a payload, or `None` if it is not a well-formed handshake.
-fn parse_hs_payload(payload: &[u8]) -> Option<([u8; 32], [u8; 32], Vec<Egg>)> {
+/// `(handle_proof, device_pubkey, eggs, epoch_eggs)` from a payload, or `None` if it is not a well-formed handshake. `epoch_eggs` is `None` when the guest sent none — which the host treats as "cannot prove the current epoch".
+fn parse_hs_payload(payload: &[u8]) -> Option<([u8; 32], [u8; 32], Vec<Egg>, Option<Vec<Egg>>)> {
     let (_, header_end) = vsf::verification::read_verified(payload, None).ok()?;
     let mut ptr = header_end;
     // Near-form sections are anonymous on the wire (the name lives in the header TOC and comes back empty here), so we gate on field presence, not section.name. The verified read above already rejects tampered/foreign bytes; the eggs are the real authenticity check.
@@ -772,21 +821,25 @@ fn parse_hs_payload(payload: &[u8]) -> Option<([u8; 32], [u8; 32], Vec<Egg>)> {
         Some(VsfType::ge(b)) => pq::eggs_from_bytes(b).ok()?,
         _ => return None,
     };
-    Some((hp, dk, eggs))
+    let epoch_eggs = match section.get_field("ee").and_then(|f| f.values.first()) {
+        Some(VsfType::ge(b)) => Some(pq::eggs_from_bytes(b).ok()?),
+        _ => None,
+    };
+    Some((hp, dk, eggs, epoch_eggs))
 }
 
 /// Host side, STATELESS: verify an incoming `PublicKey.fgtw` payload holding nothing but our own device key.
 ///
 /// The guest names the fleet. We fetch that fleet's chain (cache within bound when offline), require that WE are a current member of it — a host only ever accepts its own fleet — then that the guest is, then verify the guest's eggs against the bundle the chain records for it, at the fleet's scheme floor. Returns the verified device pubkey.
 ///
-/// Not yet checked here: whether the guest is LOCKED OUT. Lock-out is a fan-out fact (no wrap under the re-minted key), not a chain fact, so it needs the guest to prove possession of the current epoch key — the asymmetric epoch key on the fan-out header. That proof slots in after the membership check below; until it lands, a locked device is still a chain member and this accepts it.
+/// Then the EPOCH: lock-out is a fan-out fact (no wrap under the re-minted key), not a chain fact, so chain membership alone would accept a locked device. The guest must also sign the digest under the fleet's epoch bundle — derivable only from the current fleet key — and the host verifies that against the epoch public bundle in the fan-out header, whose provenance it checks from public data (`fetch_fanout_verified`). A guest that cannot is `LockedOut`.
 pub fn verify_hs_payload(
     payload: &[u8],
     client_box_pk: &[u8; 32],
     our_sign_pk: &[u8; 32],
 ) -> Result<[u8; 32], FgtwVerdict> {
     let me = device_keypair().map_err(|_| FgtwVerdict::NotEnrolled)?.public.to_bytes();
-    let (hp, device_pk, eggs) = parse_hs_payload(payload).ok_or(FgtwVerdict::BadPayload)?;
+    let (hp, device_pk, eggs, epoch_eggs) = parse_hs_payload(payload).ok_or(FgtwVerdict::BadPayload)?;
     let chain = current_chain(&hp).map_err(|e| {
         log::warn!("fgtw membership check failed: {e}");
         FgtwVerdict::StaleCache
@@ -799,8 +852,18 @@ pub fn verify_hs_payload(
         return Err(FgtwVerdict::NotMember);
     }
     let bundle = chain.declared_bundle(&device_pk).unwrap_or_else(|| KeyBundle::ed25519_only(&device_pk));
-    if !pq::verify_eggs(&eggs, &bundle, &hs_digest(&hp, client_box_pk, our_sign_pk), floor) {
+    let digest = hs_digest(&hp, client_box_pk, our_sign_pk);
+    if !pq::verify_eggs(&eggs, &bundle, &digest, floor) {
         return Err(FgtwVerdict::BadSignature);
+    }
+    // Identity proved; now the epoch.
+    let Some(ee) = epoch_eggs else { return Err(FgtwVerdict::LockedOut) };
+    let fanout = current_fanout(&hp, &members).map_err(|e| {
+        log::warn!("fgtw epoch check unavailable: {e}");
+        FgtwVerdict::StaleCache
+    })?;
+    if !pq::verify_eggs(&ee, &fanout.epoch_pub, &digest, EPOCH_TIER) {
+        return Err(FgtwVerdict::LockedOut);
     }
     Ok(device_pk)
 }
@@ -1008,11 +1071,12 @@ mod tests {
         let box_pk = [3u8; 32];
         let host_pk = [9u8; 32];
         let eggs = dev.eggs(&hs_digest(&hp, &box_pk, &host_pk), scheme::MASK_BASE);
-        let payload = encode_hs_payload(&hp, &dev.public.to_bytes(), &eggs).unwrap();
-        let (parsed_hp, parsed_dk, parsed_eggs) = parse_hs_payload(&payload).unwrap();
+        let payload = encode_hs_payload(&hp, &dev.public.to_bytes(), &eggs, None).unwrap();
+        let (parsed_hp, parsed_dk, parsed_eggs, parsed_ee) = parse_hs_payload(&payload).unwrap();
         assert_eq!(parsed_hp, hp);
         assert_eq!(parsed_dk, dev.public.to_bytes());
         assert_eq!(parsed_eggs, eggs);
+        assert!(parsed_ee.is_none(), "no fleet key ⇒ no epoch proof on the wire");
 
         let bundle = KeyBundle::ed25519_only(&parsed_dk);
         // Right binding verifies.
@@ -1044,11 +1108,19 @@ mod tests {
         let digest = hs_digest(&hp, &box_pk, &host_pk);
         let bundle = chain.declared_bundle(&gpk).unwrap();
 
-        // Full eggs: verifies at the floor.
+        // Full eggs: verifies at the floor. The epoch half rides beside them, signed under the bundle only a current-key holder can derive.
+        let fleet_key = [0x77u8; 32];
+        let epoch = pq::epoch_bundle(&fleet_key);
         let full = guest.eggs(&digest, chain.declared_mask(&gpk));
-        let (_, dk, eggs) = parse_hs_payload(&encode_hs_payload(&hp, &gpk, &full).unwrap()).unwrap();
+        let ee = epoch.eggs(&digest, EPOCH_TIER);
+        let (_, dk, eggs, parsed_ee) = parse_hs_payload(&encode_hs_payload(&hp, &gpk, &full, Some(&ee)).unwrap()).unwrap();
         assert!(pq::verify_eggs(&eggs, &bundle, &digest, floor));
         assert_eq!(dk, gpk);
+        // The epoch proof verifies against the header's public bundle — and only under THIS epoch's key. A device holding the previous epoch's key (locked out at the re-mint) produces eggs that fail.
+        let header_pub = epoch.public();
+        assert!(pq::verify_eggs(&parsed_ee.unwrap(), &header_pub, &digest, EPOCH_TIER));
+        let stale = pq::epoch_bundle(&[0x66u8; 32]).eggs(&digest, EPOCH_TIER);
+        assert!(!pq::verify_eggs(&stale, &header_pub, &digest, EPOCH_TIER), "a previous epoch's key proves nothing");
         // Ed25519 alone: short of the floor, refused — the payload cannot be stripped down.
         let short = guest.keypair().eggs(&digest, scheme::MASK_BASE);
         assert!(!pq::verify_eggs(&short, &bundle, &digest, floor));
@@ -1111,7 +1183,7 @@ mod tests {
     fn chain_cache_round_trips_and_holds_no_root() {
         let a = kp(1);
         let chain = MembershipBlob::genesis(&a, [5u8; 32], &[6u8; 32], 100);
-        let c = ChainCache { blob: chain.to_vsf_bytes().unwrap(), fetched_at: 99 };
+        let c = ChainCache { blob: chain.to_vsf_bytes().unwrap(), fanout_doc: None, fetched_at: 99 };
         let back = ChainCache::from_bytes(&c.to_bytes().unwrap()).unwrap();
         assert_eq!(back.blob, c.blob);
         assert_eq!(back.fetched_at, 99);
