@@ -48,6 +48,9 @@ struct FrameBuf {
 /// How much bigger than the host's own pixels to paint its cursor shape. Retina viewers show a 1:1 frame at half the point size, so a host arrow needs doubling to read as a pointer.
 const CURSOR_SCALE: f32 = 2.0;
 
+/// Whether the viewer paints the host's cursor shape at the pointer and hides the OS pointer under it. OFF (Nick, 2026-09-20): with the shape tinted magenta the second cursor turned out to be the Mac's own arrow, still visible under every hide this compositor offers, and a painted shape on top of a native pointer is exactly the double nobody wants. The native pointer is the one cursor; its size is the macOS Accessibility pointer-size setting. The host's shape changes (I-beam, resize arrows) are not shown — mapping them onto native cursor icons is the way to bring them back, not painting.
+const PAINT_REMOTE_CURSOR: bool = false;
+
 /// Scale an ARGB bitmap by `f` with bilinear sampling (alpha included). Done once per cursor shape at decode, never per frame.
 fn scale_bilinear(src: &[u32], w: usize, h: usize, f: f32) -> (Vec<u32>, usize, usize) {
     let dw = ((w as f32) * f).round().max(1.0) as usize;
@@ -909,7 +912,7 @@ impl FluorApp for FluorViewer {
             let id = *self.shared.cursor_id.lock().unwrap();
             let cursors = self.shared.cursors.lock().unwrap();
             let embedded = *self.shared.cursor_embedded.lock().unwrap();
-            if let Some(img) = id.and_then(|i| cursors.get(&i)).filter(|_| self.pointer_inside && !embedded) {
+            if let Some(img) = id.and_then(|i| cursors.get(&i)).filter(|_| PAINT_REMOTE_CURSOR && self.pointer_inside && !embedded) {
                 // Paint the shape at OUR pointer, not at the position the host echoes back.
                 // We are the thing moving the host's pointer, so we already know exactly where
                 // it is — and the echo only flows when the cursor-POSITION service is subscribed
@@ -990,7 +993,7 @@ impl FluorApp for FluorViewer {
             id.is_some_and(|i| self.shared.cursors.lock().unwrap().contains_key(&i))
         };
         let embedded = *self.shared.cursor_embedded.lock().unwrap();
-        if self.pointer_inside && have_shape && !embedded {
+        if PAINT_REMOTE_CURSOR && self.pointer_inside && have_shape && !embedded {
             fluor::event::CursorIcon::Hidden
         } else {
             fluor::event::CursorIcon::Default
