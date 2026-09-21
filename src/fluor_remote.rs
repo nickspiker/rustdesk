@@ -70,6 +70,8 @@ struct Shared {
     /// The current display's origin (x, y) in the remote's virtual-desktop space. Added to
     /// mapped coords so a non-primary monitor (origin != 0,0) targets the right pixels.
     display_origin: Mutex<(i32, i32)>,
+    /// Each host display's ORIGINAL resolution as the host reported it at login, by index — what the follow must put back when the session ends. A follow that outlives the connection leaves the host's desktop reflowed around a mode nobody is looking at (field 2026-09-20: panels shuffled, a second monitor stranded 1280 px away), and a host restarted mid-follow forgets its own original, so the restore has to be ours.
+    original_resolutions: Mutex<Vec<(i32, i32)>>,
     /// Which host display index we're viewing — the target of resolution-follow.
     display_idx: Mutex<i32>,
     /// The peer's OS ("Linux"/"Windows"/"Mac"), from PeerInfo. Map-mode keys carry a
@@ -204,6 +206,11 @@ impl InvokeUiSession for FluorHandler {
         *self.shared.display_idx.lock().unwrap() = pi.current_display;
         *self.shared.peer_platform.lock().unwrap() = pi.platform.clone();
         *self.shared.display_count.lock().unwrap() = pi.displays.len();
+        *self.shared.original_resolutions.lock().unwrap() = pi
+            .displays
+            .iter()
+            .map(|d| d.original_resolution.as_ref().map(|r| (r.width, r.height)).unwrap_or((d.width, d.height)))
+            .collect();
         // Seed the origin from the CURRENT display, not just on a later SwitchDisplay. Without
         // this, display_origin stays (0,0) and every click lands on the primary panel even
         // when we are viewing a monitor at a non-zero offset (the virtual head at +3840+0).
@@ -633,7 +640,19 @@ impl FluorApp for FluorViewer {
             ctx.window.request_redraw();
         }
         match event {
-            FEvent::CloseRequested => return EventResponse::Close,
+            FEvent::CloseRequested => {
+                // Put the host's display back before we go: the follow was for OUR window, and our window is closing. Only when the frame we last saw differs from what the host said its original was — a host already at its original gets no mode switch at all.
+                let idx = *self.shared.display_idx.lock().unwrap();
+                let orig = self.shared.original_resolutions.lock().unwrap().get(idx as usize).copied();
+                let (fw, fh) = self.frame_dims();
+                if let Some((ow, oh)) = orig {
+                    if (ow, oh) != (fw as i32, fh as i32) && ow > 0 && oh > 0 {
+                        log::info!("fluor: restoring host display {idx} to its original {ow}x{oh} (was following at {fw}x{fh})");
+                        self.session.change_resolution(idx, ow, oh);
+                    }
+                }
+                return EventResponse::Close;
+            }
             FEvent::CursorLeft => {
                 self.pointer_inside = false;
                 ctx.window.request_redraw();

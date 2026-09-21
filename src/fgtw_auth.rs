@@ -1104,6 +1104,30 @@ mod tests {
 
     /// Three-egg handshake against a real chain: the host verifies the guest's Falcon and SPHINCS+ eggs against the bundle the CHAIN holds for it, and a short handshake fails once the fleet's floor has risen.
     #[test]
+    /// LIVE: the handshake this machine would send, verified the way a host verifies it — against the REAL chain and fan-out fetched from fgtw.org, with a stand-in host key. Every host check reads public data plus the guest's own key, so a refusal caused by the data (a stale fan-out, a bundle the chain disagrees with, an epoch proof that cannot be minted) reproduces here, on the guest, with the verdict named. Needs an attested Photon session on this machine. `cargo test live_hs -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_hs_roundtrip_names_the_verdict() {
+        let host = Keypair::from_seed(&[0x51u8; 32]);
+        let host_pk = host.public.to_bytes();
+        let box_pk = [7u8; 32];
+        let payload = build_hs_payload(&box_pk, &host_pk).expect("no session roots — attest in Photon first");
+        let (hp, me, eggs, ee) = parse_hs_payload(&payload).expect("our own payload parses");
+        println!("payload: {} bytes, {} egg(s) {:?}, epoch eggs: {}", payload.len(), eggs.len(), eggs.iter().map(|e| e.scheme).collect::<Vec<_>>(), ee.as_ref().map(|e| e.len().to_string()).unwrap_or("NONE".into()));
+        let chain = current_chain(&hp).expect("chain");
+        let (members, floor) = chain.fold_full().expect("fold");
+        println!("chain: {} member(s), floor {:#b}, locked {:?}, my declared mask {:#b}", members.len(), floor, chain.locked_out().map(|l| l.len()), chain.declared_mask(&me));
+        match current_fanout(&hp, &members) {
+            Ok(f) => println!("fan-out: revision {}, epoch bundle mask {:#b}, {} wrap(s)", f.revision, f.epoch_pub.mask(), f.wraps.len()),
+            Err(e) => println!("fan-out: UNAVAILABLE — {e}"),
+        }
+        // What the host does, minus the one thing it checks that we cannot stand in for: that the HOST itself is a member (it is, on both machines).
+        match verify_hs_payload(&payload, &box_pk, &host_pk) {
+            Ok(pk) => println!("VERDICT: Ok ({})", hex::encode(&pk[..4])),
+            Err(v) => println!("VERDICT: {v:?}"),
+        }
+    }
+
     fn three_egg_handshake_verifies_against_the_declared_bundle() {
         let host = SigningBundle::derive(b"host-machine");
         let guest = SigningBundle::derive(b"guest-machine");
