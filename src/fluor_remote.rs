@@ -657,36 +657,6 @@ impl FluorApp for FluorViewer {
         monitor
     }
 
-    fn damage_rect(&mut self, viewport: fluor::Viewport) -> Option<fluor::canvas::PixelRect> {
-        let full = fluor::canvas::PixelRect::new(0, 0, viewport.width_px as usize, viewport.height_px as usize);
-        if !self.cursor_only_hint || self.hud {
-            self.prev_cursor_rect = None;
-            return Some(full);
-        }
-        // The rect the shape will occupy at last_cursor, padded by a pixel each side; union with where it was.
-        let cur = {
-            let id = *self.shared.cursor_id.lock().unwrap();
-            let cursors = self.shared.cursors.lock().unwrap();
-            match id.and_then(|i| cursors.get(&i)) {
-                Some(img) => {
-                    let (lx, ly) = self.last_cursor;
-                    let x0 = (lx - img.hot.0 as f32 - 1.0).max(0.0) as usize;
-                    let y0 = (ly - img.hot.1 as f32 - 1.0).max(0.0) as usize;
-                    let x1 = ((lx - img.hot.0 as f32) + img.w as f32 + 1.0).max(0.0) as usize;
-                    let y1 = ((ly - img.hot.1 as f32) + img.h as f32 + 1.0).max(0.0) as usize;
-                    fluor::canvas::PixelRect::new(x0, y0, x1.min(full.x1), y1.min(full.y1))
-                }
-                None => return Some(full),
-            }
-        };
-        let union = match self.prev_cursor_rect {
-            Some(p) => p.union(cur),
-            None => cur,
-        };
-        self.prev_cursor_rect = Some(cur);
-        Some(union)
-    }
-
     fn on_resize(&mut self, _w: u32, _h: u32, ctx: &mut Context) {
         self.cursor_only_hint = false;
         // Window resized → the host should follow to the new backing size.
@@ -755,8 +725,7 @@ impl FluorApp for FluorViewer {
                 self.dbg_org = (ox, oy);
                 self.dbg_rem = self.to_remote(ctx, cx, cy).unwrap_or((-1, -1));
                 self.send_move(ctx, cx, cy);
-                // The painted cursor shape lives at `last_cursor`, so every move needs a frame or the shape only catches up when the VIDEO does — on an idle desktop that is seconds, and the pointer visibly trails the hand (field 2026-09-20: "a laggy double cursor"). This was gated behind the HUD by mistake. Cursor-only: damage_rect repaints just the two cursor rects.
-                self.cursor_only_hint = true;
+                // The painted cursor shape lives at `last_cursor`, so every move needs a frame or the shape only catches up when the VIDEO does — on an idle desktop that is seconds, and the pointer visibly trails the hand (field 2026-09-20: "a laggy double cursor"). This was gated behind the HUD by mistake.
                 ctx.window.request_redraw();
             }
             FEvent::MouseInput { state, button } => {
