@@ -45,6 +45,9 @@ struct FrameBuf {
     gen: u64,
 }
 
+/// How much bigger than the host's own pixels to paint its cursor shape. Retina viewers show a 1:1 frame at half the point size, so a host arrow needs doubling to read as a pointer.
+const CURSOR_SCALE: f32 = 2.0;
+
 /// State shared between the io_loop-side handler (writer) and the fluor app (reader).
 #[derive(Default)]
 struct Shared {
@@ -60,6 +63,8 @@ struct Shared {
     cursors: Mutex<std::collections::HashMap<u64, CursorImage>>,
     /// Which cursor shape is current, `None` before the host names one.
     cursor_id: Mutex<Option<u64>>,
+    /// The host draws its own pointer INTO the video (Wayland/pipewire capture does; X11 does not). Then there is already a cursor in the frame — a round trip behind the hand — and painting our shape on top makes two. We paint nothing and leave the native arrow as the live one.
+    cursor_embedded: Mutex<bool>,
     /// The current display's origin (x, y) in the remote's virtual-desktop space. Added to
     /// mapped coords so a non-primary monitor (origin != 0,0) targets the right pixels.
     display_origin: Mutex<(i32, i32)>,
@@ -177,8 +182,13 @@ impl InvokeUiSession for FluorHandler {
             self.shared.wake(Wake::Frame);
         }
     }
-    fn set_display(&self, x: i32, y: i32, _w: i32, _h: i32, _cursor_embedded: bool, _scale: f64) {
+    fn set_display(&self, x: i32, y: i32, _w: i32, _h: i32, cursor_embedded: bool, _scale: f64) {
         *self.shared.display_origin.lock().unwrap() = (x, y);
+        let mut e = self.shared.cursor_embedded.lock().unwrap();
+        if *e != cursor_embedded {
+            log::info!("fluor: host cursor embedded in the video: {cursor_embedded} — {}", if cursor_embedded { "not painting our own shape over it" } else { "painting the host's shape at our pointer" });
+        }
+        *e = cursor_embedded;
     }
     fn switch_display(&self, display: &hbb_common::message_proto::SwitchDisplay) {
         *self.shared.display_idx.lock().unwrap() = display.display;
@@ -644,9 +654,8 @@ impl FluorApp for FluorViewer {
                 self.dbg_org = (ox, oy);
                 self.dbg_rem = self.to_remote(ctx, cx, cy).unwrap_or((-1, -1));
                 self.send_move(ctx, cx, cy);
-                if self.hud {
-                    ctx.window.request_redraw();
-                }
+                // The painted cursor shape lives at `last_cursor`, so every move needs a frame or the shape only catches up when the VIDEO does — on an idle desktop that is seconds, and the pointer visibly trails the hand (field 2026-09-20: "a laggy double cursor"). This was gated behind the HUD by mistake.
+                ctx.window.request_redraw();
             }
             FEvent::MouseInput { state, button } => {
                 let (cx, cy) = self.last_cursor;
@@ -828,7 +837,8 @@ impl FluorApp for FluorViewer {
         {
             let id = *self.shared.cursor_id.lock().unwrap();
             let cursors = self.shared.cursors.lock().unwrap();
-            if let Some(img) = id.and_then(|i| cursors.get(&i)).filter(|_| self.pointer_inside) {
+            let embedded = *self.shared.cursor_embedded.lock().unwrap();
+            if let Some(img) = id.and_then(|i| cursors.get(&i)).filter(|_| self.pointer_inside && !embedded) {
                 // Paint the shape at OUR pointer, not at the position the host echoes back.
                 // We are the thing moving the host's pointer, so we already know exactly where
                 // it is — and the echo only flows when the cursor-POSITION service is subscribed
@@ -837,10 +847,12 @@ impl FluorApp for FluorViewer {
                 // invisible, while the native arrow showed on top. Local placement is also
                 // zero-latency: the shape moves with the hand, not a round trip behind it.
                 let (lx, ly) = self.last_cursor;
-                let dwc = img.w as f32 * scale;
-                let dhc = img.h as f32 * scale;
-                let ccx = lx - img.hot.0 as f32 * scale + dwc * 0.5;
-                let ccy = ly - img.hot.1 as f32 * scale + dhc * 0.5;
+                // The host's shape is in ITS pixels, and the frame is blitted 1:1 into a Retina backing buffer — so a 24-px Linux arrow lands as 12 points, a speck. Drawn at CURSOR_SCALE so it reads like a pointer; the hotspot scales with it so the tip stays under the hand.
+                let cs = scale * CURSOR_SCALE;
+                let dwc = img.w as f32 * cs;
+                let dhc = img.h as f32 * cs;
+                let ccx = lx - img.hot.0 as f32 * cs + dwc * 0.5;
+                let ccy = ly - img.hot.1 as f32 * cs + dhc * 0.5;
                 let mut canvas = Canvas::new(target, bw, bh, ctx.damage);
                 draw_image(&mut canvas, &img.pixels, img.w, img.h, ccx, ccy, dwc, dhc, None);
             }
@@ -906,7 +918,8 @@ impl FluorApp for FluorViewer {
             let id = *self.shared.cursor_id.lock().unwrap();
             id.is_some_and(|i| self.shared.cursors.lock().unwrap().contains_key(&i))
         };
-        if self.pointer_inside && have_shape {
+        let embedded = *self.shared.cursor_embedded.lock().unwrap();
+        if self.pointer_inside && have_shape && !embedded {
             fluor::event::CursorIcon::Hidden
         } else {
             fluor::event::CursorIcon::Default
