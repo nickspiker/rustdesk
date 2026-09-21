@@ -48,6 +48,36 @@ struct FrameBuf {
 /// How much bigger than the host's own pixels to paint its cursor shape. Retina viewers show a 1:1 frame at half the point size, so a host arrow needs doubling to read as a pointer.
 const CURSOR_SCALE: f32 = 2.0;
 
+/// Scale an ARGB bitmap by `f` with bilinear sampling (alpha included). Done once per cursor shape at decode, never per frame.
+fn scale_bilinear(src: &[u32], w: usize, h: usize, f: f32) -> (Vec<u32>, usize, usize) {
+    let dw = ((w as f32) * f).round().max(1.0) as usize;
+    let dh = ((h as f32) * f).round().max(1.0) as usize;
+    let mut out = vec![0u32; dw * dh];
+    let ch = |p: u32, s: u32| ((p >> s) & 0xFF) as f32;
+    for y in 0..dh {
+        let sy = ((y as f32 + 0.5) / f - 0.5).max(0.0);
+        let y0 = (sy.floor() as usize).min(h - 1);
+        let y1 = (y0 + 1).min(h - 1);
+        let ty = sy - y0 as f32;
+        for x in 0..dw {
+            let sx = ((x as f32 + 0.5) / f - 0.5).max(0.0);
+            let x0 = (sx.floor() as usize).min(w - 1);
+            let x1 = (x0 + 1).min(w - 1);
+            let tx = sx - x0 as f32;
+            let (p00, p10, p01, p11) = (src[y0 * w + x0], src[y0 * w + x1], src[y1 * w + x0], src[y1 * w + x1]);
+            let mut px = 0u32;
+            for s in [24u32, 16, 8, 0] {
+                let top = ch(p00, s) * (1.0 - tx) + ch(p10, s) * tx;
+                let bot = ch(p01, s) * (1.0 - tx) + ch(p11, s) * tx;
+                let v = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u32;
+                px |= v << s;
+            }
+            out[y * dw + x] = px;
+        }
+    }
+    (out, dw, dh)
+}
+
 /// State shared between the io_loop-side handler (writer) and the fluor app (reader).
 #[derive(Default)]
 struct Shared {
@@ -172,7 +202,10 @@ impl InvokeUiSession for FluorHandler {
             let a = colors[i * 4 + 3] as u32;
             pixels[i] = (a << 24) | ((255 - r) << 16) | ((255 - g) << 8) | (255 - b);
         }
-        let img = CursorImage { pixels, w, h, hot: (cd.hotx, cd.hoty) };
+        // Pre-scale ONCE, here, with bilinear filtering: draw_image is nearest-neighbour, and a 24-px host arrow blown up 2× on every frame was a staircase. The scaled bitmap is what gets painted 1:1, the hotspot scales with it.
+        let (pixels, w, h) = scale_bilinear(&pixels, w, h, CURSOR_SCALE);
+        let hot = ((cd.hotx as f32 * CURSOR_SCALE) as i32, (cd.hoty as f32 * CURSOR_SCALE) as i32);
+        let img = CursorImage { pixels, w, h, hot };
         self.shared.cursors.lock().unwrap().insert(cd.id, img);
         // A shape usually arrives BECAUSE it just became current, and the host does not always
         // follow up with a separate id message — adopt it so the change is visible immediately.
@@ -402,6 +435,10 @@ struct FluorViewer {
     /// Cursor derived from the last raw CursorMoved (raw − window_origin, pass-0 px). Used by
     /// MouseInput (which carries no position) and as the send_move source.
     last_cursor: (Coord, Coord),
+    /// This redraw was asked for by a cursor move and nothing else — so only the old and new cursor rects need repainting, not a 65 MB Retina viewport (the per-move full blit was the "laggy" pointer, field 2026-09-20). Set by CursorMoved, cleared by every other event, wake and resize.
+    cursor_only_hint: bool,
+    /// Where the cursor shape was painted last, in viewport px — the half of the next cursor-only damage that erases it.
+    prev_cursor_rect: Option<fluor::canvas::PixelRect>,
     /// The pointer is over our window. The remote cursor shape is painted at `last_cursor`
     /// only while this is true, and the OS pointer is hidden only while this is true — once
     /// the pointer leaves, the stale `last_cursor` must not keep a phantom cursor on screen.
@@ -620,7 +657,38 @@ impl FluorApp for FluorViewer {
         monitor
     }
 
+    fn damage_rect(&mut self, viewport: fluor::Viewport) -> Option<fluor::canvas::PixelRect> {
+        let full = fluor::canvas::PixelRect::new(0, 0, viewport.width_px as usize, viewport.height_px as usize);
+        if !self.cursor_only_hint || self.hud {
+            self.prev_cursor_rect = None;
+            return Some(full);
+        }
+        // The rect the shape will occupy at last_cursor, padded by a pixel each side; union with where it was.
+        let cur = {
+            let id = *self.shared.cursor_id.lock().unwrap();
+            let cursors = self.shared.cursors.lock().unwrap();
+            match id.and_then(|i| cursors.get(&i)) {
+                Some(img) => {
+                    let (lx, ly) = self.last_cursor;
+                    let x0 = (lx - img.hot.0 as f32 - 1.0).max(0.0) as usize;
+                    let y0 = (ly - img.hot.1 as f32 - 1.0).max(0.0) as usize;
+                    let x1 = ((lx - img.hot.0 as f32) + img.w as f32 + 1.0).max(0.0) as usize;
+                    let y1 = ((ly - img.hot.1 as f32) + img.h as f32 + 1.0).max(0.0) as usize;
+                    fluor::canvas::PixelRect::new(x0, y0, x1.min(full.x1), y1.min(full.y1))
+                }
+                None => return Some(full),
+            }
+        };
+        let union = match self.prev_cursor_rect {
+            Some(p) => p.union(cur),
+            None => cur,
+        };
+        self.prev_cursor_rect = Some(cur);
+        Some(union)
+    }
+
     fn on_resize(&mut self, _w: u32, _h: u32, ctx: &mut Context) {
+        self.cursor_only_hint = false;
         // Window resized → the host should follow to the new backing size.
         if self.maybe_follow(ctx) {
             ctx.window.request_redraw();
@@ -629,13 +697,17 @@ impl FluorApp for FluorViewer {
 
     fn on_user_event(&mut self, event: Self::UserEvent, ctx: &mut Context) -> EventResponse {
         match event {
-            Wake::Frame => ctx.window.request_redraw(),
+            Wake::Frame => {
+                self.cursor_only_hint = false;
+                ctx.window.request_redraw()
+            }
         }
         EventResponse::Pass
     }
 
     fn on_event(&mut self, event: &FEvent, ctx: &mut Context) -> EventResponse {
         // Keep the host sized to this window (debounced inside). Cheap; runs on every event.
+        self.cursor_only_hint = false;
         if self.maybe_follow(ctx) {
             ctx.window.request_redraw();
         }
@@ -683,7 +755,8 @@ impl FluorApp for FluorViewer {
                 self.dbg_org = (ox, oy);
                 self.dbg_rem = self.to_remote(ctx, cx, cy).unwrap_or((-1, -1));
                 self.send_move(ctx, cx, cy);
-                // The painted cursor shape lives at `last_cursor`, so every move needs a frame or the shape only catches up when the VIDEO does — on an idle desktop that is seconds, and the pointer visibly trails the hand (field 2026-09-20: "a laggy double cursor"). This was gated behind the HUD by mistake.
+                // The painted cursor shape lives at `last_cursor`, so every move needs a frame or the shape only catches up when the VIDEO does — on an idle desktop that is seconds, and the pointer visibly trails the hand (field 2026-09-20: "a laggy double cursor"). This was gated behind the HUD by mistake. Cursor-only: damage_rect repaints just the two cursor rects.
+                self.cursor_only_hint = true;
                 ctx.window.request_redraw();
             }
             FEvent::MouseInput { state, button } => {
@@ -876,8 +949,8 @@ impl FluorApp for FluorViewer {
                 // invisible, while the native arrow showed on top. Local placement is also
                 // zero-latency: the shape moves with the hand, not a round trip behind it.
                 let (lx, ly) = self.last_cursor;
-                // The host's shape is in ITS pixels, and the frame is blitted 1:1 into a Retina backing buffer — so a 24-px Linux arrow lands as 12 points, a speck. Drawn at CURSOR_SCALE so it reads like a pointer; the hotspot scales with it so the tip stays under the hand.
-                let cs = scale * CURSOR_SCALE;
+                // The bitmap was pre-scaled by CURSOR_SCALE at decode (with its hotspot), so it paints 1:1 here.
+                let cs = scale;
                 let dwc = img.w as f32 * cs;
                 let dhc = img.h as f32 * cs;
                 let ccx = lx - img.hot.0 as f32 * cs + dwc * 0.5;
@@ -1141,6 +1214,8 @@ pub fn run(cmd: String, id: String, password: String, args: Vec<String>) {
         follow_at: None,
         last_cursor: (0.0, 0.0),
         pointer_inside: false,
+        cursor_only_hint: false,
+        prev_cursor_rect: None,
         last_telemetry: None,
         hud: false, // off by default; Ctrl+Alt+H toggles the on-screen diagnostic overlay
         dbg_raw: (0.0, 0.0),
