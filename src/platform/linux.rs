@@ -1874,6 +1874,14 @@ fn fleet_mode_name(width: usize, height: usize) -> String {
 pub fn ensure_virtual_monitor(width: usize, height: usize, guest_tag: Option<&str>) -> ResultType<()> {
     if let Some(name) = virtual_output_name() {
         if active_mode_size(&name) == Some((width, height)) {
+            // Right size already — but primary may have wandered. Muffin re-applies its saved
+            // layout on every hotplug (the physical monitor powering on), and that can hand
+            // primary to the monitor while leaving the head's mode alone. The desktop icons
+            // and new windows follow primary, so take it back before returning.
+            if primary_output().as_deref() != Some(name.as_str()) {
+                log::info!("fgtw vmon: head '{name}' already {width}x{height} but not primary — reclaiming primary");
+                Command::new("xrandr").args(["--output", &name, "--primary"]).output().ok();
+            }
             return Ok(());
         }
     }
