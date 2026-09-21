@@ -304,6 +304,13 @@ impl TerminalUserToken {
 pub struct Connection {
     inner: ConnInner,
     display_idx: usize,
+    /// The NAME of the display this session is capturing. X orders the monitor list
+    /// primary-first, so any primary change (the head asserting `--primary`, muffin handing it
+    /// to the physical panel) renumbers every display while `display_idx` stays put — and the
+    /// session silently ends up capturing a different monitor. The name is what the person
+    /// chose; the index is re-derived from it whenever the list changes.
+    #[cfg(target_os = "linux")]
+    display_name: Option<String>,
     stream: super::Stream,
     server: super::ServerPtrWeak,
     hash: Hash,
@@ -515,6 +522,8 @@ impl Connection {
             },
             require_2fa: crate::auth_2fa::get_2fa(None),
             display_idx: *display_service::PRIMARY_DISPLAY_IDX,
+            #[cfg(target_os = "linux")]
+            display_name: None,
             stream,
             server,
             hash,
@@ -1031,6 +1040,8 @@ impl Connection {
                             conn.refresh_video_display(None);
                             #[cfg(target_os = "macos")]
                             conn.retina.set_displays(&_pi.displays);
+                            #[cfg(target_os = "linux")]
+                            conn.refollow_display_by_name(&_pi.displays).await;
                         }
                         Some(message::Union::CursorPosition(pos)) => {
                             #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1936,8 +1947,11 @@ impl Connection {
                     pi.displays = displays;
                     // Default the fleet session to our virtual head, not the physical panel.
                     #[cfg(target_os = "linux")]
-                    if let Some(idx) = self.virtual_monitor_index() {
-                        self.display_idx = idx;
+                    {
+                        if let Some(idx) = self.virtual_monitor_index() {
+                            self.display_idx = idx;
+                        }
+                        self.display_name = pi.displays.get(self.display_idx).map(|d| d.name.clone());
                     }
                     pi.current_display = self.display_idx as _;
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -4278,6 +4292,38 @@ impl Connection {
         }
         lock.subscribe(&new_service_name, self.inner.clone(), true);
         self.display_idx = display_idx;
+        #[cfg(target_os = "linux")]
+        {
+            self.display_name = self.current_display_name();
+        }
+    }
+
+    /// The display list just changed: if the display this session was on has a new index,
+    /// move capture with it and tell the guest. Without this, a primary change on the host
+    /// (X lists primary first) leaves the session capturing whichever monitor inherited the
+    /// old index — for a fleet session that was the physical panel, and every follow-resize
+    /// was then refused as "not the virtual head".
+    #[cfg(target_os = "linux")]
+    async fn refollow_display_by_name(&mut self, displays: &[DisplayInfo]) {
+        if self.view_camera || self.authed_conn_type() != Some(AuthConnType::Remote) {
+            return;
+        }
+        let Some(name) = self.display_name.clone() else { return };
+        let Some(idx) = displays.iter().position(|d| d.name == name) else { return };
+        if idx == self.display_idx {
+            return;
+        }
+        let Some(server) = self.server.upgrade() else { return };
+        log::info!(
+            "display '{name}' moved from index {} to {idx} — following it",
+            self.display_idx
+        );
+        self.switch_display_to(idx, server);
+        if let Some(msg_out) =
+            video_service::make_display_changed_msg(self.display_idx, None, self.video_source())
+        {
+            self.send(msg_out).await;
+        }
     }
 
     #[cfg(windows)]

@@ -65,6 +65,8 @@ struct Shared {
     cursor_id: Mutex<Option<u64>>,
     /// The host draws its own pointer INTO the video (Wayland/pipewire capture does; X11 does not). Then there is already a cursor in the frame — a round trip behind the hand — and painting our shape on top makes two. We paint nothing and leave the native arrow as the live one.
     cursor_embedded: Mutex<bool>,
+    /// Set by `switch_display`; `maybe_follow` consumes it and starts the retry budget over.
+    follow_reset: std::sync::atomic::AtomicBool,
     /// The current display's origin (x, y) in the remote's virtual-desktop space. Added to
     /// mapped coords so a non-primary monitor (origin != 0,0) targets the right pixels.
     display_origin: Mutex<(i32, i32)>,
@@ -193,6 +195,10 @@ impl InvokeUiSession for FluorHandler {
     fn switch_display(&self, display: &hbb_common::message_proto::SwitchDisplay) {
         *self.shared.display_idx.lock().unwrap() = display.display;
         *self.shared.display_origin.lock().unwrap() = (display.x, display.y);
+        // A different display is a fresh follow: the retry budget spent on the old one (every
+        // request refused while capture sat on a physical monitor) must not stop us asking here.
+        self.shared.follow_reset.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shared.wake(Wake::Frame);
     }
     fn set_peer_info(&self, pi: &hbb_common::message_proto::PeerInfo) {
         *self.shared.display_idx.lock().unwrap() = pi.current_display;
@@ -490,6 +496,10 @@ impl FluorViewer {
         let (fw, fh) = self.frame_dims();
         if fw == 0 || fh == 0 {
             return false;
+        }
+        if self.shared.follow_reset.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.follow_tries = 0;
+            self.follow_at = Some(Instant::now() + FOLLOW_DEBOUNCE);
         }
         // DONE when the host's frame is already exactly our window — the follow converged.
         if (fw as i32, fh as i32) == target {
@@ -937,6 +947,10 @@ impl FluorViewer {
             let cur = *self.shared.display_idx.lock().unwrap();
             let next = (cur + delta).rem_euclid(count);
             log::info!("fluor: switch to host display {next}/{count}");
+            // `switch_display` re-sends the per-display size saved in the peer config, and the
+            // host applies it — a stale 2560x1600 from an earlier window shrank the head under a
+            // 4K window. Our window size is the only size that matters; the follow drives it.
+            self.session.lc.write().unwrap().set_custom_resolution(next, None);
             self.session.switch_display(next);
         }
     }
