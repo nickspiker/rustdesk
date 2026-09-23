@@ -255,7 +255,7 @@ fn route_inbound(router: &Arc<Router>, data: &[u8]) {
     let Some((bundle, required)) = crate::fgtw_auth::peer_envelope_policy(&sender_device) else {
         return; // not a member of our fleet as far as our chain knows — drop
     };
-    if !fgtw::pq::verify_eggs(&eggs, &bundle, &file_hash, required) {
+    if !fgtw::pq::verify_eggs_declared(&eggs, &bundle, &file_hash, required) {
         return; // Ed25519 alone from a fleet that has reached Falcon is a stripped frame — drop
     };
     let Some(frame) = RdFrame::decode(&inner) else {
