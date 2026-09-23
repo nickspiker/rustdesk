@@ -1117,6 +1117,10 @@ mod tests {
         let chain = current_chain(&hp).expect("chain");
         let (members, floor) = chain.fold_full().expect("fold");
         println!("chain: {} member(s), floor {:#b}, locked {:?}, my declared mask {:#b}", members.len(), floor, chain.locked_out().map(|l| l.len()), chain.declared_mask(&me));
+        let locked = chain.locked_out().unwrap_or_default();
+        for m in &members {
+            println!("  member {}: declared {:#b}{}{}", hex::encode(&m[..4]), chain.declared_mask(m), if *m == me { " (me)" } else { "" }, if locked.contains(m) { " LOCKED" } else { "" });
+        }
         match current_fanout(&hp, &members) {
             Ok(f) => println!("fan-out: revision {}, epoch bundle mask {:#b}, {} wrap(s)", f.revision, f.epoch_pub.mask(), f.wraps.len()),
             Err(e) => println!("fan-out: UNAVAILABLE — {e}"),
