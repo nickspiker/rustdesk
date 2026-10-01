@@ -978,6 +978,16 @@ impl FluorApp for FluorViewer {
         }
     }
 
+    /// Zero local interception: every chord goes to the guest.
+    ///
+    /// fluor's host otherwise keeps Ctrl/Cmd + `=` `+` `-` `0` and Ctrl+scroll for its own window
+    /// zoom, swallowing them before the app sees them. For a viewer that is a keystroke the remote
+    /// never gets: Ctrl+`-` in the guest's editor did nothing anywhere, because our window zoomed
+    /// instead. Our zoom is the host's resolution-follow, not a local scale, so we want none of it.
+    fn builtin_zoom_chords(&self) -> bool {
+        false
+    }
+
     fn cursor_for(
         &self,
         _x: Coord,
