@@ -22,6 +22,56 @@ pub fn start_tray() {
     allow_err!(make_tray());
 }
 
+/// Wait (briefly) for a StatusNotifier watcher on the session bus before creating the icon.
+///
+/// libappindicator picks its transport ONCE, when the indicator is built: if no
+/// `org.kde.StatusNotifierWatcher` is registered yet it falls back to the legacy XEmbed tray
+/// and stays there for the life of the process. On this fleet host the service starts the tray
+/// at login, well before the desktop's watcher (`xapp-sn-watcher`) is up — so we became the
+/// only XEmbed client on the panel. That is not merely cosmetic: Cinnamon 6.4's systray applet
+/// re-`manage_screen`s on every panel rebuild, double-adds each XEmbed icon, and then aborts in
+/// `st_bin_destroy` ("assertion failed: priv->child == NULL") — taking the whole session into
+/// fallback mode. With the watcher present we register as a StatusNotifier item instead, like
+/// every other tray app here, and that code path is never entered.
+///
+/// Bounded and best-effort: on a desktop with no watcher at all (or none yet after the wait) we
+/// build anyway and get the legacy icon, exactly as before.
+#[cfg(target_os = "linux")]
+fn wait_for_status_notifier_watcher() {
+    use std::time::{Duration, Instant};
+    const WATCHER: &str = "org.kde.StatusNotifierWatcher";
+    const WAIT: Duration = Duration::from_secs(20);
+    let deadline = Instant::now() + WAIT;
+    let present = || {
+        std::process::Command::new("dbus-send")
+            .args([
+                "--session",
+                "--dest=org.freedesktop.DBus",
+                "--type=method_call",
+                "--print-reply",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus.NameHasOwner",
+                &format!("string:{WATCHER}"),
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains("true"))
+    };
+    if present() {
+        return;
+    }
+    log::info!("tray: no {WATCHER} yet — waiting up to {}s so we register as a StatusNotifier item instead of a legacy XEmbed icon", WAIT.as_secs());
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+        if present() {
+            log::info!("tray: {WATCHER} appeared — creating the icon now");
+            return;
+        }
+    }
+    log::warn!("tray: {WATCHER} never appeared — falling back to the legacy tray icon");
+}
+
 fn make_tray() -> hbb_common::ResultType<()> {
     // https://github.com/tauri-apps/tray-icon/blob/dev/examples/tao.rs
     use hbb_common::anyhow::Context;
@@ -146,6 +196,8 @@ fn make_tray() -> hbb_common::ResultType<()> {
             }
             // We create the icon once the event loop is actually running
             // to prevent issues like https://github.com/tauri-apps/tray-icon/issues/90
+            #[cfg(target_os = "linux")]
+            wait_for_status_notifier_watcher();
             #[allow(unused_mut)]
             let mut builder = TrayIconBuilder::new()
                 .with_menu(Box::new(tray_menu.clone()))
