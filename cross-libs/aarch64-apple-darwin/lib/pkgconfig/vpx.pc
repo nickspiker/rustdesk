@@ -1,5 +1,5 @@
 # pkg-config file from libvpx v1.15.0
-prefix=/mnt/Octopus/Code/rustdesk/cross-libs/aarch64-apple-darwin
+prefix=/mnt/Harbor/Code/rustdesk/cross-libs/aarch64-apple-darwin
 exec_prefix=${prefix}
 libdir=${prefix}/lib
 includedir=${prefix}/include

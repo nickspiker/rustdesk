@@ -1,6 +1,6 @@
 # Opus codec reference implementation pkg-config file
 
-prefix=/mnt/Octopus/Code/rustdesk/cross-libs/aarch64-apple-darwin
+prefix=/mnt/Harbor/Code/rustdesk/cross-libs/aarch64-apple-darwin
 exec_prefix=${prefix}
 libdir=${exec_prefix}/lib
 includedir=${prefix}/include

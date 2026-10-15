@@ -1,5 +1,5 @@
 # libaom pkg-config.
-prefix=/mnt/Octopus/Code/rustdesk/cross-libs/aarch64-apple-darwin
+prefix=/mnt/Harbor/Code/rustdesk/cross-libs/aarch64-apple-darwin
 exec_prefix=${prefix}
 includedir=${prefix}/include
 libdir=${exec_prefix}/lib

@@ -1,4 +1,4 @@
-prefix=/mnt/Octopus/Code/rustdesk/cross-libs/aarch64-apple-darwin
+prefix=/mnt/Harbor/Code/rustdesk/cross-libs/aarch64-apple-darwin
 libdir=${prefix}/lib
 includedir=${prefix}/include
 
