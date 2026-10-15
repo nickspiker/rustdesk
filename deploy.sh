@@ -105,6 +105,7 @@ snap_cargo build --release --features inline,fgtw,fluor-viewer,linux-pkg-config
 
 echo ""
 echo "Building macOS arm64 release (osxcross)..."
+# The cross build takes its own rustflags: .cargo/config.toml's macOS flags add Homebrew's libvmaf for a build on the Mac itself, which the staged cross libaom.a does not reference and osxcross does not have (2026-10-15: the link failed on -lvmaf). The pre-login section is kept.
 CXXFLAGS="-include cstdint" \
 CC_aarch64_apple_darwin=$OSX/bin/aarch64-apple-darwin-clang-wrapper \
 CXX_aarch64_apple_darwin=$OSX/bin/aarch64-apple-darwin-clangxx-wrapper \
@@ -116,6 +117,7 @@ BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin="--target=arm64-apple-darwin -isys
 PKG_CONFIG_ALLOW_CROSS=1 \
 PKG_CONFIG_PATH_aarch64_apple_darwin=$XLIBS/lib/pkgconfig \
 PKG_CONFIG_LIBDIR_aarch64_apple_darwin=$XLIBS/lib/pkgconfig \
+CARGO_ENCODED_RUSTFLAGS="$(printf -- '-C\037link-args=-sectcreate __CGPreLoginApp __cgpreloginapp /dev/null')" \
 PKG_CONFIG_SYSROOT_DIR_aarch64_apple_darwin=/ \
 snap_cargo build --release --target aarch64-apple-darwin --features inline,fgtw,fluor-viewer,linux-pkg-config
 
