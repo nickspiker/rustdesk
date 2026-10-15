@@ -2017,11 +2017,25 @@ pub fn remove_virtual_monitor() {
             log::info!("fgtw vmon: saved position {x},{y} for guest {tag}");
         }
     }
-    Command::new("xrandr").args(["--output", &output, "--off"]).output().ok();
     *VIRTUAL_OUTPUT.lock().unwrap() = None;
     *VMON_GUEST_TAG.lock().unwrap() = None;
+    // Never the last screen (2026-10-15, Nick's desktop gone to wallpaper after a dropped session): with no other output showing anything, switching the head off leaves X no output at all, and it shrinks the screen to its 320x200 floor under every window, panel and desktop icon.
+    if !other_output_shows(&output) {
+        log::info!("fgtw vmon: '{output}' left on — no other monitor shows anything, and switching it off would leave X with no screen");
+        return;
+    }
+    Command::new("xrandr").args(["--output", &output, "--off"]).output().ok();
     restore_primary_after_head_off(&output);
     log::info!("fgtw vmon: '{output}' turned off, virtual head gone");
+}
+
+/// Whether a connected output other than `head` has a mode, so switching the head off still leaves a screen.
+fn other_output_shows(head: &str) -> bool {
+    let Ok(out) = Command::new("xrandr").arg("--query").output() else { return false };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(parse_output_line)
+        .any(|(name, state, _, has_mode)| name != head && state == "connected" && has_mode)
 }
 
 /// Hand `--primary` to a real monitor once the head is switched off.
@@ -2141,7 +2155,7 @@ fn unpin_ui_scale() {
     Config::set_option(SAVED_UI_SCALE_OPT.into(), "".into());
 }
 
-/// Safety net: if a crash or hard exit left a display parked on a minted `*_fgtw` mode
+/// Safety net: if a crash or hard exit left a display parked on a minted mode (`fleet-WxH`, or `*_fgtw` from older builds)
 /// (so the desktop is stuck small/"massive"), switch each such output back to its preferred
 /// mode and remove the stray mode. Called at server start; a no-op on a clean system.
 /// OBSOLETE: mode-minting was replaced by `--scale-from` transforms — keep one release to
@@ -2161,7 +2175,8 @@ pub fn reset_leftover_minted_modes() {
             if let Some(mode) = line.split_whitespace().next() {
                 // xrandr lists a connected output's modes highest-first; the first real
                 // (non-minted) mode we see for an output is its native/preferred one.
-                if !mode.ends_with("_fgtw") {
+                // Minted by resolution-follow: `fleet-WxH` now, `*_fgtw` from older builds (2026-10-15: only the old name was caught, so a crash left the head on a `fleet-` mode across every restart).
+                if !(mode.ends_with("_fgtw") || mode.starts_with("fleet-")) {
                     native.entry(current_output.clone()).or_insert_with(|| mode.to_owned());
                 } else if line.contains('*') {
                     stranded.push((current_output.clone(), mode.to_owned()));

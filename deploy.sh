@@ -46,7 +46,7 @@ R2_BUCKET="holdmyoscilloscope"
 R2_PATH="rustdesk"
 R2_URL="https://brobdingnagian.holdmyoscilloscope.com/$R2_PATH"
 
-OSX=/mnt/Octopus/Code/osxcross/target
+OSX=/mnt/Harbor/Code/osxcross/target  # Octopus retired 2026-10; the toolchain lives on Harbor
 SDK=$OSX/SDK/MacOSX14.5.sdk
 XLIBS=$(pwd)/cross-libs/aarch64-apple-darwin
 SIGNER=../photon/target/release/photon-signature-signer
