@@ -618,6 +618,14 @@ impl UI {
         "[]".to_owned()
     }
 
+    /// Why the fleet chooser is empty, or "" when it is not — rendered in place of "Empty".
+    fn get_fleet_hint(&self) -> String {
+        #[cfg(feature = "fgtw")]
+        return get_fleet_hint();
+        #[cfg(not(feature = "fgtw"))]
+        String::new()
+    }
+
     fn refresh_fleet_peers(&self) {
         #[cfg(feature = "fgtw")]
         refresh_fleet_peers();
@@ -867,6 +875,7 @@ impl sciter::EventHandler for UI {
         fn discover();
         fn get_lan_peers();
         fn get_fleet_peers();
+        fn get_fleet_hint();
         fn refresh_fleet_peers();
         fn ping_fleet_device(String);
         fn has_fleet();

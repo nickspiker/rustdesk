@@ -850,6 +850,21 @@ pub fn get_fleet_peers() -> Vec<HashMap<&'static str, String>> {
     FLEET_PEERS.lock().map(|v| v.clone()).unwrap_or_default()
 }
 
+/// Why the fleet chooser has nothing to show, in words the tab can render in place of "Empty". Set by [`refresh_fleet_peers`] when the roster cannot be read (no login on this machine is the everyday case — a reboot kills the session capsule by design), cleared the moment a roster lands. The tab showed a bare "Empty" for a fleet of four while the reason sat in a log line (field 2026-10-16).
+#[cfg(feature = "fgtw")]
+static FLEET_HINT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+#[inline]
+#[cfg(feature = "fgtw")]
+pub fn get_fleet_hint() -> String {
+    FLEET_HINT.lock().map(|s| s.clone()).unwrap_or_default()
+}
+#[cfg(feature = "fgtw")]
+fn set_fleet_hint(hint: &str) {
+    if let Ok(mut h) = FLEET_HINT.lock() {
+        *h = hint.to_string();
+    }
+}
+
 /// Re-probe ONE fleet device: drop it to offline, ping every address it publishes, then report
 /// the best tier that answers.
 ///
@@ -893,6 +908,7 @@ pub fn refresh_fleet_peers() {
         if !crate::fgtw_auth::is_enrolled() {
             if let Err(e) = crate::fgtw_auth::adopt_session() {
                 log::info!("fgtw: session adoption failed: {e}");
+                set_fleet_hint(&fleet_hint_for(&e));
                 return;
             }
         }
@@ -948,13 +964,25 @@ pub fn refresh_fleet_peers() {
                 .collect(),
             Err(e) => {
                 log::warn!("fgtw: fleet chooser refresh failed: {e}");
+                set_fleet_hint(&fleet_hint_for(&e));
                 return; // keep the last good list rather than blanking the tab
             }
         };
+        set_fleet_hint("");
         if let Ok(mut v) = FLEET_PEERS.lock() {
             *v = rows;
         }
     });
+}
+
+/// The chooser's reason line for a refresh error: the one everyday cause gets the one everyday action, anything else is shown as it came.
+#[cfg(feature = "fgtw")]
+fn fleet_hint_for(e: &str) -> String {
+    if e.contains("not logged in") || e.contains("no session") {
+        "Not logged in on this machine — log in to Photon here, and your fleet appears. Hosting works regardless.".to_string()
+    } else {
+        format!("Fleet unavailable: {e}")
+    }
 }
 
 #[inline]

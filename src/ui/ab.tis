@@ -317,6 +317,11 @@ class SessionList: Reactor.Component {
     function render() {
         var sessions = this.getSessions();
         if (sessions.length == 0) {
+            // A fleet tab with nothing to show says WHY when it knows — "Empty" for a fleet of four read as a bug when the cause was simply no login on this machine.
+            var hint = (this.type == "fleet") ? handler.get_fleet_hint() : "";
+            if (hint && hint.length > 0) {
+                return <div style="margin: *; font-size: 1.1em; width: 60%; text-align: center; color: #888;">{hint}</div>;
+            }
             return <div style="margin: *; font-size: 1.6em; width: 100px; text-align: center;">{translate("Empty")}</div>;
         }
         var me = this;
