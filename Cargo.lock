@@ -321,6 +321,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "arboard"
+version = "3.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeb9553e62312c8756a5979254fc6d7da8bbeb5986a1e17037fab932f7037917"
+dependencies = [
+ "clipboard-win",
+ "image 0.25.1",
+ "log",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-foundation 0.3.2",
+ "parking_lot",
+ "percent-encoding",
+ "windows-sys 0.52.0",
+ "x11rb 0.13.1",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3041,7 +3061,7 @@ dependencies = [
 
 [[package]]
 name = "fgtw"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "blake3",
  "chacha20poly1305 0.11.0",
@@ -3052,7 +3072,7 @@ dependencies = [
  "num-bigint",
  "rand 0.8.5",
  "voca",
- "vsf 0.10.0",
+ "vsf 0.10.2",
  "x25519-dalek",
 ]
 
@@ -3154,10 +3174,12 @@ dependencies = [
 
 [[package]]
 name = "fluor"
-version = "0.0.4"
+version = "0.0.7"
 dependencies = [
+ "arboard 3.7.0",
  "block2 0.6.2",
  "cosmic-text",
+ "libc",
  "libm",
  "log",
  "objc2 0.6.4",
@@ -3172,10 +3194,11 @@ dependencies = [
  "softbuffer",
  "swash",
  "unicode-script",
- "vsf 0.10.0",
+ "vsf 0.10.2",
  "wgpu",
  "wide",
  "windows 0.58.0",
+ "windows-core 0.58.0",
  "winit",
  "x11rb 0.13.1",
 ]
@@ -7989,7 +8012,7 @@ version = "1.4.9"
 dependencies = [
  "android-wakelock",
  "android_logger",
- "arboard",
+ "arboard 3.4.0",
  "async-process",
  "async-trait",
  "blake3",
@@ -8091,7 +8114,7 @@ dependencies = [
  "url",
  "uuid",
  "virtual_display",
- "vsf 0.10.0",
+ "vsf 0.10.2",
  "wallpaper",
  "winapi 0.3.9",
  "windows 0.61.1",
@@ -9559,7 +9582,7 @@ checksum = "c7c4ceeeca15c8384bbc3e011dbd8fccb7f068a440b752b7d9b32ceb0ca0e2e8"
 
 [[package]]
 name = "tohu"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -9567,7 +9590,7 @@ dependencies = [
  "ihi",
  "jni",
  "rand 0.8.5",
- "vsf 0.10.0",
+ "vsf 0.10.2",
 ]
 
 [[package]]
@@ -10336,9 +10359,7 @@ dependencies = [
 
 [[package]]
 name = "voca"
-version = "0.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e8d8f24210692b23219676beb53b7a9a24062db6b1e0e5d1795919d861be0e8"
+version = "0.0.1"
 dependencies = [
  "num-bigint",
  "num-integer",
@@ -10364,7 +10385,7 @@ dependencies = [
 
 [[package]]
 name = "vsf"
-version = "0.10.0"
+version = "0.10.2"
 dependencies = [
  "aes-gcm",
  "bitvec",
