@@ -544,8 +544,12 @@ impl fgtw::client::FleetSealer for RdSealer {
 /// hasn't been rotated in yet gets `None` — that's the two-phase gate, not an error.
 fn fleet_key(t: &RdTransport, handle_proof: &[u8; 32], identity_seed: &[u8; 32]) -> Result<[u8; 32], String> {
     let kp = device_keypair().map_err(|e| e.to_string())?;
-    fgtw::client::recover_or_establish_fleet_key(t, handle_proof, &kp, identity_seed)?
-        .ok_or_else(|| "no fleet-key wrap for this device yet (awaiting sponsor rotation)".into())
+    // The full bundle: an establish publishes a fan-out, held to the floor like every other envelope.
+    let key = match signing_bundle().filter(|b| fgtw::pq::FleetSigner::keypair(*b).public == kp.public) {
+        Some(b) => fgtw::client::recover_or_establish_fleet_key(t, handle_proof, b, identity_seed)?,
+        None => fgtw::client::recover_or_establish_fleet_key(t, handle_proof, &kp, identity_seed)?,
+    };
+    key.ok_or_else(|| "no fleet-key wrap for this device yet (awaiting sponsor rotation)".into())
 }
 
 /// Publish this device's RustDesk ID into its own fleet device-settings map.
