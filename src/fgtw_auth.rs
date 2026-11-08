@@ -600,7 +600,11 @@ fn publish_own_id_inner(handle_proof: &[u8; 32], identity_seed: &[u8; 32], devic
             entries,
         }),
     }
-    fgtw::client::push_fstate(&t, &RdSealer, handle_proof, device_key, &key, &fs)
+    // Sign with the full bundle when this device has one: the worker holds a member's envelope to the fleet's floor, and once the floor is the basket a bare Ed25519 envelope is refused as below_floor (field 2026-11-08: no device's ID published, every tile offline).
+    match signing_bundle().filter(|b| fgtw::pq::FleetSigner::keypair(*b).public == device_key.public) {
+        Some(bundle) => fgtw::client::push_fstate(&t, &RdSealer, handle_proof, bundle, &key, &fs),
+        None => fgtw::client::push_fstate(&t, &RdSealer, handle_proof, device_key, &key, &fs),
+    }
 }
 
 /// Re-publish this device's RustDesk ID after it changed (e.g. the rendezvous server forced
@@ -1051,7 +1055,11 @@ pub fn enroll(handle_input: &str) -> Result<String, String> {
     let mut last_err = String::new();
     let mut established = false;
     for attempt in 0..4 {
-        match fgtw::client::ensure_member(&t, &device_key, &handle_proof, &identity_seed) {
+        let member = match signing_bundle().filter(|b| fgtw::pq::FleetSigner::keypair(*b).public == device_key.public) {
+            Some(b) => fgtw::client::ensure_member(&t, b, &handle_proof, &identity_seed),
+            None => fgtw::client::ensure_member(&t, &device_key, &handle_proof, &identity_seed),
+        };
+        match member {
             Ok(()) => {
                 established = true;
                 break;
@@ -1132,7 +1140,10 @@ fn pair_flow(
         };
         if members.contains(&me) {
             // Best-effort: clear our own request now that we're bound (else the stamp lapses).
-            let _ = fgtw::client::bindreq_withdraw(t, device_key, handle_proof);
+            let _ = match signing_bundle().filter(|b| fgtw::pq::FleetSigner::keypair(*b).public == device_key.public) {
+                Some(b) => fgtw::client::bindreq_withdraw(t, b, handle_proof),
+                None => fgtw::client::bindreq_withdraw(t, device_key, handle_proof),
+            };
             let _ = tip;
             // Refresh the public chain cache now that we are in it.
             let _ = current_chain(handle_proof);
