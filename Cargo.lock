@@ -3072,7 +3072,7 @@ dependencies = [
  "num-bigint",
  "rand 0.8.5",
  "voca",
- "vsf 0.10.2",
+ "vsf 0.11.0",
  "x25519-dalek",
 ]
 
@@ -3194,7 +3194,7 @@ dependencies = [
  "softbuffer",
  "swash",
  "unicode-script",
- "vsf 0.10.2",
+ "vsf 0.11.0",
  "wgpu",
  "wide",
  "windows 0.58.0",
@@ -8114,7 +8114,7 @@ dependencies = [
  "url",
  "uuid",
  "virtual_display",
- "vsf 0.10.2",
+ "vsf 0.11.0",
  "wallpaper",
  "winapi 0.3.9",
  "windows 0.61.1",
@@ -9591,7 +9591,7 @@ dependencies = [
  "jni",
  "libc",
  "rand 0.8.5",
- "vsf 0.10.2",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -10386,7 +10386,7 @@ dependencies = [
 
 [[package]]
 name = "vsf"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "aes-gcm",
  "bitvec",

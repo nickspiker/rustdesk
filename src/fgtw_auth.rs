@@ -110,7 +110,85 @@ pub fn machine_fingerprint() -> ResultType<Vec<u8>> {
             return Ok(fp.into_bytes());
         }
     }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    ensure_root_selected();
     Ok(tohu::device::machine_fingerprint()?)
+}
+
+// ── which root the device key comes from (Linux, Windows) ──
+//
+// Photon moved Linux and Windows devices off the machine identity onto the TPM's papers (tohu `DesktopRoot`, 2026-11-08): a new device key and bundle, and the old device departs the fleet once the session is live. tohu's root is per-process and defaults to the machine identity, so RustDesk kept deriving the OLD key — on leviathan the host was left holding `90e571bf`, no longer a member, and refused every guest as ForeignFleet.
+// Photon chooses by which root its vault sits under, which RustDesk cannot open. The fleet chain answers the same question from public data: of the two candidate device keys, the one the chain lists is this device. Both listed (mid-move) → the papers, as Photon runs on them then. Neither, or no chain to ask → Photon's own priority: the papers when the chip answers.
+
+/// The root for a device given the fold's members (if any could be read) and the two candidate device keys. `true` = the papers.
+fn root_is_papers(members: Option<&[[u8; 32]]>, papers_pk: &[u8; 32], legacy_pk: &[u8; 32]) -> bool {
+    match members {
+        Some(m) if m.contains(papers_pk) => true,
+        Some(m) if m.contains(legacy_pk) => false,
+        _ => true,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn ensure_root_selected() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        use tohu::device::{desktop_select_root, DesktopRoot};
+        let root = choose_desktop_root();
+        if desktop_select_root(root) {
+            log::info!("fgtw: device root selected: {root:?}");
+        }
+        let _ = DesktopRoot::Legacy; // the enum is named so the log above stays readable across tohu revisions
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn choose_desktop_root() -> tohu::device::DesktopRoot {
+    use tohu::device::DesktopRoot;
+    let legacy = match tohu::device::machine_identity() {
+        Ok(id) => id,
+        Err(e) => {
+            log::warn!("fgtw: the machine identity does not read ({e}); staying on it");
+            return DesktopRoot::Legacy;
+        }
+    };
+    let papers = match tohu::device::papers_root() {
+        Ok(p) => p,
+        Err(e) => {
+            log::info!("fgtw: no papers on this machine ({e}); the device key comes from the machine identity");
+            return DesktopRoot::Legacy;
+        }
+    };
+    let papers_pk = derive_device_keypair(&papers).public.to_bytes();
+    let legacy_pk = derive_device_keypair(&legacy).public.to_bytes();
+    // Which fleet to ask: the cached chain names its own (a host keeps one for its fleet), else a live session. The session may not open yet — its capsule can be sealed under the root we are choosing — which is exactly why the cache is asked first.
+    let cached = ChainCache::load().and_then(|c| c.chain());
+    let hp = cached
+        .as_ref()
+        .and_then(|c| c.genesis_handle_proof())
+        .or_else(|| session_roots().map(|(hp, _)| hp));
+    // A fresh fold, not the cache's: the cache is from before the move by definition. A service starting with the network still coming up gets a few tries before the cache stands in.
+    let mut fresh = None;
+    if let Some(hp) = hp {
+        for attempt in 0..5 {
+            match fgtw::client::fetch(&RdTransport::auth(), &hp) {
+                Ok(Some(chain)) => {
+                    fresh = Some(chain);
+                    break;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    log::info!("fgtw: root selection could not fetch the chain (try {}): {e}", attempt + 1);
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
+        }
+    }
+    let basis = if fresh.is_some() { "the fleet chain" } else if cached.is_some() { "the cached chain" } else { "no chain — Photon's priority" };
+    let members = fresh.or(cached).and_then(|c| c.fold().ok());
+    let papers_first = root_is_papers(members.as_deref(), &papers_pk, &legacy_pk);
+    log::info!("fgtw: device root from {basis}: {}", if papers_first { "the papers" } else { "the machine identity" });
+    if papers_first { DesktopRoot::Papers } else { DesktopRoot::Legacy }
 }
 
 /// The fgtw seed URL for this fork — the `fgtw-url` option, defaulting to fgtw.org. Public so
@@ -1130,6 +1208,17 @@ mod tests {
             Ok(pk) => println!("VERDICT: Ok ({})", hex::encode(&pk[..4])),
             Err(v) => println!("VERDICT: {v:?}"),
         }
+    }
+
+    /// The device root follows the chain: whichever candidate key the fold lists is this device; mid-move (both) and unknown (neither, or no chain) take the papers, Photon's own priority.
+    #[test]
+    fn device_root_follows_the_chain() {
+        let (papers, legacy, other) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        assert!(root_is_papers(Some(&[papers, other]), &papers, &legacy), "moved: the chain lists the papers");
+        assert!(!root_is_papers(Some(&[legacy, other]), &papers, &legacy), "not yet moved: the chain lists the machine identity");
+        assert!(root_is_papers(Some(&[legacy, papers]), &papers, &legacy), "mid-move: both listed, the papers win");
+        assert!(root_is_papers(Some(&[other]), &papers, &legacy), "neither listed: Photon's priority");
+        assert!(root_is_papers(None, &papers, &legacy), "no chain: Photon's priority");
     }
 
     fn three_egg_handshake_verifies_against_the_declared_bundle() {
