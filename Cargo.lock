@@ -3071,8 +3071,9 @@ dependencies = [
  "fn-dsa-vrfy",
  "num-bigint",
  "rand 0.8.5",
+ "rand_chacha 0.3.1",
  "voca",
- "vsf 0.11.0",
+ "vsf",
  "x25519-dalek",
 ]
 
@@ -3194,7 +3195,7 @@ dependencies = [
  "softbuffer",
  "swash",
  "unicode-script",
- "vsf 0.11.0",
+ "vsf",
  "wgpu",
  "wide",
  "windows 0.58.0",
@@ -4538,7 +4539,7 @@ dependencies = [
  "i256",
  "sha2",
  "sha3",
- "vsf 0.6.42",
+ "vsf",
 ]
 
 [[package]]
@@ -8114,7 +8115,7 @@ dependencies = [
  "url",
  "uuid",
  "virtual_display",
- "vsf 0.11.0",
+ "vsf",
  "wallpaper",
  "winapi 0.3.9",
  "windows 0.61.1",
@@ -9591,7 +9592,7 @@ dependencies = [
  "jni",
  "libc",
  "rand 0.8.5",
- "vsf 0.11.0",
+ "vsf",
 ]
 
 [[package]]
@@ -10365,23 +10366,6 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-traits 0.2.19",
-]
-
-[[package]]
-name = "vsf"
-version = "0.6.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c5d0a40ee257e3d1c771570668208f2daa233eab0c91badf84d00132b0218bb"
-dependencies = [
- "bitvec",
- "blake3",
- "chrono",
- "hex",
- "i256",
- "libm",
- "num-complex",
- "num-traits 0.2.19",
- "unicode-normalization",
 ]
 
 [[package]]

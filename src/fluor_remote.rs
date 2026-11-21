@@ -146,6 +146,7 @@ impl InvokeUiSession for FluorHandler {
         let n = w * h;
         let mut out = vec![0u32; n];
         let swap_rb = matches!(rgba.fmt(), ImageFormat::ABGR);
+        const T: &[u8; 256] = &fluor::theme::GAMMA2_TO_G2T;
         for i in 0..n {
             let b0 = src[i * 4] as u32;
             let b1 = src[i * 4 + 1] as u32;
@@ -153,6 +154,8 @@ impl InvokeUiSession for FluorHandler {
             let a = src[i * 4 + 3] as u32;
             // Interpret little-endian channel order; produce 0xAARRGGBB darkness.
             let (r, g, b) = if swap_rb { (b0, b1, b2) } else { (b2, b1, b0) };
+            // fluor's buffer holds VSF g2t codes with headroom above white (fluor 5487994, 2026-10-20): code 255 is brighter than white, white is 194. A display-encoded frame must take the same light's g2t code on the way in, as fluor's own emoji and icons do — written raw, every pixel landed a stop too bright and the top half of a gradient clipped (field 2026-11-20).
+            let (r, g, b) = (T[r as usize] as u32, T[g as usize] as u32, T[b as usize] as u32);
             out[i] = (a << 24) | ((255 - r) << 16) | ((255 - g) << 8) | (255 - b);
         }
         let mut f = self.shared.frame.lock().unwrap();
@@ -203,6 +206,8 @@ impl InvokeUiSession for FluorHandler {
             let g = colors[i * 4 + 1] as u32;
             let b = colors[i * 4 + 2] as u32;
             let a = colors[i * 4 + 3] as u32;
+            let t = &fluor::theme::GAMMA2_TO_G2T;
+            let (r, g, b) = (t[r as usize] as u32, t[g as usize] as u32, t[b as usize] as u32);
             pixels[i] = (a << 24) | ((255 - r) << 16) | ((255 - g) << 8) | (255 - b);
         }
         // Pre-scale ONCE, here, with bilinear filtering: draw_image is nearest-neighbour, and a 24-px host arrow blown up 2× on every frame was a staircase. The scaled bitmap is what gets painted 1:1, the hotspot scales with it.
