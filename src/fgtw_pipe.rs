@@ -32,10 +32,9 @@ use hbb_common::{
     ResultType,
 };
 
-use fgtw::keys::Keypair;
 use fgtw::pipe::{
-    build_relay_envelope, peel_relay_envelope_eggs, RdFrame, RD_FLAG_FIN, RD_FLAG_NACK, RD_FLAG_SYN,
-    SVC_RUSTDESK,
+    build_relay_envelope, peel_relay_envelope_eggs, CandidateOffer, RdFrame, RD_FLAG_DIALLER, RD_FLAG_FIN, RD_FLAG_NACK,
+    RD_FLAG_PUNCH, RD_FLAG_SYN, SVC_RUSTDESK, SVC_RUSTDESK_DIALLER,
 };
 
 /// Max stream bytes per relay frame. Well under the worker's 1 MiB envelope cap, small enough to keep per-frame latency low on the video path.
@@ -68,9 +67,26 @@ struct Router {
     accept_tx: Mutex<Option<mpsc::UnboundedSender<(RelayStream, [u8; 32])>>>,
 }
 
-/// The live pipe. One per process, lazily built.
+/// Which end of a session a pipe serves. A machine is both at once — the hosting process and a process dialling out share one device key — and the seed binds one proven pipe per hub, so each side has its own: the host listens on [`SVC_RUSTDESK`], the dialler on [`SVC_RUSTDESK_DIALLER`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Host,
+    Dialler,
+}
+
+impl Side {
+    /// The hub this side's own pipe listens on.
+    fn hub(self) -> &'static str {
+        match self {
+            Side::Host => SVC_RUSTDESK,
+            Side::Dialler => SVC_RUSTDESK_DIALLER,
+        }
+    }
+}
+
+/// The live pipe, one per side per process, lazily built.
 pub struct PipeClient {
-    device_key: Arc<Keypair>,
+    side: Side,
     /// Everything this device signs relay frames with — the full bundle when the fingerprint yielded one, else the bare keypair. Frames carry Ed25519 + Falcon (the envelope tier); a peer holds them to its chain's floor.
     signer: Arc<dyn fgtw::pq::FleetSigner + Send + Sync>,
     /// Sink: already-built envelope bytes to push up the WebSocket.
@@ -78,30 +94,40 @@ pub struct PipeClient {
     router: Arc<Router>,
 }
 
-static CLIENT: OnceLock<ResultType<Arc<PipeClient>>> = OnceLock::new();
-/// Is the relay pipe up right now? The pump flips this on connect and on drop, so the UI can
+static HOST: OnceLock<ResultType<Arc<PipeClient>>> = OnceLock::new();
+static DIALLER: OnceLock<ResultType<Arc<PipeClient>>> = OnceLock::new();
+/// Is the host's relay pipe up right now? Its pump flips this on connect and on drop, so the UI can
 /// report reachability instead of the rendezvous heartbeat this fork no longer has.
 static PIPE_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// True while the seed pipe is connected.
+/// True while the host's seed pipe is connected.
 pub fn pipe_connected() -> bool {
     PIPE_UP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The process-wide pipe client, connecting on first use. `Err` if we're not enrolled or the pipe can't be established — the caller falls back to the rendezvous path.
-pub fn client() -> ResultType<Arc<PipeClient>> {
+fn get(cell: &OnceLock<ResultType<Arc<PipeClient>>>, side: Side) -> ResultType<Arc<PipeClient>> {
     // OnceLock can't hold a retryable Result cleanly; keep it simple — one attempt per process,
     // the connection task self-heals with reconnect once it exists.
-    match CLIENT.get_or_init(PipeClient::connect) {
+    match cell.get_or_init(|| PipeClient::connect(side)) {
         Ok(c) => Ok(c.clone()),
         Err(e) => Err(anyhow!("fgtw pipe unavailable: {e}")),
     }
 }
 
+/// The dialling side's pipe, connecting on first use: what a session we start rides, and where a host's punch offer reaches us.
+pub fn client() -> ResultType<Arc<PipeClient>> {
+    get(&DIALLER, Side::Dialler)
+}
+
+/// The hosting side's pipe, connecting on first use: where peers dial us and send their punch offers.
+pub fn host_client() -> ResultType<Arc<PipeClient>> {
+    get(&HOST, Side::Host)
+}
+
 impl PipeClient {
-    fn connect() -> ResultType<Arc<Self>> {
+    fn connect(side: Side) -> ResultType<Arc<Self>> {
         let kp = crate::fgtw_auth::device_keypair()?;
-        let device_key = Arc::new(kp.clone());
+        let self_pk = kp.public.to_bytes();
         let signer: Arc<dyn fgtw::pq::FleetSigner + Send + Sync> = match crate::fgtw_auth::signing_bundle() {
             Some(b) => Arc::new(b.clone()),
             None => Arc::new(kp),
@@ -111,15 +137,15 @@ impl PipeClient {
             streams: Mutex::new(HashMap::new()),
             accept_tx: Mutex::new(None),
         });
-        let self_pk = device_key.public.to_bytes();
         let host = seed_host();
         let router2 = router.clone();
         // The pump lives on rustdesk's tokio runtime. spawn requires being inside it; the connect callers (Client::_start, fleet_server) are async, so a handle exists.
+        let signer2 = signer.clone();
         tokio::spawn(async move {
-            pump(host, self_pk, out_rx, router2).await;
+            pump(host, side, self_pk, signer2, out_rx, router2).await;
         });
         Ok(Arc::new(Self {
-            device_key,
+            side,
             signer,
             out_tx,
             router,
@@ -135,9 +161,9 @@ impl PipeClient {
         self.router.streams.lock().unwrap().remove(conn);
     }
 
-    /// Seal one frame to `peer` and push it up the pipe.
-    fn send_frame(&self, peer: &[u8; 32], frame: &RdFrame) -> ResultType<()> {
-        let env = build_relay_envelope(&*self.signer, peer, Some(SVC_RUSTDESK), &frame.encode())
+    /// Seal one frame to `peer`'s `hub` and push it up the pipe.
+    fn send_frame(&self, peer: &[u8; 32], hub: &str, frame: &RdFrame) -> ResultType<()> {
+        let env = build_relay_envelope(&*self.signer, peer, Some(hub), &frame.encode())
             .map_err(|e| anyhow!("relay envelope: {e}"))?;
         self.out_tx
             .send(env)
@@ -145,16 +171,32 @@ impl PipeClient {
         Ok(())
     }
 
-    /// Open an outbound stream to a fleet peer device (guest side).
+    /// The flag bits that tell a peer which of our hubs answers this frame.
+    fn reply_flag(&self) -> u8 {
+        match self.side {
+            Side::Host => 0,
+            Side::Dialler => RD_FLAG_DIALLER,
+        }
+    }
+
+    /// Open an outbound stream to a fleet peer device (guest side), on its host hub.
     /// Fires an opening SYN immediately: the guest's first protocol act is to READ (wait for the host's SignedId), so without this the host would never learn a connection had started and never send it — an 18s deadlock.
     pub fn open(self: &Arc<Self>, peer: [u8; 32]) -> RelayStream {
         let conn = new_conn_id(&peer);
         let (in_tx, in_rx) = mpsc::unbounded_channel::<RdFrame>();
         self.register(conn, in_tx);
-        let syn = RdFrame { conn, seq: 0, flags: RD_FLAG_SYN, data: Vec::new() };
-        let _ = self.send_frame(&peer, &syn);
+        let syn = RdFrame { conn, seq: 0, flags: RD_FLAG_SYN | self.reply_flag(), data: Vec::new() };
+        let _ = self.send_frame(&peer, SVC_RUSTDESK, &syn);
         // tx_seq starts at 1 — the SYN above took seq 0.
-        RelayStream::new(self.clone(), peer, conn, in_rx, 1)
+        RelayStream::new(self.clone(), peer, SVC_RUSTDESK, conn, in_rx, 1)
+    }
+
+    /// Tell `peer` (on its `hub`) where to aim a hole punch: `offer` under punch id `id` (`fgtw_direct`). The only thing a direct path asks of the relay.
+    pub fn send_offer(&self, peer: &[u8; 32], hub: &str, id: ConnId, offer: &CandidateOffer) {
+        let frame = RdFrame { conn: id, seq: 0, flags: RD_FLAG_PUNCH | self.reply_flag(), data: offer.encode() };
+        if let Err(e) = self.send_frame(peer, hub, &frame) {
+            log::debug!("fgtw pipe: punch offer not sent: {e}");
+        }
     }
 
     /// Host side: yield inbound connections as peers dial us. One receiver per process.
@@ -180,10 +222,29 @@ fn new_conn_id(peer: &[u8; 32]) -> ConnId {
     id
 }
 
+/// This device's answer to the seed's pipe challenge (fgtw's open handshake), signed with the same key every envelope is. `None` when `frame` is not a challenge the seed signed (an ordinary relay frame); `Some(Err)` for a seed challenge we will not answer — one issued for another device or another service's hub.
+fn open_answer_for(
+    frame: &[u8],
+    side: Side,
+    self_pk: &[u8; 32],
+    signer: &(dyn fgtw::pq::FleetSigner + Send + Sync),
+) -> Option<Result<Vec<u8>, String>> {
+    let challenge = fgtw::pipe::read_challenge(frame, &crate::fgtw_auth::FGTW_SEED_PUBLIC)?;
+    if challenge.dev != *self_pk {
+        return Some(Err("the challenge names another device".to_owned()));
+    }
+    if challenge.svc.as_deref() != Some(side.hub()) {
+        return Some(Err("the challenge is for another service's hub".to_owned()));
+    }
+    Some(fgtw::pipe::open_answer(frame, signer, vsf::eagle_time_oscillations()))
+}
+
 /// The socket pump: owns the WebSocket, reconnects with backoff, moves envelopes both ways.
 async fn pump(
     host: String,
+    side: Side,
     self_pk: [u8; 32],
+    signer: Arc<dyn fgtw::pq::FleetSigner + Send + Sync>,
     mut out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     router: Arc<Router>,
 ) {
@@ -191,13 +252,19 @@ async fn pump(
     use hbb_common::futures_util;
     use tokio_tungstenite::tungstenite::Message as Ws;
 
-    let url = fgtw::pipe::pipe_url(&host, &self_pk, Some(SVC_RUSTDESK));
+    let url = fgtw::pipe::pipe_url(&host, &self_pk, Some(side.hub()));
+    // Only the host pipe speaks for this machine's reachability.
+    let up = |v: bool| {
+        if side == Side::Host {
+            PIPE_UP.store(v, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
     let mut backoff = 1u64;
     loop {
         match tokio_tungstenite::connect_async(&url).await {
             Ok((ws, _)) => {
                 backoff = 1;
-                PIPE_UP.store(true, std::sync::atomic::Ordering::Relaxed);
+                up(true);
                 log::info!("fgtw pipe: connected ({url})");
                 let (mut sink, mut stream) = ws.split();
                 // Keepalive: Cloudflare silently closes an idle WebSocket, and a host that sits
@@ -221,7 +288,18 @@ async fn pump(
                         },
                         // Inbound: WS binary → peel → route.
                         msg = stream.next() => match msg {
-                            Some(Ok(Ws::Binary(data))) => route_inbound(&router, &data),
+                            Some(Ok(Ws::Binary(data))) => match open_answer_for(&data, side, &self_pk, &*signer) {
+                                // The seed opens every pipe with a challenge; until this device answers it with its own key, the pipe is unproven: the worker reports it offline and, once its unsigned window closes, hands it nothing.
+                                Some(Ok(answer)) => {
+                                    if sink.send(Ws::Binary(answer.into())).await.is_err() {
+                                        log::warn!("fgtw pipe: answer send failed, reconnecting");
+                                        break;
+                                    }
+                                    log::info!("fgtw pipe: answered the seed's challenge with this device's key");
+                                }
+                                Some(Err(e)) => log::warn!("fgtw pipe: seed challenge left unanswered: {e}"),
+                                None => route_inbound(side, &router, &data),
+                            },
                             Some(Ok(Ws::Ping(_))) | Some(Ok(Ws::Pong(_))) => {}
                             Some(Ok(_)) => {} // text/other: ignore
                             Some(Err(e)) => { log::warn!("fgtw pipe: recv error {e}, reconnecting"); break; }
@@ -240,14 +318,14 @@ async fn pump(
             Err(e) => log::warn!("fgtw pipe: connect failed {e}, retrying in {backoff}s"),
         }
         // Either the socket dropped out of the select loop or the connect failed — down either way.
-        PIPE_UP.store(false, std::sync::atomic::Ordering::Relaxed);
+        up(false);
         tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
     }
 }
 
 /// Peel one inbound envelope and hand its frame to the right stream (or accept a new one).
-fn route_inbound(router: &Arc<Router>, data: &[u8]) {
+fn route_inbound(side: Side, router: &Arc<Router>, data: &[u8]) {
     // Structural peel first (vsf anchors the Ed25519 egg); that tells us WHO sent it, and only then can the frame be held to what the chain says that sender holds.
     let Some((sender_device, inner, eggs, file_hash)) = peel_relay_envelope_eggs(data) else {
         return; // unverifiable/garbage — drop, never fault
@@ -261,6 +339,15 @@ fn route_inbound(router: &Arc<Router>, data: &[u8]) {
     let Some(frame) = RdFrame::decode(&inner) else {
         return;
     };
+    // Where this peer listens for our answers: its dialler hub when it says so, else (a rustdesk from before the split) its host hub.
+    let peer_hub = if frame.flags & RD_FLAG_DIALLER != 0 { SVC_RUSTDESK_DIALLER } else { SVC_RUSTDESK };
+    // A punch offer is signalling for a direct path, never stream bytes. On the host hub it is a peer dialling us; on the dialler hub, a host answering a dial of ours.
+    if frame.flags & RD_FLAG_PUNCH != 0 {
+        if let Some(offer) = CandidateOffer::decode(&frame.data) {
+            crate::fgtw_direct::on_offer(sender_device, peer_hub, frame.conn, offer, side == Side::Host);
+        }
+        return;
+    }
     let conn = frame.conn;
     // Existing stream? deliver.
     if let Some(tx) = router.streams.lock().unwrap().get(&conn) {
@@ -274,9 +361,9 @@ fn route_inbound(router: &Arc<Router>, data: &[u8]) {
             let (in_tx, in_rx) = mpsc::unbounded_channel::<RdFrame>();
             let _ = in_tx.send(frame); // the SYN carries the first bytes
             router.streams.lock().unwrap().insert(conn, in_tx);
-            // The accepted stream needs a client handle to send replies; fetch the process one.
-            if let Ok(client) = client() {
-                let stream = RelayStream::new(client, sender_device, conn, in_rx, 0);
+            // The accepted stream needs a client handle to send replies; fetch the process's host one.
+            if let Ok(client) = host_client() {
+                let stream = RelayStream::new(client, sender_device, peer_hub, conn, in_rx, 0);
                 let _ = accept_tx.send((stream, sender_device));
             } else {
                 router.streams.lock().unwrap().remove(&conn);
@@ -293,6 +380,8 @@ fn route_inbound(router: &Arc<Router>, data: &[u8]) {
 pub struct RelayStream {
     client: Arc<PipeClient>,
     peer: [u8; 32],
+    /// The peer's hub this stream's frames go to: its host hub when we dialled it, the hub its SYN named when it dialled us.
+    peer_hub: &'static str,
     conn: ConnId,
     in_rx: mpsc::UnboundedReceiver<RdFrame>,
     /// Leftover payload from a partially-read frame.
@@ -317,6 +406,7 @@ impl RelayStream {
     fn new(
         client: Arc<PipeClient>,
         peer: [u8; 32],
+        peer_hub: &'static str,
         conn: ConnId,
         in_rx: mpsc::UnboundedReceiver<RdFrame>,
         start_seq: u64,
@@ -324,6 +414,7 @@ impl RelayStream {
         Self {
             client,
             peer,
+            peer_hub,
             conn,
             in_rx,
             read_buf: BytesMut::new(),
@@ -392,7 +483,7 @@ impl AsyncRead for RelayStream {
                 if due && waited <= GAP_TIMEOUT {
                     let (conn, peer, want) = (self.conn, self.peer, self.rx_next);
                     let nack = RdFrame { conn, seq: want, flags: RD_FLAG_NACK, data: Vec::new() };
-                    let _ = self.client.send_frame(&peer, &nack);
+                    let _ = self.client.send_frame(&peer, self.peer_hub, &nack);
                     self.last_nack = Some(std::time::Instant::now());
                 }
                 if waited > GAP_TIMEOUT {
@@ -415,7 +506,7 @@ impl AsyncRead for RelayStream {
                         match self.sent_window.get(&want).cloned() {
                             Some(again) => {
                                 log::info!("fgtw pipe: resending frame {want} on request");
-                                let _ = self.client.send_frame(&peer, &again);
+                                let _ = self.client.send_frame(&peer, self.peer_hub, &again);
                             }
                             None => log::warn!(
                                 "fgtw pipe: peer wants frame {want}, no longer in the resend window"
@@ -460,7 +551,7 @@ impl AsyncWrite for RelayStream {
                 flags: 0,
                 data: buf[sent..end].to_vec(),
             };
-            if let Err(e) = self.client.send_frame(&self.peer, &frame) {
+            if let Err(e) = self.client.send_frame(&self.peer, self.peer_hub, &frame) {
                 return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string())));
             }
             // Hold it briefly in case the peer's socket was mid-reconnect and missed it.
@@ -487,7 +578,7 @@ impl AsyncWrite for RelayStream {
         let conn = self.conn;
         let peer = self.peer;
         let fin = RdFrame { conn, seq, flags: RD_FLAG_FIN, data: Vec::new() };
-        let _ = self.client.send_frame(&peer, &fin);
+        let _ = self.client.send_frame(&peer, self.peer_hub, &fin);
         self.tx_seq += 1;
         Poll::Ready(Ok(()))
     }
@@ -525,95 +616,30 @@ fn wrap(relay: RelayStream) -> Stream {
     ))
 }
 
-/// Connect to a fleet peer over the relay pipe and run the passless handshake.
-/// Returns `Client::start`'s tuple so the caller's contract is byte-identical: direct=true (no relay-server hop from rustdesk's point of view), the host's identity pk, no KCP guard, label "FGTW".
-/// `Err` means "not a fleet peer" or the pipe/handshake failed — the caller falls back to rendezvous.
-/// How long to wait on the peer's published LAN address before giving up and relaying.
-/// Short: on the same network this completes in single-digit milliseconds, and when the peer is
-/// elsewhere the address is simply unreachable, so a long wait would only delay the real path.
-const LAN_DIAL_TIMEOUT: u64 = 600;
-
+/// Connect to a fleet peer and run the passless handshake: every direct path first (`fgtw_direct::dial` — TCP to its published addresses, KCP over UDP to its fleet socket with a hole punch), and the fgtw.org relay pipe only when none answers.
+/// Returns `Client::start`'s tuple so the caller's contract is byte-identical: direct=true (no relay-server hop from rustdesk's point of view), the host's identity pk, the KCP guard when the path is UDP, and the path's label.
+/// `Err` means "not a fleet peer" or every path and the handshake failed.
 pub async fn connect(
     peer_id: &str,
     _key: &str,
 ) -> ResultType<(Stream, bool, Option<Vec<u8>>, Option<KcpStream>, &'static str)> {
     let id = peer_id.to_string();
-    let (device, lan) = tokio::task::spawn_blocking(move || {
-        crate::fgtw_auth::device_and_lan_for_rustdesk_id(&id)
+    let (device, paths) = tokio::task::spawn_blocking(move || {
+        crate::fgtw_auth::device_and_paths_for_rustdesk_id(&id)
     })
     .await
     .map_err(|e| anyhow!("fleet lookup join: {e}"))?
     .ok_or_else(|| anyhow!("{peer_id} is not a fleet peer with a published id"))?;
 
-    // Same network? Dial the peer directly first. The relay is a WAN round trip through
-    // Cloudflare even when both machines sit on one LAN — metres of cable turned into
-    // thousands of kilometres — and it sheds frames under video load. A direct socket is
-    // local-RTT and lossless, so it is always worth a short attempt before falling back.
-    //
-    // RACE every published address rather than trying them in order: a multi-homed peer
-    // publishes one per interface, only some are reachable from where we sit, and a dead one
-    // fails by TIMING OUT — so sequential attempts would spend the whole budget on the first
-    // black hole and never reach the address that works. Racing costs one socket each and
-    // finishes as soon as any of them completes.
-    let candidates: Vec<String> = lan
-        .iter()
-        .flat_map(|s| s.split(','))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !candidates.is_empty() {
-        log::info!("fgtw: racing {} LAN candidate(s) for {peer_id}: {candidates:?}", candidates.len());
-        let mut racers = hbb_common::futures::stream::FuturesUnordered::new();
-        for addr in candidates {
-            racers.push(async move {
-                let r = tokio::time::timeout(
-                    std::time::Duration::from_millis(LAN_DIAL_TIMEOUT),
-                    try_lan(&addr, peer_id),
-                )
-                .await;
-                (addr, r)
-            });
-        }
-        use hbb_common::futures::StreamExt;
-        while let Some((addr, r)) = racers.next().await {
-            match r {
-                Ok(Ok(res)) => {
-                    log::info!("fgtw: connected to {peer_id} directly on the LAN ({addr})");
-                    return Ok(res);
-                }
-                Ok(Err(e)) => log::info!("fgtw: LAN candidate {addr} refused ({e})"),
-                Err(_) => log::info!("fgtw: LAN candidate {addr} timed out"),
-            }
-        }
-        log::info!("fgtw: no LAN candidate answered for {peer_id}; using the relay");
+    if let Some(dialled) = crate::fgtw_direct::dial(peer_id, device, paths).await {
+        return Ok(dialled);
     }
-
+    log::info!("fgtw: no direct path to {peer_id} answered; using the fgtw.org relay");
     let client = client()?;
     let relay = client.open(device);
     let mut conn = wrap(relay);
     let pk = Client::secure_connection_fleet(Some(peer_id), &mut conn).await?;
     Ok((conn, true, pk, None, "FGTW"))
-}
-
-/// One direct dial to a peer's published LAN address, proving fleet membership exactly as the
-/// relay path does — a local socket is not a licence to skip the handshake.
-async fn try_lan(
-    addr: &str,
-    peer_id: &str,
-) -> ResultType<(Stream, bool, Option<Vec<u8>>, Option<KcpStream>, &'static str)> {
-    let mut conn = hbb_common::socket_client::connect_tcp(addr, LAN_DIAL_TIMEOUT).await?;
-    let pk = Client::secure_connection_fleet(Some(peer_id), &mut conn).await?;
-    // Name the tier from the address that actually answered, on the shared fgtw ladder — so
-    // the strip and the fleet tile can never disagree about how we got here.
-    let tag = match addr.parse::<std::net::SocketAddr>() {
-        Ok(sa) => match fgtw::traverse::gather::classify_path(&sa, crate::fgtw_auth::our_lan_v4()) {
-            fgtw::traverse::gather::PathTier::NoRouter => "FGTW-P2P",
-            fgtw::traverse::gather::PathTier::Lan => "FGTW-LAN",
-            _ => "FGTW-WAN",
-        },
-        Err(_) => "FGTW-LAN",
-    };
-    Ok((conn, true, pk, None, tag))
 }
 
 // ── accept seam (host side) ──
@@ -628,7 +654,7 @@ pub async fn fleet_server(server: ServerPtr) {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             continue;
         }
-        let client = match client() {
+        let client = match host_client() {
             Ok(c) => c,
             Err(e) => {
                 log::warn!("fgtw fleet server: pipe unavailable ({e}); retrying");

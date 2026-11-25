@@ -146,6 +146,11 @@ impl RendezvousMediator {
             tokio::spawn(async move {
                 crate::fgtw_pipe::fleet_server(server_cloned).await;
             });
+            // And the fleet UDP socket: KCP sessions over a direct or hole-punched path, so the relay is the last rung.
+            let server_cloned = server.clone();
+            tokio::spawn(async move {
+                crate::fgtw_direct::serve(server_cloned).await;
+            });
         }
         #[cfg(target_os = "android")]
         let start_lan_listening = true;

@@ -41,6 +41,10 @@ mod auth_2fa;
 pub mod fgtw_auth;
 #[cfg(feature = "fgtw")]
 pub mod fgtw_pipe;
+#[cfg(feature = "fgtw")]
+pub mod fgtw_direct;
+#[cfg(feature = "fgtw")]
+mod fgtw_portmap;
 #[cfg(feature = "fluor-viewer")]
 pub mod fluor_remote;
 #[cfg(not(target_os = "ios"))]

@@ -191,6 +191,12 @@ fn choose_desktop_root() -> tohu::device::DesktopRoot {
     if papers_first { DesktopRoot::Papers } else { DesktopRoot::Legacy }
 }
 
+/// fgtw.org's Ed25519 key, the one every released client pins: it signs the challenge that opens a relay pipe (`fgtw::pipe::read_challenge`). The source of truth is Photon's `src/network/fgtw/bootstrap.rs` (`FGTW_ED25519_PUBLIC_KEY`), which the worker's deploy key-guard checks against; a rotation changes both. A custom `fgtw-url` seed signs with its own key, and its challenge goes unanswered.
+pub const FGTW_SEED_PUBLIC: [u8; 32] = [
+    0x02, 0x1C, 0xDF, 0x80, 0x43, 0x0C, 0x09, 0xFD, 0x58, 0xA4, 0xF7, 0xCD, 0x86, 0x03, 0x78, 0x0A,
+    0xFC, 0x30, 0x87, 0xEF, 0x16, 0x24, 0x3F, 0xC1, 0x63, 0x9D, 0x31, 0x5F, 0x94, 0x06, 0xEB, 0x6D,
+];
+
 /// The fgtw seed URL for this fork — the `fgtw-url` option, defaulting to fgtw.org. Public so
 /// the relay-pipe transport derives its WebSocket host from the same source as everything else.
 pub fn fgtw_url() -> String {
@@ -426,6 +432,11 @@ fn current_fanout(handle_proof: &[u8; 32], members: &[[u8; 32]]) -> Result<fgtw:
 }
 
 /// What a relay frame from `peer` must be verified against: the bundle the (cached) chain declares for it, and the schemes an envelope from this fleet must carry — the envelope tier clipped to the fleet's floor, so an Ed25519-only fleet still talks and a promoted one is held to Falcon. `None` when we hold no chain naming that peer.
+/// The fleet's current members as the cached chain names them — local, no round trip. `None` when no chain is cached.
+pub(crate) fn cached_members() -> Option<Vec<[u8; 32]>> {
+    ChainCache::load()?.chain()?.fold().ok()
+}
+
 pub(crate) fn peer_envelope_policy(peer: &[u8; 32]) -> Option<(KeyBundle, scheme::Mask)> {
     let chain = ChainCache::load()?.chain()?;
     let (members, floor) = chain.fold_full().ok()?;
@@ -448,37 +459,11 @@ pub(crate) fn peer_envelope_policy(peer: &[u8; 32]) -> Option<(KeyBundle, scheme
 
 /// Settings key under which a device publishes its RustDesk ID in its own device map.
 const SETTING_RUSTDESK_ID: &str = "rustdesk.id";
-/// This device's LAN address (`ip:port`) for its direct server, published so a fleet peer on
-/// the same network dials it directly instead of paying a WAN round trip through the relay.
-const SETTING_RUSTDESK_LAN: &str = "rustdesk.lan";
+/// The retired text form of this device's LAN addresses (`ip:port` comma-joined in an `x`). Replaced by the typed address sets of `fgtw_direct` (`rustdesk.tcp`, `rustdesk.udp`) on 2026-11-25; nothing reads it, and each device deletes its own on its next publish.
+const SETTING_RUSTDESK_LAN_RETIRED: &str = "rustdesk.lan";
 
-/// EVERY address a peer on our network could dial us at, as `ip:port`, comma-joined.
-///
-/// Publishing one address is not enough: the routing lookup only ever names the interface that
-/// reaches the internet, so a machine wired AND wireless publishes exactly one of the two — and
-/// if a peer cannot use that one, the direct path is invisible even though a working address
-/// existed the whole time (field: a host published its wifi address while its ethernet was the
-/// reachable one, and every session fell back to the relay). Photon solved this by gathering a
-/// candidate SET and racing it; this is the same idea at the publish end.
-fn own_lan_addrs() -> Vec<String> {
-    let port = crate::rendezvous_mediator::get_direct_port();
-    let mut out = Vec::new();
-    for iface in default_net::get_interfaces() {
-        for v4 in &iface.ipv4 {
-            let ip = v4.addr;
-            // Loopback is not reachable from anywhere else; link-local 169.254 means DHCP never
-            // answered, so nothing is listening for us on it either.
-            if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
-                continue;
-            }
-            let addr = format!("{ip}:{port}");
-            if !out.contains(&addr) {
-                out.push(addr);
-            }
-        }
-    }
-    out
-}
+/// The paths this process last published, so the upkeep loop republishes only when they move (a network change, a rotated IPv6 privacy address, a router mapping won or lost).
+static PUBLISHED_PATHS: Mutex<Option<crate::fgtw_direct::PeerPaths>> = Mutex::new(None);
 /// Photon's per-device display name, keyed `fleet.name.<pubkey hex>` in the fleet-global layer.
 const SETTING_NAME_PREFIX: &str = "fleet.name.";
 
@@ -571,7 +556,7 @@ fn publish_own_id_inner(handle_proof: &[u8; 32], identity_seed: &[u8; 32], devic
         .unwrap_or_default();
     let me = device_key.public.to_bytes();
     let now = vsf::eagle_time_oscillations();
-    // The id, plus our LAN address when we have one — both per-device, never fleet-linked.
+    // The id, plus where we can be reached directly — all per-device, never fleet-linked.
     let mut entries = vec![DeviceSetting {
         key: SETTING_RUSTDESK_ID.to_owned(),
         // fstate v7: setting values are typed VSF now. The RustDesk id is text → VsfType::x.
@@ -579,17 +564,21 @@ fn publish_own_id_inner(handle_proof: &[u8; 32], identity_seed: &[u8; 32], devic
         updated: now,
         linked: false, // per-device by nature; never follows a fleet-global value
     }];
-    let lan = own_lan_addrs();
-    if !lan.is_empty() {
-        entries.push(DeviceSetting {
-            key: SETTING_RUSTDESK_LAN.to_owned(),
-            value: VsfType::x(lan.join(",")),
-            updated: now,
-            linked: false,
-        });
+    // Only the hosting process knows the paths (it holds the fleet UDP socket and the router mapping); any other process publishes the id and leaves the paths the host wrote.
+    let paths = crate::fgtw_direct::own_paths();
+    if let Some(p) = &paths {
+        for (key, addrs) in [(crate::fgtw_direct::SETTING_TCP, &p.tcp), (crate::fgtw_direct::SETTING_UDP, &p.udp)] {
+            entries.push(DeviceSetting {
+                key: key.to_owned(),
+                value: crate::fgtw_direct::set_value(addrs),
+                updated: now,
+                linked: false,
+            });
+        }
     }
     match fs.device_settings.iter_mut().find(|d| d.device_pubkey == me) {
         Some(map) => {
+            map.entries.retain(|e| e.key != SETTING_RUSTDESK_LAN_RETIRED);
             for entry in entries {
                 match map.entries.iter_mut().find(|e| e.key == entry.key) {
                     Some(e) => *e = entry,
@@ -606,8 +595,20 @@ fn publish_own_id_inner(handle_proof: &[u8; 32], identity_seed: &[u8; 32], devic
     }
     // Sign with the full bundle when this device has one: the worker holds a member's envelope to the fleet's floor, and once the floor is the basket a bare Ed25519 envelope is refused as below_floor (field 2026-11-08: no device's ID published, every tile offline).
     match signing_bundle().filter(|b| fgtw::pq::FleetSigner::keypair(*b).public == device_key.public) {
-        Some(bundle) => fgtw::client::push_fstate(&t, &RdSealer, handle_proof, bundle, &key, &fs),
-        None => fgtw::client::push_fstate(&t, &RdSealer, handle_proof, device_key, &key, &fs),
+        Some(bundle) => fgtw::client::push_fstate(&t, &RdSealer, handle_proof, bundle, &key, &fs)?,
+        None => fgtw::client::push_fstate(&t, &RdSealer, handle_proof, device_key, &key, &fs)?,
+    }
+    if paths.is_some() {
+        *PUBLISHED_PATHS.lock().unwrap() = paths;
+    }
+    Ok(())
+}
+
+/// Have this process's direct paths moved since it last published them? `false` outside the hosting process, which publishes none.
+fn paths_moved() -> bool {
+    match crate::fgtw_direct::own_paths() {
+        Some(now) => PUBLISHED_PATHS.lock().unwrap().as_ref() != Some(&now),
+        None => false,
     }
 }
 
@@ -667,20 +668,17 @@ pub struct FleetDevice {
     pub is_self: bool,
     /// Pipe open right now? `None` = the seed didn't answer, so reachability is unknown.
     pub online: Option<bool>,
-    /// The device's published LAN address (`ip:port`), if it published one.
-    pub lan_addr: Option<String>,
+    /// Where the device said it can be reached directly (its published TCP and UDP address sets).
+    pub paths: crate::fgtw_direct::PeerPaths,
     /// The best direct path that answered a probe, if any — what the tile colours by.
     pub direct_tier: Option<fgtw::traverse::gather::PathTier>,
 }
 
-/// The current fleet as a chooser list: every member (fresh fold, cache fallback within
-/// bound) with its fleet-scoped name and, where published, its RustDesk ID. Liveness is the
-/// rendezvous server's job — hand `rustdesk_id` to the normal connect path.
 /// Reverse-map a peer's RustDesk id to its fleet device pubkey, for the relay-pipe transport.
 /// Blocking (folds the fleet + pulls the id map); the caller runs it off the async runtime.
 /// `None` when we're not enrolled, the peer isn't in the fleet, or hasn't published an id yet.
 pub fn device_for_rustdesk_id(id: &str) -> Option<[u8; 32]> {
-    device_and_lan_for_rustdesk_id(id).map(|(pk, _)| pk)
+    device_and_paths_for_rustdesk_id(id).map(|(pk, _)| pk)
 }
 
 /// Our own LAN v4, for the same-subnet judgment the tier classifier needs.
@@ -693,47 +691,15 @@ pub fn our_lan_v4() -> Option<std::net::Ipv4Addr> {
     }
 }
 
-/// Does any of a device's published LAN addresses answer right now?
-/// A tile that only knows "the relay pipe is open" cannot tell a peer in the same room from one
-/// on another continent — both are merely reachable. One short connect per candidate is what
-/// separates them, and it is the same probe the dialler would make anyway.
-pub fn probe_lan_tier(lan: &Option<String>) -> Option<fgtw::traverse::gather::PathTier> {
-    use fgtw::traverse::gather::PathTier;
-    let list = lan.as_ref()?;
-    let ours = our_lan_v4();
-    let mut best: Option<PathTier> = None;
-    for addr in list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&addr) else { continue };
-        for sa in addrs {
-            // Short: a peer on our own network answers in single-digit ms, and a dead address
-            // must not stall the roster the fleet page is waiting on.
-            if std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(250))
-                .is_ok()
-            {
-                let tier = fgtw::traverse::gather::classify_path(&sa, ours);
-                // Probe EVERY address and keep the best. Stopping at the first hit would report
-                // whichever answered soonest, which is not the same as the best path available —
-                // a router-free link can easily answer after a LAN one.
-                if best.map_or(true, |b| tier < b) {
-                    best = Some(tier);
-                }
-            }
-        }
-    }
-    best
-}
-
 /// Ping every way we know of reaching a device and report the BEST tier that answers.
 ///
-/// Direct addresses first, then the relay as the floor: a device that answers nothing directly
-/// but whose pipe is open is reachable, just expensively. `None` means genuinely nothing
-/// answered — offline.
+/// Direct paths first (`fgtw_direct::probe_tier`: its published TCP and UDP addresses), then the relay as the floor: a device that answers nothing directly but whose pipe is open is reachable, just expensively. `None` means genuinely nothing answered — offline.
 pub fn probe_best_tier(
     device: &[u8; 32],
-    lan: &Option<String>,
+    paths: &crate::fgtw_direct::PeerPaths,
 ) -> Option<fgtw::traverse::gather::PathTier> {
     use fgtw::traverse::gather::PathTier;
-    if let Some(t) = probe_lan_tier(lan) {
+    if let Some(t) = crate::fgtw_direct::probe_tier(device, paths) {
         return Some(t);
     }
     match pipe_alive(device) {
@@ -742,23 +708,30 @@ pub fn probe_best_tier(
     }
 }
 
-/// The fleet device behind a RustDesk id, plus its published LAN address if it has one.
-/// One roster pull serves both, so trying the LAN path costs no extra round trip.
-pub fn device_and_lan_for_rustdesk_id(id: &str) -> Option<([u8; 32], Option<String>)> {
+/// The fleet device behind a RustDesk id, plus where it said it can be reached directly.
+/// One roster pull serves both, so trying the direct paths costs no extra round trip.
+pub fn device_and_paths_for_rustdesk_id(id: &str) -> Option<([u8; 32], crate::fgtw_direct::PeerPaths)> {
     fleet_roster()
         .ok()?
         .into_iter()
         .find(|d| !d.is_self && d.rustdesk_id.as_deref() == Some(id))
-        .map(|d| (d.pubkey, d.lan_addr))
+        .map(|d| (d.pubkey, d.paths))
+}
+
+/// What one device published in its own settings map.
+#[derive(Default)]
+struct Published {
+    id: Option<String>,
+    paths: crate::fgtw_direct::PeerPaths,
 }
 
 pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
     let (hp, seed) = session_roots().ok_or("not logged in on this machine")?;
     let members = current_chain(&hp)?.fold().map_err(|e| format!("fleet does not fold: {e:?}"))?;
     let me = device_keypair().map(|k| k.public.to_bytes()).ok();
-    // ID map is best-effort: an unreachable slot or missing wrap degrades to names-only.
+    // The settings are best-effort: an unreachable slot or missing wrap degrades to names-only. A fleet is a handful of devices, so both lists are searched linearly.
     #[allow(clippy::type_complexity)]
-    let ((ids, lans), names): ((HashMap<[u8; 32], String>, HashMap<[u8; 32], String>), HashMap<[u8; 32], String>) = (|| -> Result<_, String> {
+    let (published, names): (Vec<([u8; 32], Published)>, Vec<([u8; 32], String)>) = (|| -> Result<_, String> {
         let t = RdTransport::auth();
         let key = fleet_key(&t, &hp, &seed)?;
         let fs = fgtw::client::pull_fstate(&t, &RdSealer, &hp, &key)?
@@ -778,50 +751,70 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
                 }
             })
             .collect();
-        let mut ids = HashMap::new();
-        let mut lans = HashMap::new();
-        for d in fs.device_settings.into_iter() {
-            for e in d.entries.into_iter() {
-                // Both written as VsfType::x (text) by publish_own_id_inner above.
-                let VsfType::x(v) = e.value else { continue };
-                match e.key.as_str() {
-                    SETTING_RUSTDESK_ID => {
-                        ids.insert(d.device_pubkey, v);
+        let published = fs
+            .device_settings
+            .into_iter()
+            .map(|d| {
+                let mut p = Published::default();
+                for e in d.entries {
+                    match (e.key.as_str(), &e.value) {
+                        (SETTING_RUSTDESK_ID, VsfType::x(v)) => p.id = Some(v.clone()),
+                        (crate::fgtw_direct::SETTING_TCP, v) => p.paths.tcp = crate::fgtw_direct::set_from_value(v).unwrap_or_default(),
+                        (crate::fgtw_direct::SETTING_UDP, v) => p.paths.udp = crate::fgtw_direct::set_from_value(v).unwrap_or_default(),
+                        _ => {}
                     }
-                    SETTING_RUSTDESK_LAN => {
-                        lans.insert(d.device_pubkey, v);
-                    }
-                    _ => {}
                 }
-            }
-        }
-        Ok(((ids, lans), names))
+                (d.device_pubkey, p)
+            })
+            .collect();
+        Ok((published, names))
     })()
     .unwrap_or_else(|e| {
         log::warn!("fgtw: fleet id map unavailable ({e}); chooser degrades to names-only");
-        ((HashMap::new(), HashMap::new()), HashMap::new())
+        (Vec::new(), Vec::new())
     });
-    Ok(members
-        .iter()
-        .map(|m| FleetDevice {
-            pubkey: *m,
-            // The name the user set in photon wins; the deterministic two-word default is the fallback.
-            name: names
-                .get(m)
-                .cloned()
-                .unwrap_or_else(|| fgtw::pair::device_name_default(m, &seed)),
-            rustdesk_id: ids.get(m).cloned(),
-            is_self: me == Some(*m),
-            // Only probe peers: our own pipe's state is not interesting and would cost a round trip per refresh.
-            online: if me == Some(*m) { None } else { pipe_alive(m) },
-            direct_tier: if me == Some(*m) {
-                None
-            } else {
-                probe_lan_tier(&lans.get(m).cloned())
-            },
-            lan_addr: lans.get(m).cloned(),
-        })
-        .collect())
+    // Every device is probed at once: each probe waits on the network, and one after another a fleet tab would take seconds per device to colour.
+    Ok(std::thread::scope(|s| {
+        let probes: Vec<_> = members
+            .iter()
+            .map(|m| {
+                let p = published.iter().find(|(d, _)| d == m).map(|(_, p)| p);
+                let paths = p.map(|p| p.paths.clone()).unwrap_or_default();
+                let is_self = me == Some(*m);
+                let probe = s.spawn(move || {
+                    // Only probe peers: our own pipe's state is not interesting and would cost a round trip per refresh.
+                    if is_self {
+                        (None, None, paths)
+                    } else {
+                        let online = pipe_alive(m);
+                        let tier = crate::fgtw_direct::probe_tier(m, &paths);
+                        (online, tier, paths)
+                    }
+                });
+                (m, p, is_self, probe)
+            })
+            .collect();
+        probes
+            .into_iter()
+            .map(|(m, p, is_self, probe)| {
+                let (online, direct_tier, paths) = probe.join().unwrap_or((None, None, Default::default()));
+                FleetDevice {
+                    pubkey: *m,
+                    // The name the user set in photon wins; the deterministic two-word default is the fallback.
+                    name: names
+                        .iter()
+                        .find(|(d, _)| d == m)
+                        .map(|(_, n)| n.clone())
+                        .unwrap_or_else(|| fgtw::pair::device_name_default(m, &seed)),
+                    rustdesk_id: p.and_then(|p| p.id.clone()),
+                    is_self,
+                    online,
+                    direct_tier,
+                    paths,
+                }
+            })
+            .collect()
+    }))
 }
 
 // ── handshake payload ──
@@ -1015,12 +1008,47 @@ fn declare_own_bundle(handle_proof: &[u8; 32]) {
     });
 }
 
-/// Best-effort background fleet bootstrap for service/UI startup, off-thread, never blocks. With a session: adopt it (idempotent — re-publishes our id every start because the id is what the My Fleet chooser connects by, and re-declares our bundle). Without one: this machine hosts only, and says so.
+/// Background fleet bootstrap and upkeep for the hosting process, off-thread, never blocks.
+///
+/// Adopts the session (idempotent — re-publishes our id every start because the id is what the My Fleet chooser connects by, and re-declares our bundle), and KEEPS TRYING until it can: at boot RustDesk starts before the login it adopts exists (field 2026-11-25: adoption at 12:23:10, Photon's session at 12:24, and a one-shot attempt left the host unpublished until its next restart). Meanwhile the machine hosts only.
+/// Then keeps the published paths true: a laptop changes networks, IPv6 privacy addresses rotate, a router mapping comes and goes.
 pub fn try_adopt_session() {
     scrub_legacy_state();
-    std::thread::spawn(|| match adopt_session() {
-        Ok(msg) => log::info!("fgtw: {msg}"),
-        Err(e) => log::info!("fgtw: session adoption not available (hosting only): {e}"),
+    std::thread::spawn(|| {
+        // No session is a cheap local read, so it is looked for often; a session that fails to adopt (no wrap yet, the fleet server unreachable) costs round trips, so those retries back off.
+        let look = std::time::Duration::from_secs(1 << 3);
+        let mut backoff = std::time::Duration::from_secs(1 << 4);
+        let backoff_max = std::time::Duration::from_secs(1 << 9);
+        let mut said = false;
+        loop {
+            if session_roots().is_none() {
+                if !said {
+                    log::info!("fgtw: no session on this machine yet (hosting only) — adopting it once one appears");
+                    said = true;
+                }
+                std::thread::sleep(look);
+                continue;
+            }
+            match adopt_session() {
+                Ok(msg) => {
+                    log::info!("fgtw: {msg}");
+                    break;
+                }
+                Err(e) => {
+                    log::info!("fgtw: session adoption not available yet (hosting only), retrying in {}s: {e}", backoff.as_secs());
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(backoff_max);
+                }
+            }
+        }
+        let every = std::time::Duration::from_secs(1 << 7);
+        loop {
+            std::thread::sleep(every);
+            if paths_moved() {
+                log::info!("fgtw: this device's direct paths moved — republishing");
+                republish_own_id();
+            }
+        }
     });
 }
 

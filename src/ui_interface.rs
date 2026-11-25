@@ -883,10 +883,10 @@ pub fn ping_fleet_device(id: String) {
         }
     }
     std::thread::spawn(move || {
-        let Some((device, lan)) = crate::fgtw_auth::device_and_lan_for_rustdesk_id(&id) else {
+        let Some((device, paths)) = crate::fgtw_auth::device_and_paths_for_rustdesk_id(&id) else {
             return; // not a fleet peer — it stays offline, which is the truth
         };
-        let tier = crate::fgtw_auth::probe_best_tier(&device, &lan);
+        let tier = crate::fgtw_auth::probe_best_tier(&device, &paths);
         if let Ok(mut rows) = FLEET_PEERS.lock() {
             if let Some(row) = rows.iter_mut().find(|r| r.get("id") == Some(&id)) {
                 // Nothing answered anywhere: offline is now a measurement, not a guess.
