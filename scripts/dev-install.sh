@@ -8,6 +8,8 @@
 # So: build → STOP the app + its supervisor + wait for the table to clear → swap the run-location
 # binary → verify hash → relaunch. One command, on either machine.
 #
+# First, on a machine that may be behind: scripts/pull-deps.sh (this repo, its siblings, the hbb_common pin).
+#
 # Usage:  scripts/dev-install.sh            (build + install + relaunch)
 #         scripts/dev-install.sh --no-build (install the existing target/release build)
 set -euo pipefail

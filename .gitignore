@@ -58,3 +58,5 @@ libsciter.dylib
 flutter/web/# fgtw release pipeline
 .sciter-cache/
 cross/build/
+# wrangler login cache, left by running wrangler here; never part of the fork
+.wrangler/
