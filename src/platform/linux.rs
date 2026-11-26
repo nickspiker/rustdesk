@@ -1617,6 +1617,10 @@ use std::sync::Mutex;
 static VIRTUAL_OUTPUT: Mutex<Option<String>> = Mutex::new(None);
 /// The guest tag whose head this is — names the config key its position is saved under.
 static VMON_GUEST_TAG: Mutex<Option<String>> = Mutex::new(None);
+/// Whether a remote session holds the head: set when a session brings it up, cleared when the last one ends. Between sessions the head belongs to nobody and [`keep_idle_head_off`] keeps it dark.
+static HEAD_IN_USE: AtomicBool = AtomicBool::new(false);
+/// Held across every change to the head's state, so the idle watcher can never switch it off between a session claiming it and bringing it up.
+static HEAD_OPS: Mutex<()> = Mutex::new(());
 /// Config key that turns virtual-head creation off entirely (value "Y").
 const VMON_DISABLED_OPT: &str = "fgtw-vmon-disabled";
 /// Config key prefix for a guest's remembered head position ("x,y").
@@ -1872,6 +1876,8 @@ fn fleet_mode_name(width: usize, height: usize) -> String {
 /// it (falling back to right-of-primary), and a live resize keeps the current arrangement.
 /// Idempotent when already that size.
 pub fn ensure_virtual_monitor(width: usize, height: usize, guest_tag: Option<&str>) -> ResultType<()> {
+    let _ops = HEAD_OPS.lock().unwrap();
+    HEAD_IN_USE.store(true, Ordering::Relaxed);
     if let Some(name) = virtual_output_name() {
         if active_mode_size(&name) == Some((width, height)) {
             // Right size already — but primary may have wandered. Muffin re-applies its saved
@@ -2002,6 +2008,8 @@ fn output_size(text: &str, output: &str) -> Option<(usize, usize)> {
 /// Turn the virtual head's output back off and forget it, remembering where the user left it
 /// so the same guest's next session brings it back in the same place.
 pub fn remove_virtual_monitor() {
+    let _ops = HEAD_OPS.lock().unwrap();
+    HEAD_IN_USE.store(false, Ordering::Relaxed);
     let commandeered = VIRTUAL_OUTPUT.lock().unwrap().clone();
     // A commandeered connector and the persistent fake-EDID head are both switched off at session
     // end: with nobody viewing it, a head is a screen that exists only to be captured, and leaving
@@ -2027,6 +2035,51 @@ pub fn remove_virtual_monitor() {
     Command::new("xrandr").args(["--output", &output, "--off"]).output().ok();
     restore_primary_after_head_off(&output);
     log::info!("fgtw vmon: '{output}' turned off, virtual head gone");
+}
+
+/// Keep the fleet head dark whenever no session holds it, for the life of the host.
+///
+/// The head is plugged in only while a remote session uses it; the physical monitor is plugged in or not on its own. But the kernel forces the head's connector on (`video=HDMI-A-1:e`, so it is a real output with an EDID when a session wants it), and the desktop therefore switches it on by itself — at login, and on every hotplug such as the monitor powering on — and parks new windows and notifications on a screen nobody can see (field 2026-11-25: the head was disabled in the kernel to stop exactly this, which also took it from remote sessions). [`remove_virtual_monitor`] only ran at session end; this catches the desktop turning it back on in between.
+///
+/// Reads `xrandr --current` (no connector re-probe, so no flicker) every few seconds. Never switches off the last screen: with no session and no monitor nobody is looking, and an X screen with no output shrinks to its floor under every window.
+pub fn keep_idle_head_off() {
+    std::thread::spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_secs(1 << 2));
+        if HEAD_IN_USE.load(Ordering::Relaxed) {
+            continue;
+        }
+        let Ok(out) = Command::new("xrandr").arg("--current").output() else { continue };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<_> = text.lines().filter_map(parse_output_line).collect();
+        // Bound first: a guard in a match scrutinee lives to the end of the match, and the arm below locks again.
+        let cached = FLEET_HEAD.lock().unwrap().clone();
+        let head = match cached {
+            Some(h) => h,
+            None => {
+                let Some((name, ..)) = lines
+                    .iter()
+                    .find(|(name, state, _, _)| state == "connected" && output_edid_name(name).is_some_and(|n| n.starts_with(FLEET_EDID_PREFIX)))
+                else {
+                    continue;
+                };
+                *FLEET_HEAD.lock().unwrap() = Some(name.clone());
+                name.clone()
+            }
+        };
+        let head_on = lines.iter().any(|(name, _, _, has_mode)| *name == head && *has_mode);
+        let another_shows = lines.iter().any(|(name, state, _, has_mode)| *name != head && state == "connected" && *has_mode);
+        if !head_on || !another_shows {
+            continue;
+        }
+        let _ops = HEAD_OPS.lock().unwrap();
+        // A session may have claimed the head while we read the layout.
+        if HEAD_IN_USE.load(Ordering::Relaxed) {
+            continue;
+        }
+        log::info!("fgtw vmon: '{head}' came on with no session holding it — switching it off");
+        Command::new("xrandr").args(["--output", &head, "--off"]).output().ok();
+        restore_primary_after_head_off(&head);
+    });
 }
 
 /// Whether a connected output other than `head` has a mode, so switching the head off still leaves a screen.

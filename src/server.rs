@@ -619,6 +619,8 @@ pub async fn start_server(is_server: bool, no_server: bool) {
         {
             crate::platform::linux::reset_leftover_minted_modes();
             crate::platform::linux::reset_leftover_transforms();
+            // The fleet head is lit only while a session holds it; the desktop switches it on by itself at login and on hotplug.
+            crate::platform::linux::keep_idle_head_off();
         }
         #[cfg(target_os = "linux")]
         {
