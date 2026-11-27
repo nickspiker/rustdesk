@@ -397,16 +397,19 @@ class SessionList: Reactor.Component {
     event click $(div.remote-session-link) (evt, me) {
         if (this.type != "fleet" || !me.id) return;
         handler.ping_fleet_device(me.id);
-        // The probe is off-thread: repaint a few times so the tile lands on its new colour
-        // whenever the result arrives, instead of guessing one delay that is right for a LAN
-        // peer and far too short for one that has to time out.
-        var tries = 8;
+        // The probe is off-thread: repaint until it is done (and once more, so its result is
+        // painted), not for a guessed few seconds — a ping that outlived a fixed window left its
+        // tile red after the device answered. The cap only stops a hung request repainting forever.
+        var tries = 128;
+        var settle = 1;
         function poll() {
             self.timer(300ms, function() {
                 tries -= 1;
                 var p = (app || {}).multipleSessions;
                 if (p) p.update();
-                if (tries > 0) poll();
+                var busy = handler.fleet_busy();
+                if (!busy) settle -= 1;
+                if (tries > 0 && (busy || settle >= 0)) poll();
                 return false;
             });
         }
@@ -666,20 +669,23 @@ class LanPeers: Reactor.Component {
     }
 }
 
-// Fleet refresh runs off-thread Rust-side (fold + sealed ID map); poll a few re-renders
-// while it lands — same shape as discover()'s update loop.
+// Fleet refresh runs off-thread Rust-side (fold + sealed ID map); repaint until it lands (and
+// once more), not for a fixed few seconds — it costs seconds of fgtw.org round trips, and a list
+// that landed after the repaints stopped was never shown.
 function refreshFleet() {
     handler.refresh_fleet_peers();
-    var tries = 15;
+    var tries = 128;
+    var settle = 1;
     function update() {
         self.timer(300ms, function() {
             tries -= 1;
-            if (tries == 0) return;
-            update();
             var p = (app || {}).multipleSessions;
             if (p) {
                 p.update();
             }
+            var busy = handler.fleet_busy();
+            if (!busy) settle -= 1;
+            if (tries > 0 && (busy || settle >= 0)) update();
         });
     }
     update();

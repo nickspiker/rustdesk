@@ -631,6 +631,14 @@ impl UI {
         refresh_fleet_peers();
     }
 
+    /// Is a fleet roster refresh or tile ping still out? The tab repaints until it is not.
+    fn fleet_busy(&self) -> bool {
+        #[cfg(feature = "fgtw")]
+        return fleet_busy();
+        #[cfg(not(feature = "fgtw"))]
+        false
+    }
+
     /// Re-probe one device (single click on its tile) so its tier is current.
     fn ping_fleet_device(&self, id: String) {
         #[cfg(feature = "fgtw")]
@@ -878,6 +886,7 @@ impl sciter::EventHandler for UI {
         fn get_fleet_hint();
         fn refresh_fleet_peers();
         fn ping_fleet_device(String);
+        fn fleet_busy();
         fn has_fleet();
         fn get_fleet_self_name();
         fn get_uuid();

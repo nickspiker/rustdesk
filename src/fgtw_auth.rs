@@ -173,6 +173,7 @@ fn choose_desktop_root() -> tohu::device::DesktopRoot {
         for attempt in 0..5 {
             match fgtw::client::fetch(&RdTransport::auth(), &hp) {
                 Ok(Some(chain)) => {
+                    *RECENT.lock().unwrap() = Some((hp, std::time::Instant::now(), chain.clone()));
                     fresh = Some(chain);
                     break;
                 }
@@ -405,6 +406,48 @@ fn current_chain(handle_proof: &[u8; 32]) -> Result<MembershipBlob, String> {
     }
 }
 
+/// How long a guest-side read may reuse a chain or fleet key this process fetched moments ago. Measured 2026-11-26: a roster cost ~6.5 s of sequential fgtw.org round trips (chain fetch and fold, fan-out recovery, fleet state), and a connect paid it again in the handshake right after its lookup — every one of those within the same few seconds.
+const RECENT_SECS: u64 = 1 << 5;
+
+/// The chain this process fetched last, and when — read by [`recent_chain`], also primed by the device-root selection, which fetches the same chain first thing in every process.
+static RECENT: Mutex<Option<([u8; 32], std::time::Instant, MembershipBlob)>> = Mutex::new(None);
+
+/// [`current_chain`], reusing this process's fetch from the last [`RECENT_SECS`]. For a GUEST's reads only — the roster, our handshake payload, checking a host's signed id. The host's verification of a guest, enrolment and adoption always fetch: that is where a removal or a fresh approval must be seen at once.
+fn recent_chain(handle_proof: &[u8; 32]) -> Result<MembershipBlob, String> {
+    if let Some((hp, at, chain)) = RECENT.lock().unwrap().as_ref() {
+        if hp == handle_proof && at.elapsed().as_secs() < RECENT_SECS {
+            return Ok(chain.clone());
+        }
+    }
+    let chain = current_chain(handle_proof)?;
+    *RECENT.lock().unwrap() = Some((*handle_proof, std::time::Instant::now(), chain.clone()));
+    Ok(chain)
+}
+
+/// The fleet key recovered in the last [`RECENT_SECS`] by this process, for reads only (opening the fleet state, the handshake's epoch proof). Never for a write: sealing fleet state under a key the fleet rotated a moment ago would hand every other device a blob it cannot open.
+static RECENT_KEY: Mutex<Option<([u8; 32], std::time::Instant, [u8; 32])>> = Mutex::new(None);
+
+fn recent_key_get(handle_proof: &[u8; 32]) -> Option<[u8; 32]> {
+    RECENT_KEY
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(hp, at, _)| hp == handle_proof && at.elapsed().as_secs() < RECENT_SECS)
+        .map(|(_, _, k)| *k)
+}
+
+fn recent_key_put(handle_proof: &[u8; 32], key: [u8; 32]) {
+    *RECENT_KEY.lock().unwrap() = Some((*handle_proof, std::time::Instant::now(), key));
+}
+
+/// [`fleet_key`] for a read: the key recovered moments ago when there is one.
+fn recent_fleet_key(t: &RdTransport, handle_proof: &[u8; 32], identity_seed: &[u8; 32]) -> Result<[u8; 32], String> {
+    if let Some(k) = recent_key_get(handle_proof) {
+        return Ok(k);
+    }
+    fleet_key(t, handle_proof, identity_seed)
+}
+
 /// The fleet's current fan-out with its provenance verified from public data — the envelope signature, its signer being the rotator, the rotator being in `members` — so a stateless host can read the epoch public bundle it checks a guest's proof against. Cached alongside the chain; offline, the cached document is re-verified against the (cached) member set within the same staleness bound.
 fn current_fanout(handle_proof: &[u8; 32], members: &[[u8; 32]]) -> Result<fgtw::fanout::Fanout, String> {
     match fgtw::client::fetch_fanout_verified(&RdTransport::auth(), handle_proof, members) {
@@ -534,7 +577,9 @@ fn fleet_key(t: &RdTransport, handle_proof: &[u8; 32], identity_seed: &[u8; 32])
         Some(b) => fgtw::client::recover_or_establish_fleet_key(t, handle_proof, b, identity_seed)?,
         None => fgtw::client::recover_or_establish_fleet_key(t, handle_proof, &kp, identity_seed)?,
     };
-    key.ok_or_else(|| "no fleet-key wrap for this device yet (awaiting sponsor rotation)".into())
+    let key = key.ok_or_else(|| "no fleet-key wrap for this device yet (awaiting sponsor rotation)".to_string())?;
+    recent_key_put(handle_proof, key);
+    Ok(key)
 }
 
 /// Publish this device's RustDesk ID into its own fleet device-settings map.
@@ -711,7 +756,8 @@ pub fn probe_best_tier(
 /// The fleet device behind a RustDesk id, plus where it said it can be reached directly.
 /// One roster pull serves both, so trying the direct paths costs no extra round trip.
 pub fn device_and_paths_for_rustdesk_id(id: &str) -> Option<([u8; 32], crate::fgtw_direct::PeerPaths)> {
-    fleet_roster()
+    // Ids and paths only: a connect has no use for every device's probe.
+    fleet_roster_with(false)
         .ok()?
         .into_iter()
         .find(|d| !d.is_self && d.rustdesk_id.as_deref() == Some(id))
@@ -725,15 +771,27 @@ struct Published {
     paths: crate::fgtw_direct::PeerPaths,
 }
 
+/// The current fleet as the chooser shows it, every device probed for its best path. See [`fleet_roster_with`].
 pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
+    fleet_roster_with(true)
+}
+
+/// The current fleet: every member, its name, its published id and direct paths, and — when `probe` — whether its pipe is open and the best direct path that answers right now. A connect only needs the ids and paths; the tiles need the probes.
+pub fn fleet_roster_with(probe: bool) -> Result<Vec<FleetDevice>, String> {
     let (hp, seed) = session_roots().ok_or("not logged in on this machine")?;
-    let members = current_chain(&hp)?.fold().map_err(|e| format!("fleet does not fold: {e:?}"))?;
+    // The chain and the fleet key are independent fetches: side by side, not one after the other.
+    let (chain, key) = std::thread::scope(|s| {
+        let key = s.spawn(|| recent_fleet_key(&RdTransport::auth(), &hp, &seed));
+        let chain = recent_chain(&hp);
+        (chain, key.join().unwrap_or_else(|_| Err("fleet key recovery panicked".to_string())))
+    });
+    let members = chain?.fold().map_err(|e| format!("fleet does not fold: {e:?}"))?;
     let me = device_keypair().map(|k| k.public.to_bytes()).ok();
     // The settings are best-effort: an unreachable slot or missing wrap degrades to names-only. A fleet is a handful of devices, so both lists are searched linearly.
     #[allow(clippy::type_complexity)]
     let (published, names): (Vec<([u8; 32], Published)>, Vec<([u8; 32], String)>) = (|| -> Result<_, String> {
         let t = RdTransport::auth();
-        let key = fleet_key(&t, &hp, &seed)?;
+        let key = key?;
         let fs = fgtw::client::pull_fstate(&t, &RdSealer, &hp, &key)?
             .unwrap_or_default();
         // Names the user set in photon's Fleet page. Photon writes `fleet.name.<pkhex>` as a
@@ -774,7 +832,7 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
         (Vec::new(), Vec::new())
     });
     // Every device is probed at once: each probe waits on the network, and one after another a fleet tab would take seconds per device to colour.
-    Ok(std::thread::scope(|s| {
+    let roster: Vec<FleetDevice> = std::thread::scope(|s| {
         let probes: Vec<_> = members
             .iter()
             .map(|m| {
@@ -783,7 +841,7 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
                 let is_self = me == Some(*m);
                 let probe = s.spawn(move || {
                     // Only probe peers: our own pipe's state is not interesting and would cost a round trip per refresh.
-                    if is_self {
+                    if is_self || !probe {
                         (None, None, paths)
                     } else {
                         let online = pipe_alive(m);
@@ -814,7 +872,21 @@ pub fn fleet_roster() -> Result<Vec<FleetDevice>, String> {
                 }
             })
             .collect()
-    }))
+    });
+    *LAST_ROSTER.lock().unwrap() = roster
+        .iter()
+        .filter_map(|d| Some((d.rustdesk_id.clone()?, d.pubkey, d.paths.clone())))
+        .collect();
+    Ok(roster)
+}
+
+/// Each published id's device and paths from this process's last roster, so pinging one tile probes that device alone instead of rebuilding the whole fleet (seconds of fgtw.org round trips — the tile went red and stayed there because its repaint window closed first, field 2026-11-26).
+static LAST_ROSTER: Mutex<Vec<(String, [u8; 32], crate::fgtw_direct::PeerPaths)>> = Mutex::new(Vec::new());
+
+/// The device and paths behind a RustDesk id as the last roster had them, falling back to a fresh lookup when there is none yet.
+pub fn device_and_paths_recent(id: &str) -> Option<([u8; 32], crate::fgtw_direct::PeerPaths)> {
+    let hit = LAST_ROSTER.lock().unwrap().iter().find(|(i, _, _)| i == id).map(|(_, d, p)| (*d, p.clone()));
+    hit.or_else(|| device_and_paths_for_rustdesk_id(id))
 }
 
 // ── handshake payload ──
@@ -875,16 +947,19 @@ pub fn build_hs_payload(client_box_pk: &[u8; 32], host_sign_pk: &[u8; 32]) -> Op
     let (hp, seed) = session_roots()?;
     let kp = device_keypair().ok()?;
     let me = kp.public.to_bytes();
-    let mask = current_chain(&hp).ok().map(|c| c.declared_mask(&me)).unwrap_or(scheme::MASK_BASE);
+    let mask = recent_chain(&hp).ok().map(|c| c.declared_mask(&me)).unwrap_or(scheme::MASK_BASE);
     let digest = hs_digest(&hp, client_box_pk, host_sign_pk);
     let eggs = match signing_bundle() {
         Some(b) => b.eggs(&digest, mask),
         None => kp.eggs(&digest, mask),
     };
     // The epoch proof: only a device holding the CURRENT fleet key — one with a wrap under it, i.e. an unlocked member of this epoch — can derive the epoch bundle. A locked device cannot, sends no `ee`, and the host refuses it as LockedOut. Nothing else in the handshake can stand in for this.
-    let epoch_eggs = fgtw::client::recover_fleet_key(&RdTransport::auth(), &hp, &kp, &seed)
-        .ok()
-        .flatten()
+    let epoch_eggs = recent_key_get(&hp)
+        .or_else(|| {
+            let k = fgtw::client::recover_fleet_key(&RdTransport::auth(), &hp, &kp, &seed).ok().flatten()?;
+            recent_key_put(&hp, k);
+            Some(k)
+        })
         .map(|k| pq::epoch_bundle(&k).eggs(&digest, EPOCH_TIER));
     encode_hs_payload(&hp, &me, &eggs, epoch_eggs.as_deref())
 }
@@ -966,7 +1041,7 @@ pub fn verify_hs_payload(
 pub fn verify_host_signed_id(signed_id: &[u8]) -> Option<(String, [u8; 32], [u8; 32])> {
     use hbb_common::sodiumoxide::crypto::sign;
     let (hp, _) = session_roots()?;
-    let members = current_chain(&hp).ok()?.fold().ok()?;
+    let members = recent_chain(&hp).ok()?.fold().ok()?;
     for m in &members {
         // Reuse rustdesk's own IdPk decode (verify sig + parse) — same path secure_connection uses.
         if let Ok((id, box_pk)) = crate::common::decode_id_pk(signed_id, &sign::PublicKey(*m)) {

@@ -22,6 +22,9 @@ BUILT="$(pwd)/target/release/rustdesk"
 sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 
 if [ "${1:-}" != "--no-build" ]; then
+    # The UI (.tis/.css/.html) is compiled in from src/ui/inline.rs, which is generated and untracked: without this a pulled UI change builds as the OLD UI (or a blank window). Same step deploy.sh runs.
+    echo "▶ inlining the UI…"
+    python3 res/inline-sciter.py >/dev/null
     echo "▶ building (fast dev profile: no LTO)…"
     # CXXFLAGS=-include cstdint is pinned in .cargo/config.toml, so a bare build already works.
     CARGO_PROFILE_RELEASE_LTO=false \

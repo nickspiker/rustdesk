@@ -851,6 +851,34 @@ pub fn get_fleet_peers() -> Vec<HashMap<&'static str, String>> {
 }
 
 /// Why the fleet chooser has nothing to show, in words the tab can render in place of "Empty". Set by [`refresh_fleet_peers`] when the roster cannot be read (no login on this machine is the everyday case — a reboot kills the session capsule by design), cleared the moment a roster lands. The tab showed a bare "Empty" for a fleet of four while the reason sat in a log line (field 2026-10-16).
+/// Fleet work in flight — a roster refresh or a tile ping. The tab repaints while any is out, rather than for a fixed few seconds: a roster costs seconds of fgtw.org round trips, and a tile pinged red stayed red when its result landed after the repaints had stopped (field 2026-11-26).
+#[cfg(feature = "fgtw")]
+static FLEET_BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts one piece of fleet work for as long as it lives. Made before the thread is spawned, so the tab never looks in the gap between asking and the work starting.
+#[cfg(feature = "fgtw")]
+struct FleetBusy;
+#[cfg(feature = "fgtw")]
+impl FleetBusy {
+    fn start() -> Self {
+        FLEET_BUSY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FleetBusy
+    }
+}
+#[cfg(feature = "fgtw")]
+impl Drop for FleetBusy {
+    fn drop(&mut self) {
+        FLEET_BUSY.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Is a roster refresh or a tile ping still out?
+#[inline]
+#[cfg(feature = "fgtw")]
+pub fn fleet_busy() -> bool {
+    FLEET_BUSY.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
 #[cfg(feature = "fgtw")]
 static FLEET_HINT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 #[inline]
@@ -882,8 +910,10 @@ pub fn ping_fleet_device(id: String) {
             row.insert("status", "offline".to_owned());
         }
     }
+    let busy = FleetBusy::start();
     std::thread::spawn(move || {
-        let Some((device, paths)) = crate::fgtw_auth::device_and_paths_for_rustdesk_id(&id) else {
+        let _busy = busy;
+        let Some((device, paths)) = crate::fgtw_auth::device_and_paths_recent(&id) else {
             return; // not a fleet peer — it stays offline, which is the truth
         };
         let tier = crate::fgtw_auth::probe_best_tier(&device, &paths);
@@ -903,7 +933,9 @@ pub fn ping_fleet_device(id: String) {
 /// yet still show (empty id → connect is a no-op) so the fleet view matches the fold.
 #[cfg(feature = "fgtw")]
 pub fn refresh_fleet_peers() {
-    std::thread::spawn(|| {
+    let busy = FleetBusy::start();
+    std::thread::spawn(move || {
+        let _busy = busy;
         // Passless: adopt the machine's login on first use (fleet-key gate; no-op if enrolled).
         if !crate::fgtw_auth::is_enrolled() {
             if let Err(e) = crate::fgtw_auth::adopt_session() {
